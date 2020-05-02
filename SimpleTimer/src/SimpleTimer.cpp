@@ -1,5 +1,5 @@
 #include "Particle.h"
-#include "simpletimer.h"
+#include "SimpleTimer.h"
 
 SimpleTimer::SimpleTimer() {
     _interval = 0;
