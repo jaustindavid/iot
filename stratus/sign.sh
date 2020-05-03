@@ -20,7 +20,7 @@ if [ -z "$FILENAME" -o ! -f "$FILENAME" ]; then
 fi
 
 SECRET=$(grep "^secret key" $FILENAME|sed -e 's/^secret key: //')
-if [ -z "$SECRET"]; then
+if [ -z "$SECRET" ]; then
   echo "ERROR: $FILENAME must contain a line like:"
   echo "secret key: <asdasdwq093>"
   exit 2
