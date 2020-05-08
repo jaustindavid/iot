@@ -46,7 +46,8 @@ bool Stratus::update() {
             #endif
             _lastUpdate = Time.now();
             _body = response.body;
-            Particle.publish("Stratus updated successfully", PRIVATE);
+            Particle.publish("Stratus updated successfully", 
+			     get("MD5", "MD5 sum"), PRIVATE);
             return true;
         } else {
             #ifdef STRATUS_DEBUGGING

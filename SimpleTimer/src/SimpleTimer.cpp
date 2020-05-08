@@ -7,20 +7,25 @@ SimpleTimer::SimpleTimer() {
 }
 
 
-SimpleTimer::SimpleTimer(time_t interval) {
+SimpleTimer::SimpleTimer(uint32_t interval) {
     setInterval(interval);
     reset();
 }
 
 
-void SimpleTimer::setInterval(time_t interval) {
+void SimpleTimer::setInterval(uint32_t interval) {
     _interval = interval;
+}
+
+
+uint32_t SimpleTimer::remaining() {
+    return (_milestone + _interval) - millis();
 }
 
 
 void SimpleTimer::wait() {
     if (! isExpired()) {
-        delay(constrain(_milestone + _interval - Time.now(), 0, _interval));
+        delay(constrain(_milestone + _interval - millis(), 0, _interval));
         _softReset(false);
     }
 }

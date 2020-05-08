@@ -36,10 +36,10 @@ class SimpleTimer {
         SimpleTimer();
         
         // will immediately start timing.  Use reset() if needed.
-        SimpleTimer(time_t);
+        SimpleTimer(uint32_t);
         
         // sets a new interval.  Does not implicity reset() the timer.
-        void setInterval(time_t); 
+        void setInterval(uint32_t); 
         
         // waits for a timer to expire.  Resets the timer.
         void wait();
@@ -47,6 +47,9 @@ class SimpleTimer {
         // reset the timer()
         void reset();
         
+	// returns the time (ms) remaining
+	uint32_t remaining();
+
         // true if the timer has expired; resets the timer if needed,
         // maintaining rhythm.  
         // note that a timer will expire exactly once per cycle, and 
