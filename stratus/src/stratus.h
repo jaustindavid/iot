@@ -6,11 +6,21 @@
   #include <HttpClient.h>
   #define TIME_NOW Time.now()
 #else
-  #include <MD5.h>
-  #include <ESP8266WiFi.h>
-  #include <ESP8266HTTPClient.h>
-  #include <WiFiClient.h>
-  #define TIME_NOW 
+  #define TIME_NOW time()
+  #ifdef ESP32
+    // #include <MD5.h>
+    #include <rom/md5_hash.h>
+    #include <esp_wifi.h>
+    #include <WiFi.h>
+    #include <WiFiClient.h>
+    #include <HTTPClient.h>
+    #define ESP_getChipId()   ((uint32_t)ESP.getEfuseMac())
+  #else
+    #include <MD5.h>
+    #include <ESP8266WiFi.h>
+    #include <ESP8266HTTPClient.h>
+    #include <WiFiClient.h>
+  #endif
 #endif
 
 #define CACHE_ENTRIES 50 // about 1kB
@@ -682,11 +692,22 @@ String Stratus::_md5(const String data) {
     
         return String(buf);
     #else
+      #ifdef ESP32
+        struct MD5Context myContext;
+        unsigned char md5sum[16];
+        // memset((void)myContext,0x00,sizeof(myContext));
+        memset(md5sum,0x00,16);
+        MD5Init(&myContext);
+        MD5Update(&myContext, (unsigned char *)data.c_str(), data.length());
+        MD5Final(md5sum, &myContext);
+        return (char *)md5sum;
+      #else
         MD5Builder md5;
         md5.begin();
         md5.add(data);
         md5.calculate();
         return md5.toString();
+      #endif 
     #endif
 } // String _md5(data)
 
