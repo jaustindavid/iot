@@ -28,7 +28,7 @@ class Ember {
         uint8_t _colorIndex; 
     
         void printHeader() {
-            Serial.printf("Ember[%d](%d)", _position, _threshold);
+            Serial.printf("Ember[%d](%02d)", _position, _threshold);
         } // print()
         
     
@@ -52,30 +52,28 @@ class Ember {
         //   level [0..100] dictates a range of possible colors from the pallet
         //      as well as the delta between cycles
         void burn(const uint8_t recency, const uint8_t level, bool printing = false) {
-            if (printing) {
-                printHeader();
-            }
-            if (recency >= _threshold) {
+            if (recency >= _threshold and random8(100) < 85) {
+                if (printing)
+                    printHeader();
                 #define MINCOLOR 10
                 uint8_t maxColor = map(min(level, (uint8_t)100), 0, 100, MINCOLOR, 255);
                 maxColor = constrain(maxColor, MINCOLOR, 255);
                 int8_t range = constrain(level, 5, 50);
                 if (printing)
-                    Serial.printf(" [max=%d; range=%d;", maxColor, range);
+                    Serial.printf(" [max=%d; range=%d; ", maxColor, range);
                 int8_t delta = range/2 - random8(range);
                 if (printing)
-                    Serial.printf("; delta=%d; index=%d]", delta, _colorIndex);
+                    Serial.printf("delta=%d; index=%d]", delta, _colorIndex);
                 _colorIndex = constrain(_colorIndex + delta, MINCOLOR, maxColor);
                 // uint8_t colorIndex = random8(MINCOLOR, maxColor);
                 if (printing) 
                     Serial.printf(": intensity=%d, index=%d", level, _colorIndex);
                 leds[_position] = ColorFromPalette(palette, _colorIndex);
                 leds[_position].subtractFromRGB(random8(50));
+                if (printing) Serial.println();
             } else {
                 leds[_position] = CRGB::Black;
-                if (printing) Serial.println(" NOP");
             }
-            if (printing) Serial.println();
         } // burn(level)
 }; // class Ember
 
@@ -153,7 +151,7 @@ void barGraph(const int level) {
 // recency, level will vary 0..100
 void burn(const uint8_t recency, const uint8_t level) {
     bool printing = false;
-    EVERY_N_SECONDS(5) {
+    EVERY_N_SECONDS(15) {
         Serial.printf("%lu: burning: recency=%d, level=%d\n", 
                         TIME_NOW, recency, level);
         printing = true;

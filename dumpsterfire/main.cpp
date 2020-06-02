@@ -40,19 +40,30 @@ void setup() {
   wfm.setup();
   setupLEDs();
   setupTweeter();
+  // REFRESH_INTERVAL = stratus.getInt("refresh interval", REFRESH_INTERVAL);
+  // Serial.printf("Refreshing every %d seconds\n", REFRESH_INTERVAL);
 } //setup()
 
 
 void loop() {
   static SimpleTimer loopTimer(50);
-  static SimpleTimer apTimer(30000, true);
   static SimpleTimer updateTimer(REFRESH_INTERVAL * 1000, true);
 
+  if (millis() < 900 * 1000) { // first 900s / 15m after startup
+    softAP_loop();
+  }
+
   if (updateTimer.isExpired()) {
-    wfm.connect();
-    stratus.update();
-    updateTimer.setInterval(stratus.getInt("refresh interval", REFRESH_INTERVAL) * 1000);
-    wfm.disconnect();
+    if (wfm.connect()) {
+      stratus.update();
+      // updateTimer.setInterval(stratus.getInt("refresh interval", REFRESH_INTERVAL) * 1000);
+      wfm.disconnect();
+    } else {
+      // if I can't connect, randomly stoke the fire a little
+      if (rand() > 0.9) {
+        callback("fuel", "100");
+      }
+    }
   }
 
   uint8_t recency = checkRecency();
