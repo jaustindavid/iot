@@ -4,10 +4,6 @@
 #define DEBUGGING
 // #undef DEBUGGING
 
-
-#include "FastLED.h"
-FASTLED_USING_NAMESPACE
-
 #define FRAMES_PER_SECOND 60
 #define NUM_LEDS 10
 CRGB leds[NUM_LEDS];
@@ -119,22 +115,6 @@ void createEmbers() {
 } // createEmbers()
 
 
-void setupLEDs() {
-  #ifdef ESP32
-    pinMode(LED_POWER, OUTPUT);
-    digitalWrite(LED_POWER, HIGH);
-  #endif
-    FastLED.addLeds<APA102, LED_DATA, LED_CLOCK, COLOR_ORDER>(leds, NUM_LEDS);
-    FastLED.setBrightness(32);
-    FastLED.clear();
-    FastLED.show();
-    
-    // palette = CRGBPalette16(CRGB::Black, CRGB::Red, CRGB::Orange, CRGB::Yellow);
-
-    createEmbers();
-} // setupLEDs()
-
-
 void barGraph(const int level) {
     for (int i = 0; i < NUM_LEDS; i++) {
         if (level/10 > i) {
@@ -162,9 +142,55 @@ void burn(const uint8_t recency, const uint8_t level) {
     }
     int brightness = map(level, 0, 100, MIN_BRIGHTNESS, MAX_BRIGHTNESS);
     FastLED.setBrightness(brightness);
+
+    if (status == STATUS_OFFLINE) {
+        leds[0] = CRGB::Red;
+    } else if (heartbeep + 30*1000 < millis()) {
+        // heartbeep expired
+        leds[0] = CRGB::Orange;
+    } else if (status == STATUS_OK) {
+        static SimpleTimer okTimer(1000);
+        if (okTimer.isExpired())
+            Serial.print(".");
+    }
     
     FastLED.show();
     FastLED.delay(1000/FRAMES_PER_SECOND); 
 }
+
+void burn_task(void * parameter) {
+    SimpleTimer burnTimer(50);
+    while (true) {
+        uint8_t recency = checkRecency();
+        uint8_t level = checkIntensity();
+        burn(recency, level);
+        burnTimer.wait();
+    }
+    vTaskDelete( NULL );
+}
+
+
+void setupLEDs() {
+    #ifdef ESP32
+        pinMode(LED_POWER, OUTPUT);
+        digitalWrite(LED_POWER, HIGH);
+    #endif
+    FastLED.addLeds<APA102, LED_DATA, LED_CLOCK, COLOR_ORDER>(leds, NUM_LEDS);
+    FastLED.setBrightness(32);
+    FastLED.clear();
+    FastLED.show();
+    
+    // palette = CRGBPalette16(CRGB::Black, CRGB::Red, CRGB::Orange, CRGB::Yellow);
+
+    createEmbers();
+
+    xTaskCreate(
+        burn_task, /* Task function. */
+        "burn Task", /* name of task. */
+        20480, /* Stack size of task */
+        NULL, /* parameter of the task */
+        1, /* priority of the task */
+        NULL); /* Task handle to keep track of created task */
+} // setupLEDs()
 
 #endif

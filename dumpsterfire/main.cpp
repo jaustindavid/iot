@@ -1,4 +1,5 @@
 #include <Arduino.h>
+
 #include "esp32_wifi.h"
 #include "time.h"
 
@@ -26,8 +27,15 @@ Stratus stratus("http://stratus-iot.s3.amazonaws.com/dumpsterfire.txt", "Dumpst3
 // managed globals
 int16_t REFRESH_INTERVAL = 300;
 
-#include "leds.h"
+#define STATUS_OK 0
+#define STATUS_OFFLINE 1
+uint32_t heartbeep = 0;
+byte status = STATUS_OK;
+
+#include "FastLED.h"
+FASTLED_USING_NAMESPACE
 #include "tweeter.h"
+#include "leds.h"
 
 WiFiManager wfm;
 
@@ -38,15 +46,15 @@ void setup() {
   delay(5000);
   // softAP_setup();
   wfm.setup();
-  setupLEDs();
   setupTweeter();
+  setupLEDs();
   // REFRESH_INTERVAL = stratus.getInt("refresh interval", REFRESH_INTERVAL);
   // Serial.printf("Refreshing every %d seconds\n", REFRESH_INTERVAL);
 } //setup()
 
 
 void loop() {
-  static SimpleTimer loopTimer(50);
+  static SimpleTimer loopTimer(100);
   static SimpleTimer updateTimer(REFRESH_INTERVAL * 1000, true);
 
   if (millis() < 900 * 1000) { // first 900s / 15m after startup
@@ -55,20 +63,29 @@ void loop() {
 
   if (updateTimer.isExpired()) {
     if (wfm.connect()) {
+      Serial.println("doin an update");
       stratus.update();
-      // updateTimer.setInterval(stratus.getInt("refresh interval", REFRESH_INTERVAL) * 1000);
+      updateTimer.setInterval(stratus.getInt("refresh interval", REFRESH_INTERVAL) * 1000);
       wfm.disconnect();
+      status = STATUS_OK;
     } else {
       // if I can't connect, randomly stoke the fire a little
       if (rand() > 0.9) {
         callback("fuel", "100");
       }
+      status = STATUS_OFFLINE;
     }
   }
 
+/*
+  // now runs async in a task from setup_leds()
   uint8_t recency = checkRecency();
   uint8_t level = checkIntensity();
   burn(recency, level);
+*/
 
-  loopTimer.wait();
+  // Serial.printf("%d: looped; %d remaining\n", millis(), loopTimer.remaining());
+  loopTimer.wait(false);
 } // loop()
+
+

@@ -220,6 +220,10 @@ void WiFiManager::setup() {
 }
 
 bool WiFiManager::connect() {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Already connected!");
+      return true;
+    }
     uint32_t start = millis();
     Serial.println("Connect!");
     WiFi.begin(Router_SSID.c_str(), Router_Pass.c_str());
@@ -233,6 +237,8 @@ bool WiFiManager::connect() {
     Serial.printf("\nMAC: %s, IP: ", WiFi.macAddress().c_str());
     Serial.println(WiFi.localIP());
     Serial.printf("Elapsed time: %lu ms\n", millis() - start);
+
+    return WiFi.status() == WL_CONNECTED;
 }
 
 void WiFiManager::disconnect() {
