@@ -23,10 +23,12 @@
  *
  *   ...
  */
+
 class SimpleTimer {
     private:
         uint32_t _interval;
         uint32_t _milestone;
+        bool _startExpired;
         
         // reset the timer while maintaining rhythm
         void _softReset(bool);
@@ -35,20 +37,21 @@ class SimpleTimer {
         // default constructor.  Will require setInterval()
         SimpleTimer();
         
-        // will immediately start timing.  Use reset() if needed.
-        SimpleTimer(uint32_t);
+        // false (default): will immediately start timing.  Use reset() if needed.
+        // true: will immediately start *expired*
+        SimpleTimer(uint32_t, bool);
         
         // sets a new interval.  Does not implicity reset() the timer.
         void setInterval(uint32_t); 
         
         // waits for a timer to expire.  Resets the timer.
-        void wait();
+        void wait(bool);
         
-        // reset the timer()
+        // reset the timer
         void reset();
         
-	// returns the time (ms) remaining
-	uint32_t remaining();
+        // returns the time (ms) remaining
+        uint32_t remaining();
 
         // true if the timer has expired; resets the timer if needed,
         // maintaining rhythm.  
@@ -56,6 +59,6 @@ class SimpleTimer {
         // cycles will maintain a very strict cadence 
         // unless externally reset()
         bool isExpired(bool);
-        bool isExpired();
 }; 
+ 
 #endif
