@@ -110,7 +110,7 @@ class StratusClient:
 
 
     # asynchronous: just record the fact that I am interested
-    def subscribe(self, callback, key, scope="PRIVATE", reset=False, limit=0):
+    def subscribe(self, callback, key, scope="PRIVATE", reset=False, limit=0, debuggery = False):
         if (key not in self.subscriptions):
             self.subscriptions[key] = dict()
         if (scope not in self.subscriptions[key]):
@@ -118,6 +118,8 @@ class StratusClient:
         self.subscriptions[key][scope]['callback'] = callback
         self.subscriptions[key][scope]['reset'] = reset
         self.subscriptions[key][scope]['limit'] = limit
+        if debuggery:
+            print(self.subscriptions)
         # message = StratusMessage("subscribe", key, "", self.guid, scope)
         # return self.send(message)
 
@@ -141,7 +143,7 @@ class StratusClient:
 
     # retrieve any held subscription info
     # todo: publish queued messages
-    def update(self):
+    def update(self, debuggery = False):
         if debuggery: 
             print("update()")
             print(self.subscriptions)
