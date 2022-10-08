@@ -1,14 +1,23 @@
 #ifndef STRATUS_H
 #define STRATUS_H
 
-#ifdef ESP32
-  #define TIME_NOW (millis()/1000)
-  #include "stratus_esp32.h"
+#ifdef PHOTON
+  #include <md5.h>
+  #include "http.h"
+  #define TIME_NOW Time.now()
+#else
+  #include <MD5.h>
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <WiFiClient.h>
+  #define TIME_NOW 
 #endif
 
-#define CACHE_ENTRIES 10 // about 1kB
+#undef CACHE_ENABLED
+#ifdef CACHE_ENABLED
+#define CACHE_ENTRIES 50 // about 1kB
 #include "cache.h"
-#include "stratus_message.h"
+#endif
 
 /* 
  * A Stratus is a shitty cloud.
@@ -82,39 +91,139 @@ char * tokenize(char *data, const char *start, const char *end,
 
 
 
+String md5sum(String data) {
+    #ifdef PHOTON
+        unsigned char result[16];
+    
+        MD5_CTX hash;
+        MD5_Init(&hash);
+        MD5_Update(&hash, data, data.length());
+        MD5_Final(result, &hash);
+    
+        char buf[33];
+        for (int i=0; i<16; i++)
+            sprintf(buf+i*2, "%02x", result[i]);
+        buf[32]=0;
+    
+        return String(buf);
+    #else
+        MD5Builder md5;
+        md5.begin();
+        md5.add(data);
+        md5.calculate();
+        return md5.toString();
+    #endif
+} // String _md5(data)
 
 
+class StratusMessage {
+    private:
+        String _action;
+        String _guid;
+        String _value;
+        int32_t _ttl;
+    
+    public:
+        String _key;
+        String _scope;
+        int32_t _limit;
+        bool _reset;
+
+        StratusMessage() {
+            _action = "";
+            _key = "";
+        } // StratusMessage()
+        
+        
+        StratusMessage(const String action, const String key, const String value="", 
+                        const String guid="guid", const String scope="PRIVATE",
+                        const int32_t ttl=60, const int32_t limit=0, const bool reset=false) {
+            _action = action;
+            _key = key;
+            _value = value;
+            _guid = guid;
+            _scope = scope;
+            _ttl = ttl;
+            _limit = limit;
+            _reset = reset;
+        } // StratusMessage(action, key, defaults)
+        
+        
+        String toURL(const String secret) {
+            String body = String::format("%s\nguid: %s\n%s: %s\n",
+                            secret.c_str(), _guid.c_str(), _key.c_str(), _value.c_str());
+            #ifdef STRATUS_DEBUGGING
+                Serial.printf("body: >>\n%s<<\n", body.c_str());
+            #endif
+            String md5 = md5sum(body);
+            String url = String::format("action=%s&key=%s&value=%s&guid=%s&scope=%s&ttl=%d&reset=%d&limit=%d&signature=%s",
+                                  _action.c_str(), _key.c_str(), _value.c_str(), _guid.c_str(), _scope.c_str(), 
+                                  _ttl, _reset ? 1 : 0, _limit, md5.c_str());
+            url.replace(" ", "%20");
+            /* all this caused some sort of String corruption
+            Serial.printf("MD5: %s\n", md5.c_str());
+            Serial.printf("obtw: scope=>%s<\n", _scope.c_str());
+            url.reserve(1024);
+            url.concat("action=" + _action + "&key=" + _key);
+            if (_value.length() > 0) {
+                // url += "&value=" + _value;
+                url.concat("&value=" + _value);
+            }
+            // Serial.printf("checkpoint: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            // url += "&guid=" + _guid + "&scope=" + _scope;
+            url.concat("&guid=" + _guid + "&scope=" + _scope);
+            // Serial.printf("checkpoint2: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            if (_ttl) url += "&ttl=" + _ttl;
+            // Serial.printf("checkpoint3: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            if (_reset) url += "&reset=1";
+            // Serial.printf("checkpoint4: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            if (_limit) url += "&limit=" + _limit;
+            // Serial.printf("checkpoint5: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            // url += "&signature=" + md5;
+            url.concat("&signature=" + md5);
+            Serial.printf("checkpoint6: scope=>%s<, url=>%s<\n", _scope.c_str(), url.c_str());
+            */
+            #ifdef STRATUS_DEBUGGING
+                Serial.printf("toURL: >>%s<<\n", url.c_str());
+            #endif
+            return url;
+        } // String toURL()
+}; // StratusMessage
 
 
 class Stratus {
     private:
         String _configURL;
         time_t _age;
+        uint16_t _refreshInterval;
         time_t _lastUpdate;
         String _body, _secret;
-        char _guid[32];
         
         #ifdef PHOTON
-          HttpClient _http;
+            char _http_buffer[10240];
+            HttpClient _http;
         #else
-          WiFiClient _client;
-          HTTPClient _http;
+            WiFiClient _client;
+            HTTPClient _http;
         #endif
-
-        Cache<String> _strings;
-        Cache<int32_t> _ints;
-        Cache<uint32_t> _hexes;
-        Cache<float> _floats;
         
+        #ifdef CACHE_ENABLED
+            Cache<String> _strings;
+            Cache<int32_t> _ints;
+            Cache<uint32_t> _hexes;
+            Cache<float> _floats;
+        #endif CACHE_ENABLED
+
         StratusMessage _subscriptions[10];
         void (*_callbacks[10])(const char *, const char *);
+        
         
         // returns the substring from data between "<key>: " and "\n"
         // or an empty string
         String _get(const String key, const String data);
 
         // returns an md5 hash of data
-        // String _md5(const String data);
+        String _md5(const String data);
         
         // verifies the MD5 checksum appended to a given String:
         // MD5: <ASCII MD5SUM>
@@ -123,8 +232,7 @@ class Stratus {
         // TODO: better error-handling        
         bool _toInt(const String data, int32_t &result);
         bool _toHex(const String data, uint32_t &result);
-        // String _httpGet(const String);
-
+        String _httpGet(const String);
       
         /* * * * * *
          * pub/sub
@@ -143,7 +251,7 @@ class Stratus {
         void updateSubscriptions();
         
         bool maybeUpdate(time_t interval);
-        // bool maybeUpdate();
+        bool maybeUpdate();
         
         String get(const String key, const String defaultValue);
         
@@ -156,11 +264,11 @@ class Stratus {
         // this is called in a constructor so must be DEAD SIMPLE
         // string ops only
         void setConfigURL(const String configURL);
-        // void chaseConfigURL();
+        void chaseConfigURL();
         void setSecret(const String secret);
         
         // return a GUID
-        // String getGUID();
+        String getGUID();
         
         time_t age();
         
@@ -183,115 +291,168 @@ class Stratus {
 
 Stratus::Stratus(const String configURL = "http://stratus-iot.s3.amazonaws.com/stratus.txt", 
                     const String secret = "default stratus key") {
-
-    char *guid;
     _lastUpdate = 0;
+    _refreshInterval = 3600;
     _body = "";
     setConfigURL(configURL);
     setSecret(secret);
-    guid = getGUID();
-    strncpy(_guid, guid, sizeof(_guid));
-    free(guid);
 } // Stratus()
         
 
-bool Stratus::update() {
-  bool ret = false;
-  char * payload = httpGet(_configURL.c_str());
-  if (payload == NULL) {
-    Serial.printf("failed to retreive a payload\n");
-    return false;
-  }
-  #ifdef STRATUS_DEBUGGING
-    Serial.printf("Updating with >>%s<<\n", payload);
-  #endif
+#ifdef PHOTON
+    bool Stratus::update() {
+        #ifdef STRATUS_DEBUGGING
+            uint32_t freemem = System.freeMemory();
+            Serial.print("free memory: ");
+            Serial.println(freemem);
+            Serial.printf("httpGet'ing %s\n", _configURL.c_str());
+        #endif
+        String body = _httpGet(_configURL);
+        #ifdef STRATUS_DEBUGGING
+            Serial.printf("update() got body=>>\n%s<<\n", body.c_str());
+        #endif
         
-  if (_verifyMD5(payload)) {
-    #ifdef STRATUS_DEBUGGING
-      Serial.println("data is valid; storing");
-    #endif
-    _age = TIME_NOW;
-    // strncpy(_body, payload, sizeof(_body));
-    _body = String(payload);
-    free(payload);
-    ret = true;
-  } else {
-    #ifdef STRATUS_DEBUGGING
-      Serial.println("could not validate data :(");
-    #endif
-    free(payload);
-  }
+        if (! body.endsWith(String("\n"))) {
+            #ifdef STRATUS_DEBUGGING
+                Serial.printf("padding body\n");
+            #endif
+            body = String(body + "\n");
+            #ifdef STRATUS_DEBUGGING
+                Serial.printf("body now >>\n%s<<\n", body.c_str());
+            #endif
+        }
 
-  updateSubscriptions();
-  
-  return ret;
-} // bool update()
+        if (body.length() > 0) {
+                #ifdef STRATUS_DEBUGGING
+                    Serial.printf("proceeding to _verifyMD5()\n");
+                #endif
+
+            if (_verifyMD5(body)) {
+                #ifdef STRATUS_DEBUGGING
+                    Serial.println("data is valid; storing");
+                #endif
+                _lastUpdate = Time.now();
+                _body = body;
+                Particle.publish("Stratus updated successfully", PRIVATE);
+                #ifdef CACHE_ENABLED
+                    _strings.init();
+                    _ints.init();
+                    _hexes.init();
+                    _floats.init();
+                #endif CACHE_ENABLED
+
+                return true;
+            } else {
+                #ifdef STRATUS_DEBUGGING
+                    Serial.println("could not validate data :(");
+                #endif
+                Particle.publish("Stratus failed to update", "MD5 failure", PRIVATE);
+                return false;
+            }
+        } else {
+            Particle.publish("Stratus failed to update", PRIVATE);
+            return false;                
+        }
+        updateSubscriptions();
+    } // bool update()
+
+#else
+    bool Stratus::update() {
+        #ifdef STRATUS_DEBUGGING
+            Serial.printf("[HTTP] begin...\n");
+        #endif
+        if (! _http.begin(_client, _configURL)) { 
+            Serial.printf("[HTTP] unable to connect");
+            return false;
+        }
+        #ifdef STRATUS_DEBUGGING
+            Serial.print("[HTTP] GET...\n");
+        #endif
+        // start connection and send HTTP header
+        int httpCode = _http.GET();
+    
+        if (httpCode < 0) { 
+            #ifdef STRATUS_DEBUGGING
+                Serial.printf("[HTTP] GET... failed, error: %s\n", _http.errorToString(httpCode).c_str());
+            #endif
+            return false;
+        }
+    
+        if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+            String payload = _http.getString();
+            #ifdef STRATUS_DEBUGGING
+                Serial.println(payload);
+            #endif
+            
+            if (_verifyMD5(payload)) {
+                #ifdef STRATUS_DEBUGGING
+                    Serial.println("data is valid; storing");
+                #endif
+                _age = TIME_NOW;
+                _body = payload;
+                return true;
+            } else {
+                #ifdef STRATUS_DEBUGGING
+                    Serial.println("could not validate data :(");
+                #endif
+                return false;
+            }
+        }
+     } // bool update()
+#endif
 
 
-// returns true if it's not time to update, or if the update succeeds
+        
+// returns true if it's not time to update, or if the update suceeds
 // returns false if the update fails
-//
-// potential problem: if an update is not successful (age() doesn't get small)
-// this may fire *every* time.  For somtehing like a 404, this could be upgly
-//
-// TODO: rate limit
 bool Stratus::maybeUpdate(const time_t interval) {
-    if (age() > interval) {
+    time_t myInterval;
+    if (interval == 0) {
+        myInterval = _refreshInterval;
+    } else {
+        myInterval = interval;
+    }
+    if (age() > myInterval) {
         return update();
     }
     return true;
 } // bool maybeUpdate(time_t)
+        
+
+bool Stratus::maybeUpdate() {
+    // get("REFRESH INTERVAL", _refreshInterval);
+    return maybeUpdate(_refreshInterval);
+} // maybeUpdate()
 
 
 String Stratus::get(const String key, String defaultValue = "") {
     String value;
-    if ((value = _strings.get(key)) != (String)0) {
-        return value;
-    }
+    #ifdef CACHE_ENABLED
+        if ((value = _strings.get(key)) != (String)0) {
+            return value;
+        }
+    #endif
     
     value = _get(key, _body);
     if (value.length() > 0) {
-        _strings.insert(key, value);
+        #ifdef CACHE_ENABLED
+            _strings.insert(key, value);
+        #endif
         return value;
     }
     return defaultValue;
 } // String get(key)
 
 
-bool Stratus::_toInt(const String data, int32_t &result) {
-    #ifdef STRATUS_DEBUGGING
-        Serial.printf("converting %s\n", data.c_str());
-    #endif
-            
-    if (data.equals("0")) {
-        result = 0;
-        return true;
-    } else if (data.startsWith("-")) {
-        // data = data.substring(1);
-        result = -1 * data.substring(1).toInt();
-        return true;
-    } else if (data.toInt() != 0) {
-        result = data.toInt();
-        return true;
-    } else if (data.startsWith("0x")) {
-        #ifdef STRATUS_DEBUGGING
-            Serial.printf("Hex? '%s'\n", data.c_str());
-        #endif
-        result = strtoul(data.c_str(), NULL, 16);
-        return true;
-    }
-            
-    return false;
-} // bool _toInt(String, &int32_t)
-
-
 // looks for / returns an int32_t specifically
 // TODO: correctly handle zero, broken keys (which will look like zero)
 int32_t Stratus::getInt(const String key, const int32_t defaultValue) {
     int32_t ret;
-    if ((ret = _ints.get(key)) != 0) {
-        return ret;
-    }
+    #ifdef CACHE_ENABLED
+        if ((ret = _ints.get(key)) != 0) {
+            return ret;
+        }
+    #endif
     
     String value = _get(key, _body);
             
@@ -314,27 +475,34 @@ int32_t Stratus::getInt(const String key, const int32_t defaultValue) {
         #ifdef STRATUS_DEBUGGING
             Serial.printf("Fetched int '%s'= %d\n", key.c_str(), ret);
         #endif
-        _ints.insert(key, ret);
+        #ifdef CACHE_ENABLED
+            _ints.insert(key, ret);
+        #endif
         return ret;
     } else { 
         return defaultValue;
     }
-} // int32_t getInt(key, defaultValue)
+} // int32_t get(key, defaultValue)
 
 
 float Stratus::getFloat(const String key, const float defaultValue) {
-    float ret = _floats.get(key);
-    if (ret != 0) {
-        return ret;
-    }
-
+    float ret;
+    #ifdef CACHE_ENABLED
+        ret = _floats.get(key);
+        if (ret != 0) {
+            return ret;
+        }
+    #endif
+    
     String value = _get(key, _body);
     #ifdef STRATUS_DEBUGGING
         Serial.printf("getting double for %s: %s\n", key.c_str(), value.c_str());
     #endif
     ret = value.toFloat();
     if (ret != 0) {
-        _floats.insert(key, ret);
+        #ifdef CACHE_ENABLED
+            _floats.insert(key, ret);
+        #endif
         return ret;
     } else {
         return defaultValue;
@@ -345,10 +513,13 @@ float Stratus::getFloat(const String key, const float defaultValue) {
 // looks for / returns a uint32_t specifically -- 0xC0FFEE
 // TODO: correctly handle zero
 uint32_t Stratus::getHex(const String key, const uint32_t defaultValue) {
-    uint32_t ret = _hexes.get(key);
-    if (ret != 0) {
-        return ret;
-    }
+    uint32_t ret;
+    #ifdef CACHE_ENABLED
+        ret = _hexes.get(key);
+        if (ret != 0) {
+            return ret;
+        }
+    #endif
     
     String value = _get(key, _body);
     #ifdef STRATUS_DEBUGGING
@@ -360,7 +531,9 @@ uint32_t Stratus::getHex(const String key, const uint32_t defaultValue) {
         #endif
         ret = strtoul(value.c_str(), NULL, 16);
         if (ret) {
-            _hexes.insert(key, ret);
+            #ifdef CACHE_ENABLED
+                _hexes.insert(key, ret);
+            #endif
             return ret;
         } 
     }
@@ -377,7 +550,7 @@ void Stratus::setConfigURL(const String configURL) {
         return; 
     }
     
-    #ifdef PHOTON
+    #ifdef PHWOTON
         int start = 0;
     
         // _configURL = configURL;
@@ -407,9 +580,36 @@ void Stratus::setConfigURL(const String configURL) {
 } // setConfigURL(String)
 
 
+// a helper function to iteratively load a GUID-specific config URL
+// until it gets to a leaf
+void Stratus::chaseConfigURL() {
+    String newConfigURL = get(getGUID() + " config url");
+    String oldConfigURL = "";
+    while (not newConfigURL.equals("") and not newConfigURL.equals(oldConfigURL)) {
+        setConfigURL(newConfigURL);
+        if (update()) {
+            oldConfigURL = newConfigURL;
+            newConfigURL = get(getGUID() + " config url");
+        } else {
+            return;
+        }
+    }
+} // chaseConfigURL()
+
+        
 void Stratus::setSecret(const String secret) {
     _secret = secret;
 } // setSecret(secret)
+        
+        
+// return a GUID
+String Stratus::getGUID() {
+    #ifdef PHOTON
+        return System.deviceID();
+    #else
+        return String(ESP_getChipId(), HEX);
+    #endif
+} // String getGUID()
         
 
 // returns the age of stratus data in seconds.
@@ -429,7 +629,7 @@ time_t Stratus::age() {
 // lower-level function; this is never cached
 String Stratus::_get(const String key, const String data) {
     #ifdef STRATUS_DEBUGGING
-        Serial.printf("get()ing key=%s", key.c_str());
+        Serial.printf("get()ing key=%s\n", key.c_str());
     #endif
     String ret;
 
@@ -440,7 +640,9 @@ String Stratus::_get(const String key, const String data) {
         #ifdef STRATUS_DEBUGGING
             Serial.printf("; ret='%s'\n", ret.c_str());
         #endif
-        _strings.insert(key, ret);
+        #ifdef CACHE_ENABLED
+            _strings.insert(key, ret);
+        #endif
         return ret;
     }
             
@@ -450,12 +652,114 @@ String Stratus::_get(const String key, const String data) {
     return String("");
 } // String _get(key)
 
+
+String Stratus::_httpGet(const String url) {
+    #ifdef STRATUS_DEBUGGING
+        uint32_t freemem = System.freeMemory();
+        Serial.print("free memory: ");
+        Serial.println(freemem);
+        Serial.printf("_httpGet(%s)\n", url.c_str());
+    #endif
+    #ifdef PHOTON
+        http_header_t headers[] = {
+            //  { "Content-Type", "application/json" },
+            //  { "Accept" , "application/json" },
+            { "User-Agent", "stratus/0.1" },
+            { "Accept" , "*/*"},
+            { NULL, NULL } // NOTE: Always terminate headers with NULL
+        };
+        
+        http_request_t request;
+        http_response_t response;
+        // response.body.reserve(10240);
+        _http.buffer = _http_buffer;
+        
+        int start = 0;
+        
+        // skip over http 
+        if (url.startsWith("http://")) {
+            start = String("http://").length();
+            // Serial.printf("starting at %d\n", start);
+        }
+        // find the port, if it exists
+        int colon = url.indexOf(':', start);
+        if (colon >= 0) {
+            request.port = url.substring(colon).toInt();
+        } else {
+            request.port = 80;
+        }
+        // grab the hostname -- first part before a : or /
+        int slash = url.indexOf('/', start);
+        if (colon != -1) {
+            request.hostname = url.substring(start, colon);
+        } else {
+            request.hostname = url.substring(start, slash);
+        }
+        // path is everything after that slash
+        request.path = url.substring(slash);
+        // Serial.printf("got: host=%s, path=%s\n", request.hostname.c_str(), request.path.c_str());
+    
+        // GET request
+        _http.get(request, response, headers);
+                    
+        #ifdef STRATUS_DEBUGGING
+            Serial.printf("Application>\tResponse status: %d\n", response.status);
+            Serial.printf("Application>\tHTTP Response Body: %s\n", response.body.c_str());
+        #endif
+                    
+        if (response.status == 200) {
+            return response.body;
+        } else {
+            return "";
+        }
+    #endif
+} // String _httpGet(url)
+
+
+String Stratus::_md5(const String data) {
+    #ifdef PHOTON
+        unsigned char result[16];
+    
+        MD5_CTX hash;
+        MD5_Init(&hash);
+        MD5_Update(&hash, data, data.length());
+        MD5_Final(result, &hash);
+    
+        char buf[33];
+        for (int i=0; i<16; i++)
+            sprintf(buf+i*2, "%02x", result[i]);
+        buf[32]=0;
+    
+        return String(buf);
+    #else
+        MD5Builder md5;
+        md5.begin();
+        md5.add(data);
+        md5.calculate();
+        return md5.toString();
+    #endif
+} // String _md5(data)
+
         
 // verifies the MD5 checksum appended to a given String:
 // MD5: <ASCII MD5SUM>
 // WIP: signature: <ASCII/HEX MD5SUM>
 bool Stratus::_verifyMD5(const String dataIn) {
+    #ifdef STRATUS_DEBUGGING
+        uint32_t freemem = System.freeMemory();
+        Serial.print("free memory: ");
+        Serial.println(freemem);
+        Serial.printf("starting _verifyMD5(%s)\n", dataIn.c_str());
+    #endif
+    
     String data = String(dataIn);
+    #ifdef STRATUS_DEBUGGING
+        freemem = System.freeMemory();
+        Serial.print("free memory: ");
+        Serial.println(freemem);
+
+        Serial.printf("gonna _get\n");
+    #endif
     String targetMD5 = _get("signature", data);
     String md5Sum;
             
@@ -468,20 +772,10 @@ bool Stratus::_verifyMD5(const String dataIn) {
     if (md5Posn != -1) {
         data.remove(md5Posn);
     } 
-    
-    #ifdef STRATUS_DEBUGGING
-        Serial.printf("JFYI, data is pruned to this long: %d\n", data.length());
-        Serial.printf("data: >>%s<<\n", data.c_str());
-    #endif
-
-    char md5data[2048];
-    snprintf(md5data, sizeof(md5data), "%s\n%s", _secret.c_str(), data.c_str());
-    #ifdef STRATUS_DEBUGGING
-      Serial.printf("hashing >>%s<<\n", md5data);
-    #endif
-    md5Sum = md5sum(md5data);
+    md5Sum = _md5(_secret + "\n" + data); // data);
 
     #ifdef STRATUS_DEBUGGING
+        Serial.printf("Hashing: >%s\n%s<\n", _secret.c_str(), data.c_str());
         Serial.printf("Computed MD5: %s\n", md5Sum.c_str());
     #endif
             
@@ -489,10 +783,35 @@ bool Stratus::_verifyMD5(const String dataIn) {
         return false;
     }
     return md5Sum == targetMD5;
-} // _verifyMD5()
+} // verifyMD5()
 
 
-
+// TODO: better error-handling        
+bool Stratus::_toInt(const String data, int32_t &result) {
+    #ifdef STRATUS_DEBUGGING
+        Serial.printf("converting %s\n", data.c_str());
+    #endif
+            
+    if (data.equals("0")) {
+        result = 0;
+        return true;
+    } else if (data.startsWith("-")) {
+        // data = data.substring(1);
+        result = -1 * data.substring(1).toInt();
+        return true;
+    } else if (data.toInt() != 0) {
+        result = data.toInt();
+        return true;
+    } else if (data.startsWith("0x")) {
+        #ifdef STRATUS_DEBUGGING
+            Serial.printf("Hex? '%s'\n", data.c_str());
+        #endif
+        result = strtoul(data.c_str(), NULL, 16);
+        return true;
+    }
+            
+    return false;
+} // bool toInt(String, &int32_t)
 
 
 /* * * * * *
@@ -552,7 +871,7 @@ String Stratus::_send(StratusMessage message) {
     #ifdef STRATUS_DEBUGGING
         Serial.printf("send URL: >%s<\n", iotmqURL.c_str());
     #endif
-    String data = httpGet(iotmqURL.c_str());
+    String data = _httpGet(iotmqURL);
     #ifdef STRATUS_DEBUGGING
         Serial.printf("data: >>%s<<", data.c_str());
     #endif
@@ -620,7 +939,7 @@ void Stratus::updateSubscriptions() {
             _subscriptions[i]._reset = false;
         }
     }
-} // updateSubscriptions()
+} // _updateSubscriptions()
 
 
 void Stratus::unsubscribe() {
