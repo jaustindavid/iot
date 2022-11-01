@@ -54,7 +54,7 @@ int16_t REFRESH_INTERVAL = 300;
     #include "display.h"
 #endif
 
-#include "tweeter.h"
+// #include "tweeter.h"
 #include "leds.h"
 
 #include "buddy.h"
@@ -84,7 +84,7 @@ void setup() {
     Serial.println(stratus.getGUID());
     
     setupTZOffset();
-    setupTweeter();
+    // setupTweeter();
     buddy.setup();
 } // setup()
 
@@ -104,8 +104,9 @@ void loop() {
         Particle.syncTime();
         stratus.update();
     }
-    
-    int intensity = checkIntensity();
-    int recency = checkRecency();
-    burn(recency, intensity);
+    /*
+        int intensity = checkIntensity();
+        int recency = checkRecency();
+        burn(recency, intensity);
+    */
 } // loop()
