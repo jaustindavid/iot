@@ -211,7 +211,8 @@ void Turtle::walkTo(byte newX, byte newY, color c, byte speed) {
     t.speed = speed;
     tasks->enqueue(t);
     print();
-    Serial.printf(": a (%d,%d)\n", t.x, t.y);
+    Serial.printf("; enq a->(%0d,%0d)", t.x, t.y);
+    Serial.printf("; %d tasks in queue\n", tasks->count());
     // Serial.println(s);
 } // walkTo(x, y, color, speed)
 
@@ -237,6 +238,7 @@ void Turtle::walk(int dx, int dy, color c, byte speed) {
     t.speed = speed;
     tasks->enqueue(t);
     print(); 
+    Serial.printf("; enq d->(%0d,%0d)", t.x, t.y);
     Serial.printf("; %d tasks in queue\n", tasks->count());
     //Serial.printf(": d (%d,%d)\n", t.x, t.y);
 } // walk(dx, dy, color, speed)
@@ -290,6 +292,7 @@ void Turtle::decode(String s) {
 void Turtle::startATask() {
     if (! tasks->isEmpty()) {
         Task task = tasks->dequeue();
+        Serial.printf("q=%d\n", tasks->count());
         switch (task.instruction) {
             case 'a': // absolute
                 drawLine(task.x, task.y, task.color, task.speed);

@@ -15,7 +15,7 @@ Adafruit_NeoPixel display(PIXEL_COUNT, PIXEL_PIN, PIXEL_TYPE);
 #include "TinyQueue.h"
 #include "turtle.h"
 #include "WobblyTime.h"
-
+#include "digits.h"
 
 #include <particle-dst.h>
 DST dst;
@@ -37,17 +37,19 @@ int forcedM = -1;
 
 
 Matrix matrix(&display);
-Turtle turtle(&matrix, 100);
+Turtle turtle(&matrix, 25);
 // Turtle secondHand(&matrix);
 WobblyTime wTime;
+Digits digs(&turtle);
 
 
 void catchup();
 void recolor(byte position, color c);
 void markDirty(byte h, byte m);
 bool maybeUpdateTime(byte h, byte m);
-void drawDigit(byte digit, byte position, color c, byte speed);
+//void drawDigit(byte digit, byte position, color c, byte speed);
 void drawColon(byte speed);
+/*
 void animate0(Turtle *turtle, byte startX, color c, byte speed);
 void animate1(Turtle *turtle, byte startX, color c, byte speed);
 void animate2(Turtle *turtle, byte startX, color c, byte speed);
@@ -58,6 +60,8 @@ void animate6(Turtle *turtle, byte startX, color c, byte speed);
 void animate7(Turtle *turtle, byte startX, color c, byte speed);
 void animate8(Turtle *turtle, byte startX, color c, byte speed);
 void animate9(Turtle *turtle, byte startX, color c, byte speed);
+*/
+void ping();
 
 int brightCallback(String parameter) {
     int b = parameter.toInt();
@@ -112,6 +116,8 @@ void setup() {
     dst.begin(beginning, end, 1);
     dst.automatic(true);
     dst.check();
+    
+    ping();
 
     wTime.setup();
 
@@ -119,14 +125,18 @@ void setup() {
     lastHour = wTime.hour();
     digits[0] = lastHour/10;
     digits[1] = lastHour%10;
-    drawDigit(digits[0], 0, BLUE, FAST);
-    drawDigit(digits[1], 1, BLUE, FAST);
+    // drawDigit(digits[0], 0, BLUE, FAST);
+    digs.draw(0, digits[0]);
+    // drawDigit(digits[1], 1, BLUE, FAST);
+    digs.draw(1, digits[1]);
     drawColon(FAST);
     // catchup();
     digits[2] = lastMinute/10;
     digits[3] = lastMinute%10;
-    drawDigit(digits[2], 2, BLUE, FAST);
-    drawDigit(digits[3], 3, BLUE, FAST);
+    // drawDigit(digits[2], 2, BLUE, FAST);
+    digs.draw(2, digits[2]);
+    // drawDigit(digits[3], 3, BLUE, FAST);
+    digs.draw(3, digits[3]);
     Particle.function("setTime", setTime);
     Particle.function("uptime", uptime);
 } // setup()
@@ -148,6 +158,7 @@ void wander() {
 
 
 SimpleTimer day(24*60*60*1000);
+SimpleTimer fiver(5*1000);
 void loop() {
     if (day.isExpired()) {
         Particle.syncTime();
@@ -158,8 +169,8 @@ void loop() {
     byte m = wTime.minute();
     byte s = wTime.second();
     
-    if (turtle.isBusy()) {
-        turtle.go();
+    if (digs.isBusy()) {
+        digs.go();
     } else {
         if (forcedH != -1) {
             h = forcedH;
@@ -169,16 +180,14 @@ void loop() {
 
         maybeUpdateTime(h, m);
 
-        if (!turtle.isBusy()) {
-            turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, FAST);
-        }
+        turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, FAST);
     }
     matrix.show();
     mspf.wait();
+    ping();
 } // loop()
 
 
-/* DEAD
 void catchup() {
     while (turtle.isBusy()) { 
         turtle.go(); 
@@ -187,7 +196,6 @@ void catchup() {
         mspf.wait(); 
     }
 }
-*/
 
 
 byte positions[5] = { 3, 9, 18, 24, 15 };
@@ -227,33 +235,41 @@ bool maybeUpdateTime(byte h, byte m) {
         markDirty(h, m);
         if (h/10 != digits[0]) {
             // Serial.printf("Hour: %d|x", h/10);
-            drawDigit(digits[0], 0, BLACK, FAST);
+            // drawDigit(digits[0], 0, BLACK, FAST);
+            digs.erase(0);
             digits[0] = h/10;
-            drawDigit(digits[0], 0, BLUE, SLOW);
+            // drawDigit(digits[0], 0, BLUE, SLOW);
+            digs.draw(0, digits[0]);
         }
         
         if (h%10 != digits[1]) {
             // Serial.printf("Hour: x|%d", h%10);
-            drawDigit(digits[1], 1, BLACK, FAST);
+            // drawDigit(digits[1], 1, BLACK, FAST);
+            digs.erase(1);
             digits[1] = h%10;
-            drawDigit(digits[1], 1, BLUE, SLOW);
+            // drawDigit(digits[1], 1, BLUE, SLOW);
+            digs.draw(1, digits[1]);
         }
 
         // drawColon();
-        // catchup();
+        catchup();
         
         if (m/10 != digits[2]) {
             // Serial.printf("Minute: %d|x", m/10);
-            drawDigit(digits[2], 2, BLACK, FAST);
+            // drawDigit(digits[2], 2, BLACK, FAST);
+            digs.erase(2);
             digits[2] = m/10;
-            drawDigit(digits[2], 2, BLUE, SLOW);
+            // drawDigit(digits[2], 2, BLUE, SLOW);
+            digs.draw(2, digits[2]);
         }
         
         if (m%10 != digits[3]) {
             // Serial.printf("Minute: x|%d", m%10);
-            drawDigit(digits[3], 3, BLACK, FAST);
+            // drawDigit(digits[3], 3, BLACK, FAST);
+            digs.erase(3);
             digits[3] = m%10;
-            drawDigit(digits[3], 3, BLUE, SLOW);
+            // drawDigit(digits[3], 3, BLUE, SLOW);
+            digs.draw(3, digits[3]);
         }
         
         lastMinute = m;
@@ -262,8 +278,13 @@ bool maybeUpdateTime(byte h, byte m) {
     return false;
 } // bool maybeUpdateTime(h, m)
 
-
+/*
 void drawDigit(byte digit, byte position, color c, byte speed) {
+    if (c == BLUE) {
+        digs.draw(position, digit);
+    } else {
+        digs.erase(position);
+    }
     Serial.printf("drawing %d at %d\n", digit, position);
     byte start = positions[position];
     // Serial.printf("drawing %d @ %d\n", digit, position);
@@ -301,7 +322,7 @@ void drawDigit(byte digit, byte position, color c, byte speed) {
     }
 //    digits[position] = digit;
 }
-
+*/
 
 void drawColon(byte speed) {
     turtle.walkTo(15, 1, TRANSPARENT, FAST);
@@ -315,7 +336,7 @@ void drawColon(byte speed) {
     turtle.walk(-1, 0, BLUE, speed);
 }
 
-
+/*
 void animate0(Turtle *turtle, byte startX, color c, byte speed) {
     turtle->walkTo(startX + 1, 0, TRANSPARENT, FAST);
     turtle->walk(2, 0, c, speed);
@@ -459,4 +480,47 @@ void animate9(Turtle *turtle, byte startX, color c, byte speed) {
     turtle->walk(-1, 1, c, speed);
     turtle->walk(-2, 0, c, speed);
     turtle->walk(-1, -1, c, speed);
+}
+*/
+
+void ping() {
+    static SimpleTimer tenS(10*1000);
+    static byte strength = 0;
+    if (tenS.isExpired()) {
+        IPAddress innernet(8,8,8,8);
+        unsigned long start = millis();
+        byte n = WiFi.ping(innernet, 3);
+        float duration = 1.0*(millis() - start)/3;
+        String s = String::format("%d replies, avg %5.2f ms", n, duration);
+        //Particle.publish("pung", s);
+        Serial.println(s);
+        color status;
+        switch (n) {
+            case 3: 
+                status = GREEN;
+                break;
+            case 2:
+                status = YELLOW;
+                break;
+            default:
+                status = RED;
+        }
+        if (duration < 50) {
+            strength = min(strength + 1, 8);
+        } else if (duration < 100) {
+            strength = max(strength - 1, 6);
+        } else if (duration < 150) {
+            strength = max(strength - 1, 3);
+        } else {
+            strength = 2;
+        }
+        for (byte y = 0; y < MATRIX_Y - strength; y++) {
+            matrix.setPixel(0, y, BLACK);
+            matrix.setPixel(1, y, BLACK);            
+        }
+        for (byte y = MATRIX_Y - strength; y < MATRIX_Y; y++) {
+            matrix.setPixel(0, y, status);
+            matrix.setPixel(1, y, status);    
+        }
+    }
 }
