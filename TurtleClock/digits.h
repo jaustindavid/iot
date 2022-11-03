@@ -21,6 +21,7 @@ class Digits {
         Turtle *turtle;
         const byte positions[5] = { 3, 9, 18, 24, 15 };
         void drawDigit(byte, byte, color, byte);
+        void animateColon(byte);
         void animate0(byte, color, byte);
         void animate1(byte, color, byte);
         void animate2(byte, color, byte);
@@ -35,6 +36,7 @@ class Digits {
     public:
         Digits(Turtle*);
         void erase(byte);
+        void drawColon();
         void draw(byte, byte);
         bool isBusy();
         void go();
@@ -65,7 +67,17 @@ void Digits::draw(byte position, byte n) {
     d.c = BLUE;
     d.n = n;
     digits->enqueue(d);
-    Serial.printf("Digit: enq(draw %d@#%d); q#%d\n", d.position, d.n, digits->count());
+    Serial.printf("Digit: enq(draw %d@#%d); q#%d\n", d.n, d.position, digits->count());
+} // draw(position, n)
+
+
+void Digits::drawColon() {
+    Digit d;
+    d.position = 5;
+    d.c = BLUE;
+    d.n = -1;
+    digits->enqueue(d);
+    Serial.printf("Digit: enq(draw ::); q#%d\n", digits->count());
 } // draw(position, n)
 
 
@@ -89,7 +101,11 @@ void Digits::go() {
     }
     
     Digit d = digits->dequeue();
-    if (d.c == BLUE) {
+    if (d.position == 5)  {
+        Serial.printf("Digits: draw :: ; %d remain\n", d.n, d.position, digits->count());
+        animateColon(SLOW);
+        print();
+    } else if (d.c == BLUE) {
         Serial.printf("Digits: draw %d @ #%d; %d remain\n", d.n, d.position, digits->count());
         drawDigit(d.n, d.position, d.c, SLOW);
         current[d.position] = d.n;
@@ -106,6 +122,18 @@ void Digits::print() {
     Serial.printf("now: %d%d:%d%d\n", current[0], current[1], current[2], current[3]);
 }
 
+
+void Digits::animateColon(byte speed) {
+    turtle->walkTo(15, 1, TRANSPARENT, FAST);
+    turtle->walk(1, 0, BLUE, speed);
+    turtle->walk(0, 1, BLUE, speed);
+    turtle->walk(-1, 0, BLUE, speed);
+    
+    turtle->walk(0, 2, TRANSPARENT, FAST);
+    turtle->walk(1, 0, BLUE, speed);
+    turtle->walk(0, 1, BLUE, speed);
+    turtle->walk(-1, 0, BLUE, speed);
+}
 
 
 void Digits::drawDigit(byte n, byte position, color c, byte speed) {

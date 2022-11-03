@@ -90,7 +90,9 @@ int uptime(String j) {
 void setup() {
     Serial.begin(115200);
     display.begin();
-    display.setBrightness(32);
+    display.setBrightness(64);
+    setupPtrans();
+    setBrightness();
     Particle.function("brightness", brightCallback);
     for (int i = 0; i < display.numPixels(); i++) {
         display.setPixelColor(i, BLACK);
@@ -125,12 +127,9 @@ void setup() {
     lastHour = wTime.hour();
     digits[0] = lastHour/10;
     digits[1] = lastHour%10;
-    // drawDigit(digits[0], 0, BLUE, FAST);
     digs.draw(0, digits[0]);
-    // drawDigit(digits[1], 1, BLUE, FAST);
     digs.draw(1, digits[1]);
-    drawColon(FAST);
-    // catchup();
+    digs.drawColon();
     digits[2] = lastMinute/10;
     digits[3] = lastMinute%10;
     // drawDigit(digits[2], 2, BLUE, FAST);
@@ -142,23 +141,10 @@ void setup() {
 } // setup()
 
 
-/* DEAD
-void wander() {
-    while (true) {
-        if (random(100) < 25) {
-            turtle.turn(random(100) > 50 ? -90 : 90);
-        } else {
-            turtle.step();
-        }
-        matrix.show();
-        mspf.wait();
-    }
-}
-*/
-
-
 SimpleTimer day(24*60*60*1000);
 SimpleTimer fiver(5*1000);
+SimpleTimer tenSec(10*1000);
+
 void loop() {
     if (day.isExpired()) {
         Particle.syncTime();
@@ -172,6 +158,7 @@ void loop() {
     if (digs.isBusy()) {
         digs.go();
     } else {
+        turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, FAST);
         if (forcedH != -1) {
             h = forcedH;
             m = forcedM;
@@ -179,13 +166,40 @@ void loop() {
         }
 
         maybeUpdateTime(h, m);
-
-        turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, FAST);
     }
     matrix.show();
     mspf.wait();
-    ping();
+    if (tenSec.isExpired()) {
+        setBrightness();
+        ping();
+    }
 } // loop()
+
+
+void setupPtrans() {
+#define PTRANS_5V    A0
+#define PTRANS_SENSE A1
+#define PTRANS_GND   A2
+    pinMode(PTRANS_5V, OUTPUT);
+    pinMode(PTRANS_SENSE, INPUT);
+    pinMode(PTRANS_GND, OUTPUT);
+    
+    digitalWrite(PTRANS_GND, LOW);
+    digitalWrite(PTRANS_5V, HIGH);
+} // setupPtrans();
+
+
+void setBrightness() {
+    byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {15, 16}, {10, 8}, {0, 4}};
+    int luna = analogRead(A1);
+    Serial.printf("Raw luna: %d\n", luna);
+    byte i = 0;
+    while (luna < brights[i][0]) {
+        i++;
+    }
+    Serial.printf("i=%d; luna >= %d, brightness->%d\n", i, brights[i][0], brights[i][1]);
+    display.setBrightness(brights[i][1]);
+} // setBrightness()
 
 
 void catchup() {
@@ -278,51 +292,6 @@ bool maybeUpdateTime(byte h, byte m) {
     return false;
 } // bool maybeUpdateTime(h, m)
 
-/*
-void drawDigit(byte digit, byte position, color c, byte speed) {
-    if (c == BLUE) {
-        digs.draw(position, digit);
-    } else {
-        digs.erase(position);
-    }
-    Serial.printf("drawing %d at %d\n", digit, position);
-    byte start = positions[position];
-    // Serial.printf("drawing %d @ %d\n", digit, position);
-    switch (digit) {
-        case 1:
-            animate1(&turtle, start, c, speed);
-            break;
-        case 2:
-            animate2(&turtle, start, c, speed);
-            break;
-        case 3:
-            animate3(&turtle, start, c, speed);
-            break;
-        case 4:
-            animate4(&turtle, start, c, speed);
-            break;
-        case 5:
-            animate5(&turtle, start, c, speed);
-            break;
-        case 6:
-            animate6(&turtle, start, c, speed);
-            break;
-        case 7:
-            animate7(&turtle, start, c, speed);
-            break;
-        case 8:
-            animate8(&turtle, start, c, speed);
-            break;
-        case 9:
-            animate9(&turtle, start, c, speed);
-            break;
-        case 0:
-        default:
-            animate0(&turtle, start, c, speed);
-    }
-//    digits[position] = digit;
-}
-*/
 
 void drawColon(byte speed) {
     turtle.walkTo(15, 1, TRANSPARENT, FAST);
@@ -336,191 +305,42 @@ void drawColon(byte speed) {
     turtle.walk(-1, 0, BLUE, speed);
 }
 
-/*
-void animate0(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX + 1, 0, TRANSPARENT, FAST);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(0, 5, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(0, -5, c, speed);
-    turtle->walk(1, -1, c, speed);
-    // while (turtle->isBusy()) { turtle->go(); matrix.show(); }
-    // walk(2, 0, c);
-}
-
-
-void animate1(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX, 3, TRANSPARENT, FAST);
-    
-    turtle->walk(3, -3, c, speed);
-    turtle->walk(0, 7, c, speed);
-}
-
-
-void animate2(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX, 1, TRANSPARENT, FAST);
-    
-    turtle->walk(1, -1, c, speed);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(0, 1, c, speed);
-    turtle->walk(-4, 4, c, speed);
-    turtle->walk(0, 1, c, speed);
-    turtle->walk(4, 0, c, speed);
-    turtle->walk(0, -1, c, speed);
-}
-
-
-void animate3(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX, 1, TRANSPARENT, FAST);
-    
-    turtle->walk(0, -1, c, speed);
-    turtle->walk(4, 0, c, speed);
-    turtle->walk(0, 1, c, speed);
-    turtle->walk(-3, 2, c, speed);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1,1, c, speed);
-    turtle->walk(0, 2, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-}
-
-
-void animate4(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX+1, 0, TRANSPARENT, FAST);
-    
-    turtle->walk(-1, 3, c, speed);
-    turtle->walk(4, 0, c, speed);
-    
-    turtle->walk(-1, -2, TRANSPARENT, FAST);
-    turtle->walk(0,6, c, speed);
-}
-
-
-void animate5(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX + 4, 1, TRANSPARENT, FAST);
-    
-    turtle->walk(0, -1, c, speed);
-    turtle->walk(-4, 0, c, speed);
-    turtle->walk(0, 3, c, speed);
-    turtle->walk(3, 0, c, speed);
-    turtle->walk(1,1, c, speed);
-    turtle->walk(0,2, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-}
-
-
-void animate6(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX + 4, 1, TRANSPARENT, FAST);
-    
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(0, 5, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, -1, c, speed);
-    turtle->walk(0, -2, c, speed);
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(-1, 0, c, speed);
-}
-
-
-void animate7(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX, 1, TRANSPARENT, FAST);
-    
-    turtle->walk(0, -1, c, speed);
-    turtle->walk(4, 0, c, speed);
-    turtle->walk(0, 2, c, speed);
-    turtle->walk(-2, 2, c, speed);
-    turtle->walk(0, 3, c, speed);
-}
-
-
-void animate8(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX + 1, 0, TRANSPARENT, FAST);
-    
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(0, 1, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(0, 2, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, -1, c, speed);
-    turtle->walk(0, -2, c, speed);
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(0, -1, c, speed);
-    turtle->walk(1, -1, c, speed);
-    // walk(2, 0, c);
-}
-
-
-void animate9(Turtle *turtle, byte startX, color c, byte speed) {
-    turtle->walkTo(startX + 4, 2, TRANSPARENT, FAST);
-    
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-    turtle->walk(0, -1, c, speed);
-    turtle->walk(1, -1, c, speed);
-    turtle->walk(2, 0, c, speed);
-    turtle->walk(1, 1, c, speed);
-    turtle->walk(0, 5, c, speed);
-    turtle->walk(-1, 1, c, speed);
-    turtle->walk(-2, 0, c, speed);
-    turtle->walk(-1, -1, c, speed);
-}
-*/
 
 void ping() {
-    static SimpleTimer tenS(10*1000);
     static byte strength = 0;
-    if (tenS.isExpired()) {
-        IPAddress innernet(8,8,8,8);
-        unsigned long start = millis();
-        byte n = WiFi.ping(innernet, 3);
-        float duration = 1.0*(millis() - start)/3;
-        String s = String::format("%d replies, avg %5.2f ms", n, duration);
-        //Particle.publish("pung", s);
-        Serial.println(s);
-        color status;
-        switch (n) {
-            case 3: 
-                status = GREEN;
-                break;
-            case 2:
-                status = YELLOW;
-                break;
-            default:
-                status = RED;
-        }
-        if (duration < 50) {
-            strength = min(strength + 1, 8);
-        } else if (duration < 100) {
-            strength = max(strength - 1, 6);
-        } else if (duration < 150) {
-            strength = max(strength - 1, 3);
-        } else {
-            strength = 2;
-        }
-        for (byte y = 0; y < MATRIX_Y - strength; y++) {
-            matrix.setPixel(0, y, BLACK);
-            matrix.setPixel(1, y, BLACK);            
-        }
-        for (byte y = MATRIX_Y - strength; y < MATRIX_Y; y++) {
-            matrix.setPixel(0, y, status);
-            matrix.setPixel(1, y, status);    
-        }
+    IPAddress innernet(8,8,8,8);
+    unsigned long start = millis();
+    byte n = WiFi.ping(innernet, 3);
+    float duration = 1.0*(millis() - start)/3;
+    String s = String::format("%d replies, avg %5.2f ms", n, duration);
+    //Particle.publish("pung", s);
+    Serial.println(s);
+    color status;
+    switch (n) {
+        case 3: 
+            status = GREEN;
+            break;
+        case 2:
+            status = YELLOW;
+            break;
+        default:
+            status = RED;
     }
-}
+    if (duration < 50) {
+        strength = min(strength + 1, 8);
+    } else if (duration < 100) {
+        strength = max(strength - 1, 6);
+    } else if (duration < 150) {
+        strength = max(strength - 1, 3);
+    } else {
+        strength = 2;
+    }
+    for (byte y = 0; y < MATRIX_Y - strength; y++) {
+        matrix.setPixel(0, y, BLACK);
+        matrix.setPixel(1, y, BLACK);            
+    }
+    for (byte y = MATRIX_Y - strength; y < MATRIX_Y; y++) {
+        matrix.setPixel(0, y, status);
+        matrix.setPixel(1, y, status);    
+    }
+} // ping()
