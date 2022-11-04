@@ -46,7 +46,7 @@ int incrment(const int index) {
 template <class T>
 TinyQueue<T>::TinyQueue(byte qsize) {
     TINYQUEUE_SIZE = qsize;
-    _queue = (T*)malloc(sizeof(T) * TINYQUEUE_SIZE + 1);
+    _queue = (T*)malloc(sizeof(T) * (TINYQUEUE_SIZE + 1));
     reset();
 } // TinyQueue<T>()
 

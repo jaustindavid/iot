@@ -24,7 +24,7 @@
 #define MATRIX_X 32
 #define MATRIX_Y 8
 #define NSTEPS 10        // steps in the transition between pallets
-#define XFADE  10        // MSPF/10
+#define XFADE  20         // MSPF/10
 typedef uint32_t color;
 
 typedef struct Pixel {
@@ -34,6 +34,7 @@ typedef struct Pixel {
 
 class Matrix {
     private:
+        // TODO: heap
         color fg[MATRIX_X][MATRIX_Y];
         color bg[MATRIX_X][MATRIX_Y];
         // byte fadeable[MATRIX_X][MATRIX_Y];
@@ -43,15 +44,14 @@ class Matrix {
         Adafruit_NeoPixel *display;
         int txlate(byte, byte);
         void xfade(byte, byte, byte);
-        // void maybeFade(byte, byte);
-        // void fadeAll();
         
     public:
         Matrix(Adafruit_NeoPixel*);
         color getPixel(byte, byte);
         void setPixel(byte, byte, color);
         void setTurtle(byte, byte, color);
-        // void setFadeable(byte, byte);
+        void setTurtle(byte, byte, color, byte);
+        void fadeSome(byte, byte, byte, byte, byte);
         void show();
 };
 

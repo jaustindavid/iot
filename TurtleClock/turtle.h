@@ -11,9 +11,6 @@
 #define STATE_HLINE 1
 #define STATE_VLINE 2
 
-#define SLOW 3
-#define FAST 0
-
 
 class Task {
     public:
@@ -51,6 +48,19 @@ class Turtle {
         
         
     public:
+        // color enums
+        static const byte transparent = 0;
+        static const byte black = 1;
+        static const byte blue = 2;
+        static const byte green = 3;
+        
+        // speeds -- value is FPS
+        static const byte fast = 10;
+        static const byte slow = 2;
+        
+        // stop bit / special case
+        static const byte stop = 127;
+        
         int x, y, angle;
         color hidden;
 

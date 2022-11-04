@@ -80,13 +80,13 @@ void Turtle::print() {
 /*
  * INCREMENTAL VERSION
  * start: drawLine(x', y')
- * 
+ * iterate: while (state != STATE_IDLE) stepLine()
  *
  */
 
 
 void Turtle::stepLine() {
-    if (_delay != 0) {
+    if (false && _delay != 0) {
         _delay -= 1;
         return;
     } 
@@ -95,13 +95,7 @@ void Turtle::stepLine() {
     if (_trail != TRANSPARENT) {
         matrix->setPixel(x, y, _trail);
     } 
-    /* TURTLE
-    else {
-        // no trail; restore the previous color
-        matrix->setPixel(x, y, _hidden);
-        // TODO: deal with multiple turtles
-    } */
-    
+
     if (state == STATE_HLINE) {
         _x += _xi;
         _y += _dy;
@@ -113,12 +107,7 @@ void Turtle::stepLine() {
     x = round(_x);
     y = round(_y);
 
-    /* TURTLE
-    // draw my GREEN shell
-    _hidden = matrix->getPixel(x, y);
-    matrix->setPixel(x, y, GREEN);
-    */
-    matrix->setTurtle(x, y, GREEN);
+    matrix->setTurtle(x, y, GREEN, _speed);
     
     -- _i;
     _delay = _speed;
@@ -200,9 +189,7 @@ void Turtle::walkTo(byte newX, byte newY, color c, byte speed) {
         }   
         return;
     }
-    // Serial.printf("walking to (%d, %d): ", newX, newY);
-    // String s = String::format("a %d %d %u %d", newX, newY, c, speed);
-    // queue.enqueue(s);
+
     Task t;
     t.instruction = 'a';
     t.x = newX;
@@ -227,9 +214,6 @@ void Turtle::walk(int dx, int dy, color c, byte speed) {
         startATask();
     }
     
-    // Serial.printf("walk (%d, %d): ", dx, dy);
-    // String s = String::format("d %d %d %u %d", dx, dy, c, speed);
-    // queue.enqueue(s);
     Task t;
     t.instruction = 'd';
     t.x = dx;
@@ -251,43 +235,6 @@ void Turtle::teleport(byte newX, byte newY) {
     matrix->setTurtle(x, y, GREEN);
 }
 
-
-/* dead
-// tasks are always of the form:
-// instruction: c
-// x: d
-// y: d
-// color: u
-// speed: d
-void Turtle::decode(String s) {
-    char instruction = s.charAt(0);
-    // Serial.printf("Instruction: %c; ", instruction);
-    s.remove(0, s.indexOf(" ") + 1);
-    byte newX = s.toInt();
-    // Serial.printf("x: %d; ", x);
-    s.remove(0, s.indexOf(" ") + 1);
-    byte newY = s.toInt();
-    // Serial.printf("y: %d; ", y);
-    s.remove(0, s.indexOf(" ") + 1);
-    int c = s.toInt();
-    // Serial.printf("color: %d; ", c);
-    s.remove(0, s.indexOf(" ") + 1);
-    byte speed = s.toInt();
-    // Serial.printf("speed: %d; ", speed);
-    // Serial.println();
-    switch (instruction) {
-        case 'a': // absolute
-            drawLine(newX, newY, c, speed);
-            break;
-        case 'd': // delta
-            drawLine(x + newX, y + newY, c, speed);
-            break;
-        default:
-            // Serial.println("wth?");
-            true;
-    }
-}
-*/
 
 void Turtle::startATask() {
     if (! tasks->isEmpty()) {

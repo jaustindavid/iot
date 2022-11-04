@@ -25,7 +25,7 @@ dst_limit_t end;
 
 color bg[MATRIX_X][MATRIX_Y];
 
-SimpleTimer mspf(100);    // ms per frame
+SimpleTimer mspf(200);    // ms per frame
 SimpleTimer second(1000);
 
 
@@ -47,38 +47,19 @@ void catchup();
 void recolor(byte position, color c);
 void markDirty(byte h, byte m);
 bool maybeUpdateTime(byte h, byte m);
-//void drawDigit(byte digit, byte position, color c, byte speed);
-void drawColon(byte speed);
-/*
-void animate0(Turtle *turtle, byte startX, color c, byte speed);
-void animate1(Turtle *turtle, byte startX, color c, byte speed);
-void animate2(Turtle *turtle, byte startX, color c, byte speed);
-void animate3(Turtle *turtle, byte startX, color c, byte speed);
-void animate4(Turtle *turtle, byte startX, color c, byte speed);
-void animate5(Turtle *turtle, byte startX, color c, byte speed);
-void animate6(Turtle *turtle, byte startX, color c, byte speed);
-void animate7(Turtle *turtle, byte startX, color c, byte speed);
-void animate8(Turtle *turtle, byte startX, color c, byte speed);
-void animate9(Turtle *turtle, byte startX, color c, byte speed);
-*/
-void ping();
-
-int brightCallback(String parameter) {
-    int b = parameter.toInt();
-    if (b) {
-        display.setBrightness(b);
-        return 0;
-    }
-    return -1;
-} // int brightness(parameter)
+// void ping();
 
 
 int setTime(String hhmm) {
-    String hh = hhmm.substring(0, 2);
-    forcedH = hh.toInt();
-    String mm = hhmm.substring(3, 5);
-    forcedM = mm.toInt();
-    return 1;
+    if (hhmm.length() == 5) {
+        String hh = hhmm.substring(0, 2);
+        forcedH = hh.toInt();
+        String mm = hhmm.substring(3, 5);
+        forcedM = mm.toInt();
+        return forcedH * 100 + forcedM;
+    } else {
+        return -1;
+    }
 } // int setTime(hhmm)
 
 
@@ -90,10 +71,10 @@ int uptime(String j) {
 void setup() {
     Serial.begin(115200);
     display.begin();
-    display.setBrightness(64);
+    display.setBrightness(64); // redundant
     setupPtrans();
-    setBrightness();
-    Particle.function("brightness", brightCallback);
+    setBrightness("");
+    Particle.function("brightness", setBrightness);
     for (int i = 0; i < display.numPixels(); i++) {
         display.setPixelColor(i, BLACK);
     }
@@ -102,16 +83,12 @@ void setup() {
     Time.zone(-5);
 
     beginning.hour = 2;
-    //beginning.day = 3; // tuesday
-    beginning.day = DST::days::tue;
-    //beginning.month = 2; // february
+    beginning.day = DST::days::sun;
     beginning.month = DST::months::feb;
     beginning.occurrence = 2;
         
     end.hour = 2;
-    //end.day = 4; // wednesday
     end.day = DST::days::sun;
-    //end.month = 10; // october
     end.month = DST::months::nov;
     end.occurrence = 1;
         
@@ -132,9 +109,7 @@ void setup() {
     digs.drawColon();
     digits[2] = lastMinute/10;
     digits[3] = lastMinute%10;
-    // drawDigit(digits[2], 2, BLUE, FAST);
     digs.draw(2, digits[2]);
-    // drawDigit(digits[3], 3, BLUE, FAST);
     digs.draw(3, digits[3]);
     Particle.function("setTime", setTime);
     Particle.function("uptime", uptime);
@@ -142,7 +117,7 @@ void setup() {
 
 
 SimpleTimer day(24*60*60*1000);
-SimpleTimer fiver(5*1000);
+SimpleTimer oneSec(1000);
 SimpleTimer tenSec(10*1000);
 
 void loop() {
@@ -158,7 +133,7 @@ void loop() {
     if (digs.isBusy()) {
         digs.go();
     } else {
-        turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, FAST);
+        turtle.walkTo(MATRIX_X-1, s/MATRIX_Y, TRANSPARENT, Turtle::fast);
         if (forcedH != -1) {
             h = forcedH;
             m = forcedM;
@@ -167,19 +142,21 @@ void loop() {
 
         maybeUpdateTime(h, m);
     }
-    matrix.show();
-    mspf.wait();
+
+    matrix.fadeSome(0, 0, 1, MATRIX_Y-1, 2);
     if (tenSec.isExpired()) {
-        setBrightness();
+        setBrightness("");
         ping();
     }
+    matrix.show();
+    // mspf.wait();    // NOP; fps is actually dictated by the matrix, with xfader
 } // loop()
 
 
 void setupPtrans() {
-#define PTRANS_5V    A0
-#define PTRANS_SENSE A1
-#define PTRANS_GND   A2
+    #define PTRANS_5V    A0
+    #define PTRANS_SENSE A1
+    #define PTRANS_GND   A2
     pinMode(PTRANS_5V, OUTPUT);
     pinMode(PTRANS_SENSE, INPUT);
     pinMode(PTRANS_GND, OUTPUT);
@@ -189,17 +166,23 @@ void setupPtrans() {
 } // setupPtrans();
 
 
-void setBrightness() {
-    byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {15, 16}, {10, 8}, {0, 4}};
+int setBrightness(String input) {
+    int tune = input.toInt();
+    static byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {15, 16}, {10, 8}, {0, 4}};
     int luna = analogRead(A1);
     Serial.printf("Raw luna: %d\n", luna);
     byte i = 0;
     while (luna < brights[i][0]) {
         i++;
     }
+    if (tune > 0 && tune < 255) {
+        brights[i][1] = tune;
+        Serial.printf("Updating threshold @ %d -> %d", brights[i][0], tune);
+    }
     Serial.printf("i=%d; luna >= %d, brightness->%d\n", i, brights[i][0], brights[i][1]);
     display.setBrightness(brights[i][1]);
-} // setBrightness()
+    return brights[i][1];
+} // int setBrightness(input)
 
 
 void catchup() {
@@ -248,20 +231,14 @@ bool maybeUpdateTime(byte h, byte m) {
     if (m != lastMinute) {
         markDirty(h, m);
         if (h/10 != digits[0]) {
-            // Serial.printf("Hour: %d|x", h/10);
-            // drawDigit(digits[0], 0, BLACK, FAST);
             digs.erase(0);
             digits[0] = h/10;
-            // drawDigit(digits[0], 0, BLUE, SLOW);
             digs.draw(0, digits[0]);
         }
         
         if (h%10 != digits[1]) {
-            // Serial.printf("Hour: x|%d", h%10);
-            // drawDigit(digits[1], 1, BLACK, FAST);
             digs.erase(1);
             digits[1] = h%10;
-            // drawDigit(digits[1], 1, BLUE, SLOW);
             digs.draw(1, digits[1]);
         }
 
@@ -269,20 +246,14 @@ bool maybeUpdateTime(byte h, byte m) {
         catchup();
         
         if (m/10 != digits[2]) {
-            // Serial.printf("Minute: %d|x", m/10);
-            // drawDigit(digits[2], 2, BLACK, FAST);
             digs.erase(2);
             digits[2] = m/10;
-            // drawDigit(digits[2], 2, BLUE, SLOW);
             digs.draw(2, digits[2]);
         }
         
         if (m%10 != digits[3]) {
-            // Serial.printf("Minute: x|%d", m%10);
-            // drawDigit(digits[3], 3, BLACK, FAST);
             digs.erase(3);
             digits[3] = m%10;
-            // drawDigit(digits[3], 3, BLUE, SLOW);
             digs.draw(3, digits[3]);
         }
         
@@ -293,19 +264,6 @@ bool maybeUpdateTime(byte h, byte m) {
 } // bool maybeUpdateTime(h, m)
 
 
-void drawColon(byte speed) {
-    turtle.walkTo(15, 1, TRANSPARENT, FAST);
-    turtle.walk(1, 0, BLUE, speed);
-    turtle.walk(0, 1, BLUE, speed);
-    turtle.walk(-1, 0, BLUE, speed);
-    
-    turtle.walk(0, 2, TRANSPARENT, FAST);
-    turtle.walk(1, 0, BLUE, speed);
-    turtle.walk(0, 1, BLUE, speed);
-    turtle.walk(-1, 0, BLUE, speed);
-}
-
-
 void ping() {
     static byte strength = 0;
     IPAddress innernet(8,8,8,8);
@@ -313,7 +271,6 @@ void ping() {
     byte n = WiFi.ping(innernet, 3);
     float duration = 1.0*(millis() - start)/3;
     String s = String::format("%d replies, avg %5.2f ms", n, duration);
-    //Particle.publish("pung", s);
     Serial.println(s);
     color status;
     switch (n) {

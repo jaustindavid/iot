@@ -18,6 +18,10 @@
  * stall, depending on settings.
  *
  * TODO: add a few particle functions for console interaction
+ * TODO: speed up, rather than lurching forward
+ *
+ * update: pace is a "percent of realtime" measure
+ * 
  */
 
 
@@ -30,8 +34,8 @@ int rando(int rmin, int rmax) {
 class WobblyTime {
     private:
         byte h, m, s;
-        int MAX_ADVANCE, MIN_ADVANCE;
-        time_t fakeTime, initial, target;
+        int MAX_ADVANCE, MIN_ADVANCE, pace;
+        time_t fakeTime;
         SimpleTimer *tickTimer;
         void update();
         int setAdvance(String);
@@ -50,8 +54,6 @@ class WobblyTime {
 WobblyTime::WobblyTime() {
     MAX_ADVANCE = 300;         // at most, this fast
     MIN_ADVANCE = 30;           // at least this fast
-    target = MIN_ADVANCE + Time.now();
-    initial = Time.now();
     fakeTime = MIN_ADVANCE * 1.5 + Time.now();
     tickTimer = new SimpleTimer(1000);
 } // WobblyTime()
