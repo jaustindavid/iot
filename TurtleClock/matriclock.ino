@@ -47,6 +47,9 @@ void catchup();
 void recolor(byte position, color c);
 void markDirty(byte h, byte m);
 bool maybeUpdateTime(byte h, byte m);
+
+int platency = 100;
+int ploss = 0;
 // void ping();
 
 
@@ -113,6 +116,8 @@ void setup() {
     digs.draw(3, digits[3]);
     Particle.function("setTime", setTime);
     Particle.function("uptime", uptime);
+    Particle.variable("packet latency", platency);
+    Particle.variable("packet loss", ploss);
 } // setup()
 
 
@@ -153,6 +158,7 @@ void loop() {
 } // loop()
 
 
+int luna = 0;
 void setupPtrans() {
     #define PTRANS_5V    A0
     #define PTRANS_SENSE A1
@@ -163,13 +169,14 @@ void setupPtrans() {
     
     digitalWrite(PTRANS_GND, LOW);
     digitalWrite(PTRANS_5V, HIGH);
+    Particle.variable("Luna", luna);
 } // setupPtrans();
 
 
 int setBrightness(String input) {
     int tune = input.toInt();
-    static byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {15, 16}, {10, 8}, {0, 4}};
-    int luna = analogRead(A1);
+    static byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {13, 16}, {10, 8}, {0, 4}};
+    luna = analogRead(A1);
     Serial.printf("Raw luna: %d\n", luna);
     byte i = 0;
     while (luna < brights[i][0]) {
@@ -185,6 +192,7 @@ int setBrightness(String input) {
 } // int setBrightness(input)
 
 
+/*
 void catchup() {
     while (turtle.isBusy()) { 
         turtle.go(); 
@@ -193,7 +201,7 @@ void catchup() {
         mspf.wait(); 
     }
 }
-
+*/
 
 byte positions[5] = { 3, 9, 18, 24, 15 };
 void recolor(byte position, color c) {
@@ -210,19 +218,19 @@ void recolor(byte position, color c) {
 void markDirty(byte h, byte m) {
     Serial.printf("marking dirty; %02d:%02d vs. digits=[%d %d : %d %d]\n", h, m, digits[0], digits[1], digits[2], digits[3]);
     if (h/10 != digits[0]) {
-        recolor(0, LIGHTGREY);
+        recolor(0, DARKWHITE);
     }
     
     if (h%10 != digits[1]) {
-        recolor(1, LIGHTGREY);
+        recolor(1, DARKWHITE);
     }
 
     if (m/10 != digits[2]) {
-        recolor(2, LIGHTGREY);
+        recolor(2, DARKWHITE);
     }
         
     if (m%10 != digits[3]) {
-        recolor(3, LIGHTGREY);
+        recolor(3, DARKWHITE);
     }
 } // markDirty(h, m)
 
@@ -243,7 +251,7 @@ bool maybeUpdateTime(byte h, byte m) {
         }
 
         // drawColon();
-        catchup();
+        // catchup();
         
         if (m/10 != digits[2]) {
             digs.erase(2);
@@ -264,40 +272,76 @@ bool maybeUpdateTime(byte h, byte m) {
 } // bool maybeUpdateTime(h, m)
 
 
-void ping() {
-    static byte strength = 0;
-    IPAddress innernet(8,8,8,8);
-    unsigned long start = millis();
-    byte n = WiFi.ping(innernet, 3);
-    float duration = 1.0*(millis() - start)/3;
-    String s = String::format("%d replies, avg %5.2f ms", n, duration);
-    Serial.println(s);
-    color status;
-    switch (n) {
-        case 3: 
-            status = GREEN;
-            break;
-        case 2:
-            status = YELLOW;
-            break;
-        default:
-            status = RED;
-    }
-    if (duration < 50) {
-        strength = min(strength + 1, 8);
-    } else if (duration < 100) {
-        strength = max(strength - 1, 6);
-    } else if (duration < 150) {
-        strength = max(strength - 1, 3);
+#define N 30
+#define UGLY 100
+// returns the rolling avg of the last N things
+// if the new value is UGLY it's over-weighted by (N/3)x
+// this means high values will take a long time to "drain" out
+int rollingAvg(int value) {
+    static int sum = UGLY*N;     // preload
+    // Serial.printf("rollingAvg: sum: %d value: %d; ", sum, value);
+    if (value >= UGLY) {
+        sum += 10*value;
     } else {
-        strength = 2;
+        sum += value;
     }
-    for (byte y = 0; y < MATRIX_Y - strength; y++) {
+    int avg = sum / N;
+    sum -= avg;
+    // Serial.printf("Sum: %d, avg: %d\n", sum, avg);
+    return avg;
+} // int rollingAvg(value)
+
+
+// TODO: multiping
+// each ping() call does one timed ping, and updates counters for ploss and platency
+void ping() {
+    // static byte strength = 0;
+    IPAddress innernet(8,8,8,8);
+    color c = display.getPixelColor(7);
+    display.setPixelColor(7, WHITE);
+    display.show();
+    unsigned long start = millis();
+    byte n = WiFi.ping(innernet, 1);
+    int duration = (millis() - start);
+    display.setPixelColor(7, c);
+    display.show();
+    
+    platency = rollingAvg(min(duration, 500));
+    // String s = String::format("%d replies, now %d ms, avg %d ms", n, duration, platency);
+    // Serial.println(s);
+    if (n) {
+        // no less than 0
+        ploss = max(0, ploss -1);
+    } else {
+        // no more than 5
+        ploss = min(5, ploss + 1);
+    }
+    
+    color status;
+    if (n == 0 || ploss > 3) {
+        // this ping is a missed packet, or > 3 recently lost
+        status = RED;
+    } else if (ploss == 0) {
+        // no loss
+        status = GREEN;
+    } else {
+        // previous loss (<= 3) but not this one
+        status = YELLOW;
+    }
+
+    for (byte y = 0; y < MATRIX_Y - 1; y++) {
         matrix.setPixel(0, y, BLACK);
-        matrix.setPixel(1, y, BLACK);            
+        matrix.setPixel(1, y, BLACK);
     }
-    for (byte y = MATRIX_Y - strength; y < MATRIX_Y; y++) {
+    int strength = map(platency, 30, 150, 0, 6);
+    int currStrength = map(duration, 30, 150, 0, 6);
+    Serial.printf("platency %d -> %d; ", platency, strength);
+    Serial.printf("duration %d -> %d\n", duration, currStrength);
+    
+    for (byte y = currStrength; y < MATRIX_Y; y++) {
         matrix.setPixel(0, y, status);
-        matrix.setPixel(1, y, status);    
+    }
+    for (byte y = strength; y < MATRIX_Y; y++) {
+        matrix.setPixel(1, y, status);
     }
 } // ping()

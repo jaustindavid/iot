@@ -1,5 +1,6 @@
 #include "turtle.h"
 
+#undef DEBUG_TURT
 
 Turtle::Turtle(Matrix* newMatrix, byte qsize) {
     matrix = newMatrix;
@@ -156,20 +157,22 @@ void Turtle::drawLine(byte x1, byte y1, color c, byte speed) {
     _delay = _speed = speed;
     _trail = c;
 
-    // Serial.printf("Line: Dy = %5.2f, Dx = %5.2f\n", _Dy, _Dx);
-    if (c == TRANSPARENT) {
-        Serial.print("moving ("); 
-    } else {
-        Serial.print("drawing ("); 
-    }
-    Serial.print(x); 
-    Serial.print(","); 
-    Serial.print(y);
-    Serial.print(") -> (");
-    Serial.print(x1);
-    Serial.print(",");
-    Serial.print(y1);
-    Serial.println(")");
+    #ifdef DEBUG_TURT
+        // Serial.printf("Line: Dy = %5.2f, Dx = %5.2f\n", _Dy, _Dx);
+        if (c == TRANSPARENT) {
+            Serial.print("moving ("); 
+        } else {
+            Serial.print("drawing ("); 
+        }
+        Serial.print(x); 
+        Serial.print(","); 
+        Serial.print(y);
+        Serial.print(") -> (");
+        Serial.print(x1);
+        Serial.print(",");
+        Serial.print(y1);
+        Serial.println(")");
+    #endif
     if (abs(_Dy) > abs(_Dx)) {
         drawVLine(x1, y1);
     } else {
@@ -197,9 +200,9 @@ void Turtle::walkTo(byte newX, byte newY, color c, byte speed) {
     t.color = c;
     t.speed = speed;
     tasks->enqueue(t);
-    print();
-    Serial.printf("; enq a->(%0d,%0d)", t.x, t.y);
-    Serial.printf("; %d tasks in queue\n", tasks->count());
+    // print();
+    // Serial.printf("; enq a->(%0d,%0d)", t.x, t.y);
+    // Serial.printf("; %d tasks in queue\n", tasks->count());
     // Serial.println(s);
 } // walkTo(x, y, color, speed)
 
@@ -221,9 +224,9 @@ void Turtle::walk(int dx, int dy, color c, byte speed) {
     t.color = c;
     t.speed = speed;
     tasks->enqueue(t);
-    print(); 
-    Serial.printf("; enq d->(%0d,%0d)", t.x, t.y);
-    Serial.printf("; %d tasks in queue\n", tasks->count());
+    // print(); 
+    // Serial.printf("; enq d->(%0d,%0d)", t.x, t.y);
+    // Serial.printf("; %d tasks in queue\n", tasks->count());
     //Serial.printf(": d (%d,%d)\n", t.x, t.y);
 } // walk(dx, dy, color, speed)
 
@@ -239,7 +242,7 @@ void Turtle::teleport(byte newX, byte newY) {
 void Turtle::startATask() {
     if (! tasks->isEmpty()) {
         Task task = tasks->dequeue();
-        Serial.printf("q=%d\n", tasks->count());
+        // Serial.printf("q=%d\n", tasks->count());
         switch (task.instruction) {
             case 'a': // absolute
                 drawLine(task.x, task.y, task.color, task.speed);

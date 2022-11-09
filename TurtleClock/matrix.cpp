@@ -71,7 +71,9 @@ void Matrix::fadeSome(byte x0, byte y0, byte x1, byte y1, byte amount) {
 
 // "show" the buffer, by slowly cross-fading the (changed) pixels
 void Matrix::show() {
-    unsigned long start = millis();
+    #ifdef MDEBUG
+        unsigned long start = millis();
+    #endif
     // temporarily overlay the turtle
     if (fgTurt.c != TRANSPARENT) {
         hidden = fg[fgTurt.x][fgTurt.y];
@@ -93,7 +95,7 @@ void Matrix::show() {
     // last, flip
     memcpy(bg, fg, sizeof(fg));
     bgTurt = fgTurt;
-    #ifdef DEBUG
+    #ifdef MDEBUG
         Serial.printf("show() duration: %d ms\n", millis() - start);
     #endif
 } // show()
@@ -126,7 +128,7 @@ void Matrix::setTurtle(byte tX, byte tY, color tC, byte fps) {
     fgTurt.y = tY;
     fgTurt.c = tC;
     byte interval = (1000/fps/NSTEPS);
-    Serial.printf("setting interval: %d", interval);
+    // Serial.printf("setting interval: %d", interval);
     xfader->setInterval(interval);
     xfader->reset();
 } // setTurtle(x, y, c, ms)

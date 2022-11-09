@@ -77,15 +77,61 @@ void WobblyTime::setup() {
 } // setup()
 
 
-// advance fakeTime (about) half as fast as real time
-// e.g. 50% chance of ticking not more than 1/sec
-void WobblyTime::tick() {
+/*
+// update the amount of "advance" in the clock
+void WobblyTime::updateAdvance() {
+    if (Time.now() + MIN_ADVANCE >= fakeTime) {
+        fakeTime = rando(MIN_ADVANCE, MAX_ADVANCE) + Time.now();
+        Serial.print("New advance: ");
+        Serial.println(fakeTime - Time.now());
+    }
+//    return;
+    if (Time.now() + dT == fakeTime) {
+        dT = rando(MIN_ADVANCE, MAX_ADVANCE);
+        int pacer = rando(100, 500);
+        int delta = fakeTime - Time.now();
+        Serial.printf("delta %d, dt %d, pacer %d; ", delta, dT, pacer);
+        if (dT > fakeTime - Time.now()) {
+            pace = map(pacer, 100, 500, 90, 30);   // slow down, 30-90% real time
+        } else {
+            pace = map(pacer, 100, 500, 110, 300); // speed up, 110-300% real time
+        }
+        Serial.printf(" new pace: %d\n", pace);
+    }
+} // updateAdvance()
+*/
 
+
+// advance fakeTime (about) half as fast as real time
+// we.g 50% chance of ticking not more than 1/sec
+/*
+ * if dT
+ */
+void WobblyTime::tick() {
+    /*
+    static time_t lastTick = Time.now();
+    // Serial.printf("Tick?  (%ds since last)\n", Time.now() - lastTick);
+    if (Time.now() > lastTick) {
+    */
     if (tickTimer->isExpired()) {
+        /*
+        if (random(0, 100) < 50) {
+            Serial.printf("Tick: delta = %ds\n", fakeTime - Time.now());
+            fakeTime += 1;
+        }
+        int tock = 0;
+        if (pace > 100) {
+            tock = random(pace) / 100;
+        } else if (random(0, 100) < pace) {
+            tock = 1; 
+        }
+        Serial.printf("pace %d -> tock: %d\n", pace, tock);
+        // lastTick = Time.now();
+        */
         int offset = dT - (fakeTime - Time.now());
-        // Serial.printf("dT: %d; ", dT);
-        // Serial.printf("fT: %d; ", fakeTime - Time.now());
-        // Serial.printf("offset: %d; ", offset);
+        Serial.printf("dT: %d; ", dT);
+        Serial.printf("fT: %d; ", fakeTime - Time.now());
+        Serial.printf("offset: %d; ", offset);
         int tock = 0;
         if (offset > 0) {
             tock = 1 + min(offset, random(3));
@@ -96,7 +142,7 @@ void WobblyTime::tick() {
         } else {
             dT = rando(MIN_ADVANCE, MAX_ADVANCE);
         }
-        // Serial.printf("tock: %d\n", tock);
+        Serial.printf("tock: %d\n", tock);
         fakeTime += tock;
     }
 } // tick()
