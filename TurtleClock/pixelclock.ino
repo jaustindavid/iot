@@ -39,7 +39,7 @@ int forcedM = -1;
 Matrix matrix(&display);
 Turtle turtle(&matrix, 25);
 // Turtle secondHand(&matrix);
-WobblyTime wTime;
+WobblyTime wTime(30, 300);
 Digits digs(&turtle);
 
 
@@ -53,6 +53,8 @@ int ploss = 0;
 // void ping();
 
 
+// sets a time hh:mm; for debugging,
+// the time will get displayed then immediately corrected
 int setTime(String hhmm) {
     if (hhmm.length() == 5) {
         String hh = hhmm.substring(0, 2);
@@ -69,7 +71,8 @@ int setTime(String hhmm) {
 // returns tenths-of-hours running
 int uptime(String j) {
     return millis() / (360*1000);
-}
+} // int uptime(junque)
+
 
 void setup() {
     Serial.begin(115200);
@@ -82,6 +85,9 @@ void setup() {
         display.setPixelColor(i, BLACK);
     }
     display.show(); // Initialize all pixels to 'off'
+
+    Particle.syncTime();
+    waitUntil(Particle.syncTimeDone);
 
     Time.zone(-5);
 
@@ -122,7 +128,6 @@ void setup() {
 
 
 SimpleTimer day(24*60*60*1000);
-SimpleTimer oneSec(1000);
 SimpleTimer tenSec(10*1000);
 
 void loop() {
@@ -154,7 +159,6 @@ void loop() {
         ping();
     }
     matrix.show();
-    // mspf.wait();    // NOP; fps is actually dictated by the matrix, with xfader
 } // loop()
 
 
@@ -173,6 +177,11 @@ void setupPtrans() {
 } // setupPtrans();
 
 
+// callable function; if input is an int, it will update the table
+// note that the table is overwritten on restart.
+// "luna" is a raw value from a phototransistor; the highest value greater
+// than luna corresponds to the actual brightness used.
+// 0 is a stop value, luna will always be greater than this.
 int setBrightness(String input) {
     int tune = input.toInt();
     static byte brights[6][2] = {{100, 64}, {75, 48}, {30, 32}, {13, 16}, {10, 8}, {0, 4}};
@@ -192,17 +201,7 @@ int setBrightness(String input) {
 } // int setBrightness(input)
 
 
-/*
-void catchup() {
-    while (turtle.isBusy()) { 
-        turtle.go(); 
-        // secondHand.go();
-        matrix.show(); 
-        mspf.wait(); 
-    }
-}
-*/
-
+// the X position of digits, and the colon
 byte positions[5] = { 3, 9, 18, 24, 15 };
 void recolor(byte position, color c) {
     for (byte x = positions[position]; x <= positions[position] + 5; x++) {
@@ -215,6 +214,7 @@ void recolor(byte position, color c) {
 } // recolor(position, color)
 
 
+// marks some digits "dirty" (paints them DARKWHITE instantly)
 void markDirty(byte h, byte m) {
     Serial.printf("marking dirty; %02d:%02d vs. digits=[%d %d : %d %d]\n", h, m, digits[0], digits[1], digits[2], digits[3]);
     if (h/10 != digits[0]) {
@@ -235,6 +235,7 @@ void markDirty(byte h, byte m) {
 } // markDirty(h, m)
 
 
+// given an hour and minute, possibly change what's on the clock
 bool maybeUpdateTime(byte h, byte m) {
     if (m != lastMinute) {
         markDirty(h, m);
@@ -333,8 +334,8 @@ void ping() {
         matrix.setPixel(0, y, BLACK);
         matrix.setPixel(1, y, BLACK);
     }
-    int strength = map(platency, 30, 150, 0, 6);
-    int currStrength = map(duration, 30, 150, 0, 6);
+    int strength = constrain(map(platency, 30, 150, 0, MATRIX_Y-1), 0, MATRIX_Y-1);
+    int currStrength = constrain(map(duration, 30, 150, 0, MATRIX_Y-1), 0, MATRIX_Y-1);
     Serial.printf("platency %d -> %d; ", platency, strength);
     Serial.printf("duration %d -> %d\n", duration, currStrength);
     
