@@ -46,9 +46,6 @@ WobblyTime wTime(30, 180);
 Digits digs(&turtle);
 
 
-// void catchup();
-void recolor(byte position, color c);
-void markDirty(byte h, byte m);
 bool maybeUpdateTime(byte h, byte m);
 
 int platency = 100;
@@ -202,6 +199,9 @@ void setupPtrans() {
 } // setupPtrans();
 
 
+// return the (updated) moving average over N
+// avg == old average, "value" = new
+// usage: average = ma(30, average, value)
 float ma(int n, float avg, float value) {
     return (avg * (n-1)/n) + value/n;
 } // float ma(n, avg, value)
@@ -237,92 +237,6 @@ int setBrightness(String input) {
     return brights[i][1];
 } // int setBrightness(input)
 
-
-// the X position of digits, and the colon
-byte positions[5] = { 3, 9, 18, 24, 15 };
-void recolor(byte position, color c) {
-    for (byte x = positions[position]; x <= positions[position] + 5; x++) {
-        for (byte y = 0; y < MATRIX_Y; y++) {
-            if (matrix.getPixel(x, y) == BLUE) {
-                matrix.setPixel(x, y, c);
-            }
-        }
-    }
-} // recolor(position, color)
-
-
-/*
-// marks some digits "dirty" (paints them DARKWHITE instantly)
-void mark_Dirty(byte h, byte m) {
-    md2(h,m);
-    return;
-    Serial.printf("marking dirty; %02d:%02d vs. digits=[%d %d : %d %d]\n", h, m, digits[0], digits[1], digits[2], digits[3]);
-    if (h/10 != digits[0]) {
-        recolor(0, DARKWHITE);
-    }
-    
-    if (h%10 != digits[1]) {
-        recolor(1, DARKWHITE);
-    }
-
-    if (m/10 != digits[2]) {
-        recolor(2, DARKWHITE);
-    }
-        
-    if (m%10 != digits[3]) {
-        recolor(3, DARKWHITE);
-    }
-} // markDirty(h, m)
-
-
-void md2(byte h, byte m) {
-     if (m%10 != digits[3]) {
-        recolor(3, DARKWHITE);
-        digs.erase(3);
-    }
-    
-    if (m/10 != digits[2]) {
-        recolor(2, DARKWHITE);
-        digs.erase(2);
-    }
-     
-    if (h%10 != digits[1]) {
-        recolor(1, DARKWHITE);
-        digs.erase(1);
-    }
-
-    if (h/10 != digits[0]) {
-        recolor(0, DARKWHITE);
-        digs.erase(0);
-    }
-}
-*/
-
-
-// true if h:m is MORE than 1 minute delayed
-// assumes h:m came from wTime, and wTime always increases
-bool bigTimeDifference(byte h, byte m) {
-    // 9:32 <> 9:30; 9::59 <> 9::58; 9:01 <> 9:00
-    if (wTime.hour() == h) {
-        return (wTime.minute() - m) > 1;
-    } 
-    
-    // 9:00 <> 8:59 -> 60 <> 59; 9:01 <> 8:59 -> 61 <> 59
-    byte wTm = wTime.minute() + 60;
-    return wTm > (m + 1);
-} // bool bigTimeDifference(h,m)
-
-
-/*
-void catchup() {
-    SimpleTimer halfS(500);
-    while (digs.isBusy()) {
-        digs.go();
-        matrix.show();
-        halfS.wait();
-    }
-}
-*/
 
 // given an hour and minute, possibly change what's on the clock
 bool maybeUpdateTime(byte h, byte m) {
@@ -360,67 +274,8 @@ bool maybeUpdateTime(byte h, byte m) {
     return false;
 } // bool maybeUpdateTime(h, m)
 
-/*
-// given an hour and minute, possibly change what's on the clock
-bool maybentUpdateTime(byte h, byte m) {
-    return maybeUpdateTime(h,m);
-
-    if (m != lastMinute) {
-        markDirty(h, m);
-        if (h/10 != digits[0]) {
-            digs.erase(0);
-            digits[0] = h/10;
-            digs.draw(0, digits[0]);
-        }
-        
-        if (h%10 != digits[1]) {
-            digs.erase(1);
-            digits[1] = h%10;
-            digs.draw(1, digits[1]);
-        }
-
-        // drawColon();
-        // catchup();
-        
-        if (m/10 != digits[2]) {
-            digs.erase(2);
-            digits[2] = m/10;
-            digs.draw(2, digits[2]);
-        }
-        
-        if (m%10 != digits[3]) {
-            digs.erase(3);
-            digits[3] = m%10;
-            digs.draw(3, digits[3]);
-        }
-        
-        lastMinute = m;
-        return true;
-    }
-    return false;
-} // bool maybeUpdateTime(h, m)
-*/
 
 #define N 30
-/*
-#define UGLY 100
-// returns the rolling avg of the last N things
-// if the new value is UGLY it's over-weighted by (N/3)x
-// this means high values will take a long time to "drain" out
-int rollingAvg(int value) {
-    static int sum = UGLY*N;     // preload
-    // Serial.printf("rollingAvg: sum: %d value: %d; ", sum, value);
-//     if (value >= UGLY) {
-//        sum += 10*value;
-//    } else {
-        sum += value;
-//    }
-    int avg = sum / N;
-    sum -= avg;
-    // Serial.printf("Sum: %d, avg: %d\n", sum, avg);
-    return avg;
-} // int rollingAvg(value)
-*/
 
 // each ping() call does one timed ping, and updates counters for ploss and platency
 // last duration is returned
