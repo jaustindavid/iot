@@ -46,6 +46,7 @@ class Digits {
 
     public:
         Digits(Turtle*);
+        int count();
         void erase(byte);
         void drawColon();
         void draw(byte, byte);
@@ -61,6 +62,11 @@ Digits::Digits(Turtle* t) {
     memset(current, 0, sizeof(current));
     // makeFonts();
 } // constructor
+
+
+int Digits::count() {
+    return digits->count();
+}
 
 
 void Digits::erase(byte position) {
