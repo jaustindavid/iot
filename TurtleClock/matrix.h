@@ -15,6 +15,20 @@
 #define LIGHTGREY   (Adafruit_NeoPixel::Color(32, 32, 32))
 #define DARKWHITE   (Adafruit_NeoPixel::Color(64, 64, 64))
 #define WHITE       (Adafruit_NeoPixel::Color(255, 255, 255))
+
+// weather stuff
+#define COLOR_HOT   RED
+#define COLOR_WARM  (Adafruit_NeoPixel::Color(128, 64, 0))
+#define COLOR_COOL  (Adafruit_NeoPixel::Color(128, 0, 128)) 
+#define COLOR_CHILLY (Adafruit_NeoPixel::Color(0, 0, 128))
+#define COLOR_COLD  (Adafruit_NeoPixel::Color(128, 0, 255))
+#define COLOR_FREEZING (Adafruit_NeoPixel::Color(128, 128, 255))
+#define COLOR_FROZE (Adafruit_NeoPixel::Color(192, 192, 192))
+
+#define COLOR_SUNNY YELLOW
+#define COLOR_CLOUDY DARKWHITE
+#define COLOR_RAINY BLUE
+
 // a magic color, never actually rendered
 #define TRANSPARENT (Adafruit_NeoPixel::Color(1, 1, 1))
 

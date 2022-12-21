@@ -23,14 +23,12 @@ Adafruit_NeoPixel display(PIXEL_COUNT, PIXEL_PIN, PIXEL_TYPE);
 #include <particle-dst.h>
 DST dst;
 
-dst_limit_t beginning;
-dst_limit_t end;
-
 color bg[MATRIX_X][MATRIX_Y];
+color feelie(float temperature);
+color lookie(byte condition);
 
-SimpleTimer mspf(200);    // ms per frame
-SimpleTimer second(1000);
-
+// SimpleTimer mspf(200);    // ms per frame
+// SimpleTimer second(1000);
 
 byte lastMinute = 0; 
 byte lastHour = 0;
@@ -50,7 +48,6 @@ bool maybeUpdateTime(byte h, byte m);
 
 int platency = 100;
 int ploss = 0;
-// void ping();
 
 
 // sets a time hh:mm; for debugging,
@@ -86,26 +83,9 @@ void setup() {
     }
     display.show(); // Initialize all pixels to 'off'
 
-    Particle.syncTime();
-    waitUntil(Particle.syncTimeDone);
-
-    Time.zone(-5);
-
-    beginning.hour = 2;
-    beginning.day = DST::days::sun;
-    beginning.month = DST::months::feb;
-    beginning.occurrence = 2;
-        
-    end.hour = 2;
-    end.day = DST::days::sun;
-    end.month = DST::months::nov;
-    end.occurrence = 1;
-        
-    dst.begin(beginning, end, 1);
-    dst.automatic(true);
-    dst.check();
-    
+    setup_dst();
     ping();
+    setup_forecast();
 
     wTime.setup();
 
@@ -197,6 +177,178 @@ void setupPtrans() {
     digitalWrite(PTRANS_5V, HIGH);
     Particle.variable("Luna", luna);
 } // setupPtrans();
+
+
+void setup_dst() {
+    dst_limit_t beginning;
+    dst_limit_t end;
+    Particle.syncTime();
+    waitUntil(Particle.syncTimeDone);
+
+    Time.zone(-5);
+
+    beginning.hour = 2;
+    beginning.day = DST::days::sun;
+    beginning.month = DST::months::feb;
+    beginning.occurrence = 2;
+        
+    end.hour = 2;
+    end.day = DST::days::sun;
+    end.month = DST::months::nov;
+    end.occurrence = 1;
+        
+    dst.begin(beginning, end, 1);
+    dst.automatic(true);
+    dst.check();
+} // setup_dst()
+
+
+float forecast_temp[8];
+byte forecast_cond[8];
+time_t forecast_freshness = 0;
+void setup_forecast() {
+    for (int i = 0; i < 8; i++) {
+        forecast_temp[i] = -99.0;
+        forecast_cond[i] = 0;
+    }
+    
+    Particle.subscribe("weather", weatherHandler);
+    Particle.function("weather_freshness", freshmaker);
+} // setup_forecast()
+
+
+color feelie(float temperature) {
+    if (temperature >= 35) {
+        return COLOR_HOT;
+    } else if (temperature >= 30) {
+        return COLOR_WARM;
+    } else if (temperature >= 25) {
+        return COLOR_COOL;
+    } else if (temperature >= 15) {
+        return COLOR_CHILLY;
+    } else if (temperature >= 10) {
+        return COLOR_COLD;
+    } else if (temperature >= 5) {
+        return COLOR_FREEZING;
+    } else {
+        return COLOR_FROZE;
+    }
+    return BLUE;
+}
+
+
+color lookie(byte condition) {
+    switch (condition) {
+        case 1:
+            return COLOR_SUNNY;
+        case 2:
+            return COLOR_CLOUDY;
+        case 3:
+            return COLOR_RAINY;
+        default:
+            return RED;
+    }
+}
+
+
+void update_forecast() {
+    if (Time.now() - forecast_freshness < 3*3600) {
+        // flash
+        for (int i = 0; i < 8; i++) {
+            matrix.setPixel(MATRIX_X-2, i, WHITE);
+            matrix.setPixel(MATRIX_X-1, i, WHITE);
+        }        
+        matrix.show();
+        for (int i = 0; i < 8; i++) {
+            matrix.setPixel(MATRIX_X-2, i, feelie(forecast_temp[i]));
+            matrix.setPixel(MATRIX_X-1, i, lookie(forecast_cond[i]));
+        }
+        matrix.show();
+    } else {
+        // flash
+        for (int i = 0; i < 8; i++) {
+            matrix.setPixel(MATRIX_X-2, i, RED);
+            matrix.setPixel(MATRIX_X-1, i, RED);
+        }        
+        matrix.show();
+        // PAINT IT BLACK
+        for (int i = 0; i < 8; i++) {
+            matrix.setPixel(MATRIX_X-2, i, BLACK);
+            matrix.setPixel(MATRIX_X-1, i, BLACK);
+        }
+        matrix.show();
+    }
+} // update_forecast()
+
+
+// returns minutes since last weather
+int freshmaker(String j) {
+    return (Time.now() - forecast_freshness) / 60;
+} // int uptime(junque)
+
+
+void weatherHandler(const char *eventName, const char *data) {
+    Serial.printf("eventName: %s; data: %s\n", eventName, data);
+    bool valid = false;
+    float temps[8];
+    byte conds[8];
+    for (int i = 0; i < 8; i++) {
+        temps[i] = -99;
+        conds[i] = 0;
+    }
+
+    JSONValue outerObj = JSONValue::parseCopy(data);
+    JSONObjectIterator iter(outerObj);
+    while (iter.next()) {
+        // Serial.print(String(iter.name()));
+        // Serial.print(": ");
+        // Serial.println(String(iter.value().toString()));
+        if (iter.name() == "freshness") {
+            time_t stamp = iter.value().toInt();
+            int age = Time.now() - stamp;
+            Serial.printf("data is %d secs old\n", age);
+            if (age > -30 && age < 3*3600) {
+                Serial.println("Age is valid");
+                valid = true;
+                for (int i = 0; i < 8; i++) {
+                    if (temps[i] == -99 || conds[i] == 0) {
+                        valid = false;
+                    }
+                }
+                if (valid) {
+                    Serial.println("All values have been set.  Copying...");
+                    for (int i = 0; i < 8; i++) {
+                        forecast_temp[i] = temps[i];
+                        forecast_cond[i] = conds[i];
+                    }
+                    forecast_freshness = stamp;
+                    update_forecast();
+                }
+            }
+        } else {
+            int eighth = String(iter.name()).toInt();
+            // Serial.printf("eighth: %d\n", eighth);
+            JSONObjectIterator inner(iter.value());
+            while (inner.next()) {
+                if (inner.name() == "temp") {
+                    temps[eighth] = inner.value().toDouble();
+                } else if (inner.name() == "cond") {
+                    String cond = String(inner.value().toString());
+                    if (cond.equals("SUNNY")) {
+                        conds[eighth] = 1;
+                    } else if (cond.equals("CLOUDY")) {
+                        conds[eighth] = 2;
+                    } else {
+                        conds[eighth] = 3;
+                    }
+                } else {
+                    Serial.print("unknown name:");
+                    Serial.println(String(inner.name()));
+                }
+            }
+        }
+    }
+}
 
 
 // return the (updated) moving average over N
