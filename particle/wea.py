@@ -42,7 +42,7 @@ for day in data['days']:
 				forecast_min = hour['feelslike']
 			if hour['precipprob'] > 50:
 				cond = "RAINY"
-			elif hour['precipprob'] > 20:
+			elif hour['precipprob'] > 20 or hour['cloudcover'] >= 50:
 				cond = "CLOUDY"
 			else:
 				cond = "SUNNY"
