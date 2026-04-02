@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IoT Telemetry Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo"></div>
+                <h2>IoT Telemetry</h2>
+            </div>
+            <ul class="nav-links">
+                <li><a href="#" data-target="dashboard" class="active">Dashboard / Stats</a></li>
+                <li><a href="#" data-target="keys">Key Management</a></li>
+                <li><a href="#" data-target="logs">Activity Logs</a></li>
+            </ul>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="content-area">
+            <!-- Dashboard View -->
+            <section id="dashboard" class="view active-view">
+                <header>
+                    <h1>System Overview</h1>
+                    <p class="subtitle">Monitor ephemeral queues and persistent key-value configuration.</p>
+                </header>
+                
+                <div class="stats-grid">
+                    <div class="stat-card queue-card">
+                        <h3>Active Queues <span id="queueCount" class="badge">0</span></h3>
+                        <div class="card-content" id="queueList"></div>
+                    </div>
+                    <div class="stat-card kv-card">
+                        <h3>Persistent KV Pairs <span id="kvCount" class="badge">0</span></h3>
+                        <div class="card-content" id="kvList"></div>
+                    </div>
+                </div>
+
+                <!-- Peek Modal (Hidden by default) -->
+                <div id="peekModal" class="modal">
+                    <div class="modal-content glass-panel">
+                        <span class="close-btn">&times;</span>
+                        <h3 id="peekTitle">Peek Data</h3>
+                        <div class="code-block-wrapper">
+                            <pre><code id="peekDataContent"></code></pre>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Key Management View -->
+            <section id="keys" class="view">
+                <header>
+                    <h1>Client Access Control</h1>
+                    <p class="subtitle">Manage device identities, HMAC symmetric keys, and permissions.</p>
+                </header>
+                
+                <div class="card glass-panel form-card">
+                    <h3>Register New Client</h3>
+                    <form id="keyForm">
+                        <div class="input-group">
+                            <input type="text" id="newClientId" placeholder="Device or Client ID (e.g. ESP32-Weather-01)" required>
+                        </div>
+                        <div class="input-group">
+                            <select id="aclSelect">
+                                <option value="*">Full Access (Read/Write)</option>
+                                <option value="read_only">Read-Only</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="primary-btn pulse-glow">Generate Secret Key</button>
+                    </form>
+                    <!-- Shows immediately after generation -->
+                    <div id="newSecretDisplay" class="hidden alert-success"></div>
+                </div>
+
+                <div class="card transparent-card">
+                    <h3>Active Clients</h3>
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Client ID</th>
+                                <th>Permissions</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="clientsTableBody">
+                            <!-- populated by js -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Logs View -->
+            <section id="logs" class="view">
+                <header>
+                    <h1>Activity Logs</h1>
+                    <p class="subtitle">Real-time monitor of incoming client requests.</p>
+                </header>
+                
+                <div class="card log-card glass-panel">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Client ID</th>
+                                <th>Action</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="logsTableBody">
+                            <!-- populated by js -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
