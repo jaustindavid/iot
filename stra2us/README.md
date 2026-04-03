@@ -1,6 +1,6 @@
-# Stra2us - IoT Telemetry Service
+# Stra2Us - IoT Telemetry Service
 
-Stra2us is a high-performance, stateless IoT messaging and configuration management relay system designed implicitly for resource-constrained devices (like the ESP32 and Particle Photon 2). 
+Stra2Us is a high-performance, stateless IoT messaging and configuration management relay system designed implicitly for resource-constrained devices (like the ESP32 and Particle Photon 2). 
 
 It features an asynchronous Python backend layered on top of Redis, and ships alongside a zero-malloc C++ client SDK.
 

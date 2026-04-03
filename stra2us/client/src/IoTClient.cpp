@@ -86,8 +86,10 @@ void IoTClient::calculateSignature(const char* uri, const uint8_t* payload, size
 }
 
 bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
-    if (!_client.connect(_host, _port)) {
-        return false;
+    if (!_client.connected()) {
+        if (!_client.connect(_host, _port)) {
+            return false;
+        }
     }
 
     uint32_t ts = _timeFunc ? _timeFunc() : 0;
@@ -103,6 +105,8 @@ bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uin
     _client.print("Host: ");
     _client.print(_host);
     _client.print("\r\n");
+    
+    _client.print("Connection: keep-alive\r\n");
 
     _client.print("X-Client-ID: ");
     _client.print(_clientId);
@@ -132,30 +136,52 @@ bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uin
         delay(10);
     }
 
-    // Extremely simple response processing: skip headers, read body
+    // HTTP/1.1 Keep-Alive response processing
     bool isBody = false;
     String currentLine = "";
     int readHead = 0;
+    int contentLength = -1;
+    
     while (_client.connected() || _client.available()) {
         if (_client.available()) {
             char c = _client.read();
             if (!isBody) {
                 currentLine += c;
-                if (currentLine.endsWith("\r\n\r\n")) {
-                    isBody = true;
+                if (currentLine.endsWith("\n")) {
+                    String lowerLine = currentLine;
+                    lowerLine.toLowerCase();
+                    if (lowerLine.startsWith("content-length:")) {
+                        contentLength = lowerLine.substring(15).toInt();
+                    }
+                    if (currentLine == "\r\n" || currentLine == "\n") {
+                        isBody = true;
+                        if (contentLength == 0) {
+                            break; // 204 No Content or Empty
+                        }
+                    }
+                    currentLine = "";
                 }
             } else {
                 if (responseBuffer != nullptr && outLen != nullptr && readHead < maxLen) {
-                    responseBuffer[readHead++] = c;
+                    responseBuffer[readHead] = c;
+                }
+                readHead++;
+                
+                if (contentLength >= 0 && readHead >= contentLength) {
+                    break; // Finished reading HTTP body
                 }
             }
+        } else {
+            if (!_client.connected()) break;
+            delay(1);
         }
     }
+    
     if (outLen != nullptr) {
         *outLen = readHead;
     }
 
-    _client.stop();
+    // We purposely do NOT call _client.stop() to preserve the TCP socket
     return true;
 }
 
