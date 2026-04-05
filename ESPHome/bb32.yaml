@@ -30,6 +30,18 @@ time:
     id: sntp_time
     timezone: "EST5EDT,M3.2.0,M11.1.0"
 
+globals:
+  # Stores the memory address of your physics engine
+  - id: engine_ptr
+    type: 'void*'
+    initial_value: 'nullptr'
+
+  # Tracks the last minute to trigger the clock update
+  - id: engine_last_minute
+    type: 'int'
+    initial_value: '-1'
+    restore_value: no
+
 font:
   - file: "CustomMerged.bdf"
     id: clock_font
