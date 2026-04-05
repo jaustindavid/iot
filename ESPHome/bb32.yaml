@@ -36,11 +36,37 @@ globals:
     type: 'void*'
     initial_value: 'nullptr'
 
-  # Tracks the last minute to trigger the clock update
+  # Tracks the last (virtual) minute to trigger the clock update
   - id: engine_last_minute
     type: 'int'
     initial_value: '-1'
     restore_value: no
+
+  # --- Wobbly Time Settings ---
+  # The clock always tries to display a time that is slightly ahead of reality.
+  # The displayed time will drift randomly within [wobble_min_minutes, wobble_max_minutes].
+  - id: wobble_min_minutes
+    type: int
+    initial_value: '2'
+
+  - id: wobble_max_minutes
+    type: int
+    initial_value: '5'
+
+  # When the displayed time is behind its target, it runs this much faster than real time.
+  - id: wobble_fast_rate
+    type: float
+    initial_value: '1.3'
+
+  # When the displayed time is ahead of its target, it runs this much slower.
+  - id: wobble_slow_rate
+    type: float
+    initial_value: '0.7'
+
+  # Memory pointer to the WobblyTime instance
+  - id: wobbly_ptr
+    type: 'void*'
+    initial_value: 'nullptr'
 
 font:
   - file: "CustomMerged.bdf"
@@ -50,12 +76,29 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
+          // Initialize WobblyTime singleton on first run
+          if (id(wobbly_ptr) == nullptr) {
+            WobblyTime* wt = new WobblyTime(
+              id(wobble_min_minutes),
+              id(wobble_max_minutes),
+              id(wobble_fast_rate),
+              id(wobble_slow_rate)
+            );
+            id(wobbly_ptr) = (void*)wt;
+          }
+          
           if (id(engine_ptr) != nullptr) {
             CoatiEngine* engine = (CoatiEngine*)id(engine_ptr);
-            auto current = id(sntp_time).now();
-            if (current.is_valid() && current.minute != id(engine_last_minute)) {
-              id(engine_last_minute) = current.minute;
-              engine->update_target(current, id(clock_font));
+            WobblyTime* wt = (WobblyTime*)id(wobbly_ptr);
+            auto real_now = id(sntp_time).now();
+            if (!real_now.is_valid()) return;
+            
+            // Advance virtual time and extract the display minute
+            auto virtual_now = wt->advance(real_now);
+            if (virtual_now.minute != id(engine_last_minute)) {
+              id(engine_last_minute) = virtual_now.minute;
+              // Render font to staging buffer only — apply happens in render lambda
+              engine->prepare_target(virtual_now, id(clock_font));
             }
           }
 
@@ -80,7 +123,7 @@ display:
       }
       return (x * 8) + (7 - y);
     rotation: 0°
-    update_interval: 16ms
+    update_interval: 33ms
     lambda: |-
       static CoatiEngine* engine = nullptr;
       if (engine == nullptr) {
@@ -91,7 +134,12 @@ display:
       static long last_tick_time = millis();
       long now = millis();
       
-      // Advance physics engine strictly at 50ms intervals
+      // Apply any pending target update from the timer context.
+      // This is safe here: both apply_pending_target() and tick() run in
+      // the same (main task) execution context as this lambda.
+      engine->apply_pending_target();
+
+      // Physics tick at 50ms intervals
       if (now - last_tick_time >= 50) {
         last_tick_time = now;
         engine->tick();
@@ -101,15 +149,23 @@ display:
       float blend = (float)(now - last_tick_time) / 50.0f;
       if (blend > 1.0f) blend = 1.0f;
       
-      // Advance pixel fading state independently given 16ms framerate
+      // Advance pixel fading for ACTIVE board pixels only.
+      // Incrementing fade for dark (false) positions caused spurious green flashes
+      // when those positions briefly transitioned to true with non-zero fade values.
       for (int x = 0; x < 32; x++) {
         for (int y = 0; y < 8; y++) {
-            if (engine->fade_board[x][y] < 1.0f) {
-                engine->fade_board[x][y] += 0.032f; // Ramps up over ~31 logic frames (~500ms)
+            if (engine->current_board[x][y] && engine->fade_board[x][y] < 1.0f) {
+                engine->fade_board[x][y] += 0.032f;
                 if (engine->fade_board[x][y] > 1.0f) engine->fade_board[x][y] = 1.0f;
             }
         }
       }
+
+      // Board snapshot for stable rendering
+      bool board_snap[32][8];
+      float fade_snap[32][8];
+      memcpy(board_snap, engine->current_board, sizeof(board_snap));
+      memcpy(fade_snap,  engine->fade_board,    sizeof(fade_snap));
 
       Color green = Color(0, 255, 0);
       Color red = Color(255, 0, 0);
@@ -123,13 +179,12 @@ display:
       it.draw_pixel_at(30, 7, blue);
       it.draw_pixel_at(31, 7, blue);
       
-      // Draw physical pixels deposited
+      // Draw physical pixels deposited (using stable snapshot)
       for (int x = 0; x < 32; x++) {
         for (int y = 0; y < 8; y++) {
-          if (engine->current_board[x][y]) {
+          if (board_snap[x][y]) {
             if (y == 7 && (x <= 1 || x >= 30)) continue;
-            // Draw with biological fade-in mapping!
-            it.draw_pixel_at(x, y, Color(0, 255 * engine->fade_board[x][y], 0));
+            it.draw_pixel_at(x, y, Color(0, (uint8_t)(255 * fade_snap[x][y]), 0));
           }
         }
       }
