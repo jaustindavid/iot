@@ -1,0 +1,171 @@
+esphome:
+  name: bb32
+  friendly_name: bb32
+  includes:
+    - coati_engine.h
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "ZkIcQPXumySkKDYUxq3PFE6oZxuMusI6gNv1VTd/Z98="
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Bb32 Fallback Hotspot"
+    password: "ByIg5i1tSdFp"
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "EST5EDT,M3.2.0,M11.1.0"
+
+font:
+  - file: "CustomMerged.bdf"
+    id: clock_font
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(engine_ptr) != nullptr) {
+            CoatiEngine* engine = (CoatiEngine*)id(engine_ptr);
+            auto current = id(sntp_time).now();
+            if (current.is_valid() && current.minute != id(engine_last_minute)) {
+              id(engine_last_minute) = current.minute;
+              engine->update_target(current, id(clock_font));
+            }
+          }
+
+light:
+  - platform: esp32_rmt_led_strip
+    rgb_order: GRB
+    pin: GPIO10
+    num_leds: 256
+    chipset: WS2812
+    id: matrix_strip
+    name: "LED Matrix Clock"
+
+display:
+  - platform: addressable_light
+    id: matrix_display
+    addressable_light_id: matrix_strip
+    width: 32
+    height: 8
+    pixel_mapper: |-
+      if (x % 2 == 0) {
+        return (x * 8) + y;
+      }
+      return (x * 8) + (7 - y);
+    rotation: 0°
+    update_interval: 16ms
+    lambda: |-
+      static CoatiEngine* engine = nullptr;
+      if (engine == nullptr) {
+        engine = new CoatiEngine();
+        id(engine_ptr) = (void*)engine;
+      }
+      
+      static long last_tick_time = millis();
+      long now = millis();
+      
+      // Advance physics engine strictly at 50ms intervals
+      if (now - last_tick_time >= 50) {
+        last_tick_time = now;
+        engine->tick();
+      }
+      
+      // Calculate blending fraction between physics frames
+      float blend = (float)(now - last_tick_time) / 50.0f;
+      if (blend > 1.0f) blend = 1.0f;
+      
+      // Advance pixel fading state independently given 16ms framerate
+      for (int x = 0; x < 32; x++) {
+        for (int y = 0; y < 8; y++) {
+            if (engine->fade_board[x][y] < 1.0f) {
+                engine->fade_board[x][y] += 0.032f; // Ramps up over ~31 logic frames (~500ms)
+                if (engine->fade_board[x][y] > 1.0f) engine->fade_board[x][y] = 1.0f;
+            }
+        }
+      }
+
+      Color green = Color(0, 255, 0);
+      Color red = Color(255, 0, 0);
+      Color blue = Color(0, 0, 255);
+      Color white = Color(255, 255, 255);
+      Color cyan = Color(0, 255, 255);
+      
+      // Draw static endpoints (Dumpster & Pool)
+      it.draw_pixel_at(0, 7, red);
+      it.draw_pixel_at(1, 7, red);
+      it.draw_pixel_at(30, 7, blue);
+      it.draw_pixel_at(31, 7, blue);
+      
+      // Draw physical pixels deposited
+      for (int x = 0; x < 32; x++) {
+        for (int y = 0; y < 8; y++) {
+          if (engine->current_board[x][y]) {
+            if (y == 7 && (x <= 1 || x >= 30)) continue;
+            // Draw with biological fade-in mapping!
+            it.draw_pixel_at(x, y, Color(0, 255 * engine->fade_board[x][y], 0));
+          }
+        }
+      }
+      
+      // Draw Coatis dynamically
+      for (size_t i = 0; i < engine->agents.size(); i++) {
+        auto& agent = engine->agents[i];
+        
+        Color agent_color;
+        if (agent.carrying) {
+           float pulse = 0.7f + 0.3f * sin(now / 150.0f);
+           agent_color = Color(255 * pulse, 255 * pulse, 0); 
+        } else {
+           if (i == 0) agent_color = white;
+           else agent_color = cyan;
+        }
+        
+        // Frustration shimmer
+        if (agent.wait_ticks > 1) {
+            float shim = (sin(now / 30.0f) > 0) ? 1.0f : 0.0f;
+            if (shim > 0.5f) agent_color = Color(255, 100, 100);
+        }
+        
+        if (agent.pos == agent.last_pos) {
+            it.draw_pixel_at(agent.pos.x, agent.pos.y, agent_color);
+        } else {
+            // Motion Blur Temporal Antialiasing
+            Color dep = agent_color;
+            dep.r = dep.r * (1.0f - blend);
+            dep.g = dep.g * (1.0f - blend);
+            dep.b = dep.b * (1.0f - blend);
+            dep.w = dep.w * (1.0f - blend);
+            it.draw_pixel_at(agent.last_pos.x, agent.last_pos.y, dep);
+            
+            Color arr = agent_color;
+            arr.r = arr.r * blend;
+            arr.g = arr.g * blend;
+            arr.b = arr.b * blend;
+            arr.w = arr.w * blend;
+            it.draw_pixel_at(agent.pos.x, agent.pos.y, arr);
+        }
+      }
+
+# Ensure these are present for OTA and Logs to work
+ota:
+  - platform: esphome
+    password: "48d462d0fa84e4d6f0d4fc0f3086b2f4"
+
+logger:
+  level: DEBUG
+    
