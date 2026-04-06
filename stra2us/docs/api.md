@@ -63,6 +63,8 @@ Publish a message to a named topic queue.
 - `application/x-msgpack` — Body must be a valid MessagePack-encoded value. Stored as-is.
 - `text/plain` — Body is a raw UTF-8 string. Server wraps it in MessagePack before storage. Subscribers receive a properly-wrapped msgpack string.
 
+The server stores the authenticated `X-Client-ID` alongside every message in the stream, enabling attribution metadata in consumer responses (see below).
+
 **Response `200 OK`:**
 ```json
 {"status": "ok"}
@@ -79,8 +81,29 @@ Publish a message to a named topic queue.
 
 Read the next available message for this client. Each client maintains its own independent read cursor, so multiple clients can consume from the same topic independently.
 
-**Response `200 OK`:**  
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `envelope` | bool | `false` | When `true`, wraps the payload in a metadata envelope |
+
+**Response `200 OK` (default — raw payload):**  
 Body is raw MessagePack bytes (`Content-Type: application/x-msgpack`).
+
+**Response `200 OK` (`?envelope=true`):**  
+Body is a MessagePack-encoded dict:
+```json
+{
+  "data": "heartbeat",
+  "client_id": "bb32",
+  "received_at": 1712412399
+}
+```
+- `data` — The payload exactly as published (string, map, or other msgpack value).
+- `client_id` — The authenticated publisher's `X-Client-ID`; cannot be forged by the client.
+- `received_at` — Unix seconds derived from the Redis Stream entry ID — authoritative server-side receive time, independent of any client clock.
+
+> **Backward compatibility:** The default response format (raw payload bytes) is unchanged. Existing consumers are not affected. Opt in per-request with `?envelope=true`.
 
 **Response `204 No Content`:**  
 Queue is empty or all available messages have been consumed.

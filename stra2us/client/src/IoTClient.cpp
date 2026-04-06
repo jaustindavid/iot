@@ -234,16 +234,20 @@ int IoTClient::publishQueue(const char* topic, const char* message) {
     return sendSignedRequest("POST", uri, (const uint8_t*)message, strlen(message), nullptr, 0, nullptr, "text/plain");
 }
 
-int IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
-    char uri[64];
-    snprintf(uri, sizeof(uri), "/q/%s", topic);
-    
+int IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen, bool envelope) {
+    char uri[96];
+    if (envelope) {
+        snprintf(uri, sizeof(uri), "/q/%s?envelope=true", topic);
+    } else {
+        snprintf(uri, sizeof(uri), "/q/%s", topic);
+    }
+
     size_t localOutLen = 0;
     int status = sendSignedRequest("GET", uri, nullptr, 0, responseBuffer, maxLen, &localOutLen);
-    
+
     if (outLen != nullptr) {
         *outLen = localOutLen;
     }
-    
+
     return status;
 }

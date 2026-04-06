@@ -26,7 +26,9 @@ public:
 
     // Consume messages from a queue using the pulling cursor.
     // Returns HTTP status code (200 = msg, 204 = empty, etc.) or -1 on error.
-    int consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen);
+    // When envelope=true, the response is a msgpack-packed dict:
+    //   {"data": <payload>, "client_id": "<publisher>", "received_at": <unix seconds>}
+    int consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen, bool envelope = false);
 
     // Set a function to get unix time (required for timestamp signing)
     void setTimeFunction(uint32_t (*timeFunc)());

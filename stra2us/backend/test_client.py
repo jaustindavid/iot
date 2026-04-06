@@ -100,24 +100,42 @@ def command_publish(args):
     else:
         logging.error(f"Failed to publish: {resp.status_code} - {resp.text}")
 
+def format_envelope(msg):
+    """Pretty-print an envelope response dict."""
+    if not isinstance(msg, dict):
+        return str(msg)
+    client_id  = msg.get('client_id', msg.get(b'client_id', '?'))
+    received_at = msg.get('received_at', msg.get(b'received_at', 0))
+    data       = msg.get('data', msg.get(b'data', msg))
+    if isinstance(client_id, bytes):  client_id   = client_id.decode()
+    if isinstance(data, bytes):       data        = data.decode('utf-8', errors='replace')
+    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(received_at))
+    return f"[{ts}] from={client_id}  data={data!r}"
+
 def command_follow(args):
     delay = args.delay if hasattr(args, "delay") and args.delay else 1.0
-    logging.info(f"Following topic: {args.topic} (Polling every {delay} seconds)")
+    envelope = getattr(args, "envelope", False)
+    params = {"envelope": "true"} if envelope else {}
+    mode = "envelope" if envelope else "raw"
+    logging.info(f"Following topic: {args.topic} (mode={mode}, poll every {delay}s)")
     try:
         while True:
             # Drain the queue fully before sleeping
             while True:
-                resp = make_request("GET", f"q/{args.topic}", None, args.client_id, args.secret, args.url)
-                
+                resp = make_request("GET", f"q/{args.topic}", None, args.client_id, args.secret, args.url, params=params)
+
                 if resp.status_code == 200:
                     msg = parse_response(resp)
-                    logging.info(f"Received message: {msg}")
+                    if envelope:
+                        logging.info(format_envelope(msg))
+                    else:
+                        logging.info(f"Received: {msg}")
                 elif resp.status_code == 204:
-                    break # Queue is currently empty, break to wait
+                    break  # Queue is currently empty, break to wait
                 else:
                     logging.error(f"Failed to fetch: {resp.status_code} - {resp.text}")
                     break
-                    
+
             time.sleep(delay)
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -162,6 +180,7 @@ def main():
     follow_parser = subparsers.add_parser("follow", help="Consume messages from a topic in a loop")
     follow_parser.add_argument("topic", help="Topic to follow")
     follow_parser.add_argument("--delay", type=float, default=1.0, help="Polling delay in seconds (default 1.0)")
+    follow_parser.add_argument("--envelope", action="store_true", help="Request server-side attribution metadata (client_id, received_at)")
 
     # Set Command
     set_parser = subparsers.add_parser("set", help="Set a KV config pair")
