@@ -1,8 +1,14 @@
+substitutions:
+  stra2us_client_id: !secret stra2us_client_id
+  stra2us_secret_hex: !secret stra2us_secret_hex
+  stra2us_host: !secret stra2us_host
+
 esphome:
   name: bb32
   friendly_name: bb32
   includes:
     - coati_engine.h
+    - IoTClientIDF.h
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -71,6 +77,20 @@ globals:
     type: 'void*'
     initial_value: 'nullptr'
 
+  # --- Stra2us Telemetry ---
+  - id: stra2us_host
+    type: std::string
+    initial_value: '"${stra2us_host}"'
+  - id: stra2us_port
+    type: int
+    initial_value: '8000'
+  - id: stra2us_client_id
+    type: std::string
+    initial_value: '"${stra2us_client_id}"'
+  - id: stra2us_secret_hex
+    type: std::string
+    initial_value: '"${stra2us_secret_hex}"'
+
 font:
   - file: "CustomMerged.bdf"
     id: clock_font
@@ -105,6 +125,18 @@ interval:
               engine->prepare_target(virtual_now, id(clock_font));
             }
           }
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          stra2us_publish(
+            id(stra2us_host).c_str(),
+            id(stra2us_port),
+            id(stra2us_client_id).c_str(),
+            id(stra2us_secret_hex).c_str(),
+            "coaticlock",
+            "heartbeat"
+          );
 
 light:
   - platform: esp32_rmt_led_strip
