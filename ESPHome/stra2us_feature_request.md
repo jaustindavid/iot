@@ -5,13 +5,13 @@
 **Contact:** austin (jaustindavid)  
 
 These requests arose during integration of the `IoTClient` C++ library into an
-ESPHome-based ESP32-C3 firmware (`bb32.yaml`). They are **not blocking** — the
-current implementation works correctly with the server as-is — but they would
-meaningfully improve the experience for embedded clients going forward.
+ESPHome-based ESP32-C3 firmware (`bb32.yaml`).
+
+**All FRs have been implemented as of 2026-04-06.**
 
 ---
 
-## FR-1 — Plain-text / raw-string publish endpoint
+## FR-1 — Plain-text / raw-string publish endpoint ✅ Implemented
 
 ### Background
 
@@ -64,7 +64,7 @@ else:
 
 ---
 
-## FR-2 — HTTP status code exposed through IoTClient response
+## FR-2 — HTTP status code exposed through IoTClient response ✅ Implemented
 
 ### Background
 
@@ -103,7 +103,7 @@ to change to `if (result == 200)`.  Suggest bumping `library.properties` to
 
 ---
 
-## FR-3 — Server health / ping endpoint (no auth required)
+## FR-3 — Server health / ping endpoint (no auth required) ✅ Implemented
 
 ### Background
 
@@ -126,7 +126,7 @@ side-effects on the message store.
 
 ---
 
-## FR-4 — IoTClient: Add `publishQueue` overload for raw strings
+## FR-4 — IoTClient: Add `publishQueue` overload for raw strings ✅ Implemented
 
 ### Background
 
@@ -150,6 +150,57 @@ To support this, the internal `sendSignedRequest` method likely needs a new para
 
 ---
 
-*These requests are low-priority and carry no urgency — the current server API
-is fully functional for the Coati Clock use case.  File as backlog items at
-your discretion.*
+## FR-5 — Subscriber Metadata: `client_id` and `received_at` in Consumer Responses ✅ Implemented
+
+**Date:** 2026-04-06
+
+### Background
+
+Every publish request is already authenticated via HMAC-SHA256 with a known `X-Client-ID`. The server therefore knows exactly who sent every message and when it was received. However, this attribution is currently discarded at the subscriber boundary — consumers receive only the raw payload (e.g. `"heartbeat"`), with no indication of who sent it or when.
+
+This became apparent when observing the `coaticlock` queue from multiple clients simultaneously: a `"heartbeat"` message is indistinguishable from any other client's heartbeat, and there is no way to determine message age without the subscriber tracking external state.
+
+### Design Decision
+
+**Client payloads remain unchanged.** Clients post whatever they want — a plain string, a msgpack blob, a JSON object. The server does not inspect or modify the payload.
+
+**The server wraps consumer responses** with an envelope containing attribution metadata derived from the authenticated request:
+
+```json
+{
+  "data": "heartbeat",
+  "client_id": "bb32",
+  "received_at": 1712412399
+}
+```
+
+- `data` — exactly what the client posted (string, decoded from msgpack if applicable)
+- `client_id` — taken from the authenticated `X-Client-ID` header at publish time; the client cannot forge or omit this
+- `received_at` — Unix timestamp recorded by the server at the moment the message was stored; authoritative and independent of any client-supplied timestamp
+
+### Why server-side attribution is preferable to client self-identification
+
+- **Already authenticated:** The server knows the client ID with certainty. Discarding it forces subscribers to trust client-supplied payload content instead, which is weaker.
+- **Timestamps are only meaningful from the server:** An embedded device's `X-Timestamp` header is used for HMAC replay prevention, not message ordering. Only the server's receive time answers "how old is this message?".
+- **Enforced consistency:** All messages get metadata regardless of client implementation. A new client that posts a bare `"heartbeat"` string gets attributed automatically, with no convention to follow.
+- **Separation of concerns:** Payload is the client's domain. Envelope metadata is the server's domain. Clients should not be required to embed infrastructure-level fields inside their application payloads.
+
+### Suggested implementation surface
+
+`backend/src/api/routes_device.py` — `consume_message()`:
+
+The response body changes from returning the raw msgpack-decoded payload to returning a structured envelope. The Redis Stream entry ID already encodes millisecond-precision receive time (first 13 digits are Unix ms); `client_id` should be stored alongside the payload at publish time (e.g. as a second field in the stream entry).
+
+### Backward compatibility
+
+This is a **breaking change** for existing consumers that expect a bare payload. Suggest a versioned endpoint (`/v2/q/{topic}`) or a request header opt-in (`Accept: application/vnd.stra2us.envelope+json`) to allow gradual migration.
+
+---
+
+| FR | Description | Status |
+|---|---|---|
+| FR-1 | Plain-text publish endpoint (`text/plain`) | ✅ Implemented |
+| FR-2 | HTTP status code returned by IoTClient | ✅ Implemented |
+| FR-3 | Unauthenticated `/health` ping endpoint | ✅ Implemented |
+| FR-4 | `publishQueue(topic, const char*)` overload | ✅ Implemented |
+| FR-5 | Subscriber envelope with `client_id` + `received_at` | ✅ Implemented |
