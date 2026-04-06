@@ -98,6 +98,10 @@ app.include_router(device_router, tags=["device"])
 # Mount Static UI (Protected via external .htaccess in production as specified by user)
 app.mount("/admin", StaticFiles(directory="src/static", html=True), name="static")
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 @app.get("/")
 def read_root():
     return {"status": "IoT Telemetry Service is running. Access /admin for Management UI."}

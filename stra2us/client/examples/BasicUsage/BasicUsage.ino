@@ -50,18 +50,23 @@ void setup() {
     cmp_write_str(&ctx, "ok", 2);
 
     Serial.println("Publishing telemetry data...");
-    bool pubSuccess = iotClient.publishQueue("sensors/temp", mb.data, mb.size);
-    if (pubSuccess) Serial.println("Publish SUCCESS!");
-    else Serial.println("Publish FAILED!");
+    int pubStatus = iotClient.publishQueue("sensors/temp", mb.data, mb.size);
+    if (pubStatus == 200) {
+        Serial.println("Publish SUCCESS (200 OK)");
+    } else {
+        Serial.print("Publish FAILED (Status: ");
+        Serial.print(pubStatus);
+        Serial.println(")");
+    }
 
     // --- Example 2: Read from KV ---
     Serial.println("Reading configuration key...");
     uint8_t rx_buf[128];
     size_t rx_len = 0;
-    bool rxSuccess = iotClient.readKV("device_config", rx_buf, sizeof(rx_buf), &rx_len);
+    int rxStatus = iotClient.readKV("device_config", rx_buf, sizeof(rx_buf), &rx_len);
     
-    if (rxSuccess && rx_len > 0) {
-        Serial.printf("KV Read SUCCESS (Length: %d)\n", rx_len);
+    if (rxStatus == 200 && rx_len > 0) {
+        Serial.printf("KV Read SUCCESS (200 OK, Length: %d)\n", rx_len);
         
         // We could decode MessagePack here using cmp again.
         struct memory_buffer rx_mb;
@@ -71,8 +76,12 @@ void setup() {
         cmp_ctx_t rx_ctx;
         cmp_init(&rx_ctx, &rx_mb, mem_buf_reader, mem_buf_skipper, mem_buf_writer);
         // ... perform read logic
+    } else if (rxStatus == 404) {
+        Serial.println("KV Read: Key not found (404)");
     } else {
-        Serial.println("KV Read FAILED or empty.");
+        Serial.print("KV Read FAILED (Status: ");
+        Serial.print(rxStatus);
+        Serial.println(")");
     }
 }
 

@@ -23,14 +23,22 @@ async def publish_message(
         ttl = 604800
 
     await check_acl(context, f"q/{topic}", mode="write")
+    content_type = request.headers.get("content-type", "")
     body = await request.body()
-    try:
-        # We just store the raw MessagePack bytes
-        # Optionally, validate if it's valid msgpack:
-        if len(body) > 0:
-            msgpack.unpackb(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid MessagePack payload")
+    
+    if "text/plain" in content_type:
+        try:
+            # Wrap raw string in msgpack
+            body = msgpack.packb(body.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid UTF-8 payload")
+    else:
+        try:
+            # Validate existing msgpack
+            if len(body) > 0:
+                msgpack.unpackb(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid MessagePack payload")
 
     redis = get_redis_client()
     exp_time = int(time.time()) + ttl
@@ -85,13 +93,20 @@ async def write_kv(
     context: dict = Depends(verify_device_request)
 ):
     await check_acl(context, f"kv/{key}", mode="write")
+    content_type = request.headers.get("content-type", "")
     body = await request.body()
     
-    try:
-        if len(body) > 0:
-            msgpack.unpackb(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid MessagePack payload")
+    if "text/plain" in content_type:
+        try:
+            body = msgpack.packb(body.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid UTF-8 payload")
+    else:
+        try:
+            if len(body) > 0:
+                msgpack.unpackb(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid MessagePack payload")
 
     redis = get_redis_client()
     await redis.set(f"kv:{key}", body)

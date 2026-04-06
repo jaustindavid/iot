@@ -85,10 +85,10 @@ void IoTClient::calculateSignature(const char* uri, const uint8_t* payload, size
 #endif
 }
 
-bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
+int IoTClient::sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
     if (!_client.connected()) {
         if (!_client.connect(_host, _port)) {
-            return false;
+            return -1;
         }
     }
 
@@ -141,6 +141,8 @@ bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uin
     String currentLine = "";
     int readHead = 0;
     int contentLength = -1;
+    int statusCode = -1;
+    bool isFirstLine = true;
     
     while (_client.connected() || _client.available()) {
         if (_client.available()) {
@@ -148,6 +150,21 @@ bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uin
             if (!isBody) {
                 currentLine += c;
                 if (currentLine.endsWith("\n")) {
+                    if (isFirstLine) {
+                        // Parse "HTTP/1.1 200 OK"
+                        int firstSpace = currentLine.indexOf(' ');
+                        if (firstSpace != -1) {
+                            String codePart = currentLine.substring(firstSpace + 1);
+                            int secondSpace = codePart.indexOf(' ');
+                            if (secondSpace != -1) {
+                                statusCode = codePart.substring(0, secondSpace).toInt();
+                            } else {
+                                statusCode = codePart.toInt();
+                            }
+                        }
+                        isFirstLine = false;
+                    }
+
                     String lowerLine = currentLine;
                     lowerLine.toLowerCase();
                     if (lowerLine.startsWith("content-length:")) {
@@ -182,48 +199,43 @@ bool IoTClient::sendSignedRequest(const char* method, const char* uri, const uin
     }
 
     // We purposely do NOT call _client.stop() to preserve the TCP socket
-    return true;
+    return statusCode;
 }
 
-bool IoTClient::writeKV(const char* key, const uint8_t* payload, size_t payloadLen) {
+int IoTClient::writeKV(const char* key, const uint8_t* payload, size_t payloadLen) {
     char uri[64];
     snprintf(uri, sizeof(uri), "/kv/%s", key);
     return sendSignedRequest("POST", uri, payload, payloadLen, nullptr, 0, nullptr);
 }
 
-bool IoTClient::readKV(const char* key, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
+int IoTClient::readKV(const char* key, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
     char uri[64];
     snprintf(uri, sizeof(uri), "/kv/%s", key);
     return sendSignedRequest("GET", uri, nullptr, 0, responseBuffer, maxLen, outLen);
 }
 
-bool IoTClient::publishQueue(const char* topic, const uint8_t* payload, size_t payloadLen) {
+int IoTClient::publishQueue(const char* topic, const uint8_t* payload, size_t payloadLen) {
     char uri[64];
     snprintf(uri, sizeof(uri), "/q/%s", topic);
     return sendSignedRequest("POST", uri, payload, payloadLen, nullptr, 0, nullptr);
 }
 
-bool IoTClient::publishQueue(const char* topic, const uint8_t* payload, size_t payloadLen, uint32_t ttl) {
+int IoTClient::publishQueue(const char* topic, const uint8_t* payload, size_t payloadLen, uint32_t ttl) {
     char uri[128];
     snprintf(uri, sizeof(uri), "/q/%s?ttl=%lu", topic, (unsigned long)ttl);
     return sendSignedRequest("POST", uri, payload, payloadLen, nullptr, 0, nullptr);
 }
 
-bool IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
+int IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
     char uri[64];
     snprintf(uri, sizeof(uri), "/q/%s", topic);
     
     size_t localOutLen = 0;
-    bool reqSuccess = sendSignedRequest("GET", uri, nullptr, 0, responseBuffer, maxLen, &localOutLen);
+    int status = sendSignedRequest("GET", uri, nullptr, 0, responseBuffer, maxLen, &localOutLen);
     
     if (outLen != nullptr) {
         *outLen = localOutLen;
     }
     
-    // If request failed entirely, or if the server returned 0 bytes (HTTP 204 No Content)
-    if (!reqSuccess || localOutLen == 0) {
-        return false;
-    }
-    
-    return true;
+    return status;
 }
