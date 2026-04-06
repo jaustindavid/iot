@@ -85,7 +85,7 @@ void IoTClient::calculateSignature(const char* uri, const uint8_t* payload, size
 #endif
 }
 
-int IoTClient::sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {
+int IoTClient::sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen, const char* contentType) {
     if (!_client.connected()) {
         if (!_client.connect(_host, _port)) {
             return -1;
@@ -121,7 +121,9 @@ int IoTClient::sendSignedRequest(const char* method, const char* uri, const uint
     _client.print("\r\n");
 
     if (payloadLen > 0) {
-        _client.print("Content-Type: application/x-msgpack\r\n");
+        _client.print("Content-Type: ");
+        _client.print(contentType);
+        _client.print("\r\n");
         _client.print("Content-Length: ");
         _client.print(payloadLen);
         _client.print("\r\n\r\n");
@@ -224,6 +226,12 @@ int IoTClient::publishQueue(const char* topic, const uint8_t* payload, size_t pa
     char uri[128];
     snprintf(uri, sizeof(uri), "/q/%s?ttl=%lu", topic, (unsigned long)ttl);
     return sendSignedRequest("POST", uri, payload, payloadLen, nullptr, 0, nullptr);
+}
+
+int IoTClient::publishQueue(const char* topic, const char* message) {
+    char uri[64];
+    snprintf(uri, sizeof(uri), "/q/%s", topic);
+    return sendSignedRequest("POST", uri, (const uint8_t*)message, strlen(message), nullptr, 0, nullptr, "text/plain");
 }
 
 int IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen) {

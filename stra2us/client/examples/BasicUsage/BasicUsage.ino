@@ -59,7 +59,19 @@ void setup() {
         Serial.println(")");
     }
 
-    // --- Example 2: Read from KV ---
+    // --- [New] Example 3: Simple Raw String Publish (FR-4) ---
+    // No MessagePack, no buffer management, no cmp library needed for this call!
+    Serial.println("Publishing raw heartbeat string...");
+    int hbStatus = iotClient.publishQueue("device/status", "keep_alive");
+    if (hbStatus == 200) {
+        Serial.println("Heartbeat SUCCESS!");
+    } else {
+        Serial.print("Heartbeat FAILED (Status: ");
+        Serial.print(hbStatus);
+        Serial.println(")");
+    }
+
+    // --- Example 4: Read from KV ---
     Serial.println("Reading configuration key...");
     uint8_t rx_buf[128];
     size_t rx_len = 0;

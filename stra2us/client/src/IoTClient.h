@@ -21,6 +21,9 @@ public:
     // Publish ephemeral data to a queue with a custom TTL (in seconds)
     int publishQueue(const char* topic, const uint8_t* payload, size_t payloadLen, uint32_t ttl);
 
+    // [New] Publish ephemeral data as an un-encoded raw UTF-8 string (uses text/plain)
+    int publishQueue(const char* topic, const char* message);
+
     // Consume messages from a queue using the pulling cursor.
     // Returns HTTP status code (200 = msg, 204 = empty, etc.) or -1 on error.
     int consumeQueue(const char* topic, uint8_t* responseBuffer, size_t maxLen, size_t* outLen);
@@ -40,7 +43,7 @@ private:
 
     uint32_t (*_timeFunc)();
 
-    int sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen);
+    int sendSignedRequest(const char* method, const char* uri, const uint8_t* payload, size_t payloadLen, uint8_t* responseBuffer, size_t maxLen, size_t* outLen, const char* contentType = "application/x-msgpack");
     void readResponse(uint8_t* responseBuffer, size_t maxLen, size_t* outLen);
 };
 
