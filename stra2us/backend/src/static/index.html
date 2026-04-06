@@ -25,6 +25,7 @@
             <ul class="nav-links">
                 <li><a href="#" data-target="dashboard" class="active">Dashboard / Stats</a></li>
                 <li><a href="#" data-target="keys">Key Management</a></li>
+                <li><a href="#" data-target="monitor">Topic Monitor</a></li>
                 <li><a href="#" data-target="logs">Activity Logs</a></li>
                 <li><a href="#" data-target="backup">Backup / Restore</a></li>
             </ul>
@@ -101,6 +102,29 @@
                             <!-- populated by js -->
                         </tbody>
                     </table>
+                </div>
+            </section>
+
+            <!-- Topic Monitor View -->
+            <section id="monitor" class="view">
+                <header>
+                    <h1>Topic Monitor</h1>
+                    <p class="subtitle">Non-destructive, read-only live feed of any queue. Does not advance subscriber cursors.</p>
+                </header>
+
+                <div class="card glass-panel form-card" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                    <input type="text" id="monitorTopic" placeholder="Topic name (e.g. coaticlock)" style="flex:1; min-width:200px;">
+                    <button id="monitorStartBtn" class="primary-btn" onclick="monitorStart()">&#9654; Watch</button>
+                    <button id="monitorStopBtn" class="primary-btn" onclick="monitorStop()" style="background:var(--accent-danger); display:none;">&#9632; Stop</button>
+                    <div id="monitorStatus" class="monitor-status-off">Idle</div>
+                </div>
+
+                <div class="card glass-panel" style="padding:0; overflow:hidden;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid rgba(255,255,255,0.07);">
+                        <span style="font-weight:600; font-size:0.95rem;" id="monitorFeedTitle">No topic selected</span>
+                        <button onclick="monitorClear()" style="background:none; border:1px solid rgba(255,255,255,0.15); color:var(--text-muted); padding:4px 12px; border-radius:6px; cursor:pointer; font-size:0.8rem;">Clear</button>
+                    </div>
+                    <div id="monitorFeed" class="monitor-feed"></div>
                 </div>
             </section>
 

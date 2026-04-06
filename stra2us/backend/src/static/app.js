@@ -240,5 +240,112 @@ async function uploadRestore() {
     `;
 }
 
+// 5. Topic Monitor
+const MONITOR_COLORS = [
+    '#6c63ff','#00c2ff','#f5a623','#43e97b','#ff6b6b',
+    '#a18cd1','#fda085','#84fab0','#f093fb','#4facfe',
+];
+const monitorClientColors = {};
+let monitorInterval = null;
+let monitorSeenIds = new Set();
+let monitorActive = false;
+
+function monitorClientColor(clientId) {
+    if (!monitorClientColors[clientId]) {
+        const idx = Object.keys(monitorClientColors).length % MONITOR_COLORS.length;
+        monitorClientColors[clientId] = MONITOR_COLORS[idx];
+    }
+    return monitorClientColors[clientId];
+}
+
+function monitorFormatData(data) {
+    if (data === null || data === undefined) return '<em>null</em>';
+    if (typeof data === 'object') return JSON.stringify(data);
+    return String(data);
+}
+
+async function monitorPoll() {
+    const topic = document.getElementById('monitorTopic').value.trim();
+    if (!topic) return;
+
+    const res = await fetch(`${API_BASE}/stream/q/${topic}`);
+    if (!res.ok) return;
+    const messages = await res.json();
+
+    const feed = document.getElementById('monitorFeed');
+    let addedAny = false;
+
+    // messages arrive newest-first from the server
+    for (const msg of messages) {
+        if (monitorSeenIds.has(msg.id)) continue;
+        monitorSeenIds.add(msg.id);
+        addedAny = true;
+
+        const color = monitorClientColor(msg.client_id);
+        const d = new Date(msg.received_at * 1000);
+        const ts = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const dataStr = monitorFormatData(msg.data);
+
+        const row = document.createElement('div');
+        row.className = 'monitor-row monitor-row-new';
+        row.innerHTML = `
+            <span class="monitor-ts">${ts}</span>
+            <span class="monitor-badge" style="background:${color}22; color:${color}; border-color:${color}44;">${msg.client_id}</span>
+            <span class="monitor-data">${dataStr}</span>
+        `;
+        // Prepend so newest is at top
+        feed.insertBefore(row, feed.firstChild);
+
+        // Remove animation class after it plays
+        setTimeout(() => row.classList.remove('monitor-row-new'), 600);
+    }
+
+    // Cap feed at 200 rows
+    while (feed.children.length > 200) {
+        feed.removeChild(feed.lastChild);
+    }
+}
+
+function monitorStart() {
+    const topic = document.getElementById('monitorTopic').value.trim();
+    if (!topic) { document.getElementById('monitorTopic').focus(); return; }
+
+    monitorActive = true;
+    document.getElementById('monitorFeedTitle').textContent = `q/${topic}`;
+    document.getElementById('monitorStartBtn').style.display = 'none';
+    document.getElementById('monitorStopBtn').style.display = '';
+    const status = document.getElementById('monitorStatus');
+    status.textContent = 'Live';
+    status.className = 'monitor-status-live';
+
+    monitorPoll();
+    monitorInterval = setInterval(monitorPoll, 2000);
+}
+
+function monitorStop() {
+    clearInterval(monitorInterval);
+    monitorInterval = null;
+    monitorActive = false;
+    document.getElementById('monitorStartBtn').style.display = '';
+    document.getElementById('monitorStopBtn').style.display = 'none';
+    const status = document.getElementById('monitorStatus');
+    status.textContent = 'Stopped';
+    status.className = 'monitor-status-off';
+}
+
+function monitorClear() {
+    document.getElementById('monitorFeed').innerHTML = '';
+    monitorSeenIds.clear();
+}
+
+// Stop monitor when navigating away
+document.querySelectorAll('.nav-links a').forEach(link => {
+    link.addEventListener('click', () => {
+        if (monitorActive && link.dataset.target !== 'monitor') {
+            monitorStop();
+        }
+    });
+});
+
 // Init
 fetchStats();

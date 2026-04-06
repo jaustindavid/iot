@@ -196,3 +196,48 @@ async def restore_keys(payload: BackupPayload, force: bool = Query(False)):
             results["restored"].append(client.client_id)
 
     return results
+
+
+# --- Topic Stream Monitor ---
+
+@router.get("/stream/q/{topic}")
+async def stream_monitor(topic: str, limit: int = 50):
+    """Read-only scan of the last N messages from a topic stream.
+    Uses XREVRANGE — does not advance any subscriber cursor.
+    """
+    redis = get_redis_client()
+    records = await redis.xrevrange(f"q:{topic}", max="+", min="-", count=limit)
+
+    messages = []
+    now = int(time.time())
+    for msg_id, fields in records:
+        if isinstance(msg_id, bytes):
+            msg_id = msg_id.decode()
+
+        # received_at derived from stream entry ID millisecond prefix (authoritative)
+        ms_str = msg_id.split("-")[0]
+        received_at = int(ms_str) // 1000
+
+        # Skip expired messages
+        exp = int(fields.get(b"exp", b"0"))
+        if now > exp:
+            continue
+
+        raw_payload = fields.get(b"payload", b"")
+        try:
+            data = msgpack.unpackb(raw_payload, raw=False)
+        except Exception:
+            data = raw_payload.hex()
+
+        client_id = fields.get(b"client_id", b"unknown")
+        if isinstance(client_id, bytes):
+            client_id = client_id.decode("utf-8")
+
+        messages.append({
+            "id": msg_id,
+            "received_at": received_at,
+            "client_id": client_id,
+            "data": data,
+        })
+
+    return messages
