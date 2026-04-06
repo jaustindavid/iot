@@ -187,5 +187,58 @@ setInterval(() => {
     if (activeViewId === 'logs') fetchLogs();
 }, 5000);
 
+// 4. Backup / Restore
+async function downloadBackup() {
+    const res = await fetch(`${API_BASE}/keys/backup`);
+    if (!res.ok) {
+        alert('Backup failed. Check the server logs.');
+        return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'stra2us_backup.json';
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+async function uploadRestore() {
+    const fileInput = document.getElementById('restoreFile');
+    const force = document.getElementById('forceRestore').checked;
+    const resultDiv = document.getElementById('restoreResult');
+
+    if (!fileInput.files.length) {
+        alert('Please select a backup file first.');
+        return;
+    }
+
+    const text = await fileInput.files[0].text();
+    let payload;
+    try {
+        payload = JSON.parse(text);
+    } catch (e) {
+        alert('Invalid JSON file. Please select a valid backup.');
+        return;
+    }
+
+    const res = await fetch(`${API_BASE}/keys/restore?force=${force}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+
+    const data = await res.json();
+    resultDiv.classList.remove('hidden');
+    resultDiv.innerHTML = `
+        <strong>Restore complete!</strong><br><br>
+        ✅ Restored: <strong>${data.restored.length}</strong> clients<br>
+        ⏭ Skipped (already exist): <strong>${data.skipped.length}</strong> clients<br>
+        ♻️ Overwritten: <strong>${data.overwritten.length}</strong> clients
+        ${data.restored.length ? `<br><br><small>New: ${data.restored.join(', ')}</small>` : ''}
+        ${data.overwritten.length ? `<br><small>Overwritten: ${data.overwritten.join(', ')}</small>` : ''}
+    `;
+}
+
 // Init
 fetchStats();

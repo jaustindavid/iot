@@ -1,73 +1,176 @@
-# Stra2Us - IoT Telemetry Service
+# Stra2Us — IoT Telemetry Service
 
-Stra2Us is a high-performance, stateless IoT messaging and configuration management relay system designed implicitly for resource-constrained devices (like the ESP32 and Particle Photon 2). 
-
-It features an asynchronous Python backend layered on top of Redis, and ships alongside a zero-malloc C++ client SDK.
+Stra2Us is a high-performance, stateless IoT messaging and configuration relay designed for resource-constrained devices (ESP32, Particle Photon 2, and similar). It features an async Python/Redis backend, a zero-malloc C++ client SDK, and a browser-based admin dashboard.
 
 ## Design Architecture
 
-- **Stateless Backend Mechanism:** The backend HTTP application stores absolutely zero persistent state in process memory. It relies purely on Redis. This allows it to scale horizontally indefinitely out-of-the-box.
-- **HMAC-SHA256 Signatures:** IoT Devices transmit data safely over unencrypted streams or without heavy Transport Layer Security overhead by cryptographically hashing their device secrets against the Unix timestamp. The server rigorously restricts replay attacks tighter than a 5-minute drift window.
-- **Broadcast Streams:** Message queues actively operate natively via Redis Streams (`XADD`/`XREAD`). A stream acts as a destructive-free pipeline. Devices fetch messages concurrently at distinct rates unbothered by others, polling on uniquely defined server-bound cursors.
-- **Micro-serialization:** Communication payload is deeply packed using `MessagePack`. This cuts the byte envelope overhead exponentially vs JSON, saving crucial IoT bandwidth and minimizing TCP boundaries.
+- **Stateless Backend:** Zero in-process state — everything lives in Redis. Scales horizontally out of the box.
+- **HMAC-SHA256 Signatures:** Devices sign requests with a shared secret + Unix timestamp. The server enforces a ±300 second replay window.
+- **Broadcast Streams:** Queues use Redis Streams (`XADD`/`XREAD`). Each subscriber maintains its own cursor, so multiple devices can read independently without consuming each other's messages.
+- **Micro-serialization:** Payloads use [MessagePack](https://msgpack.org/) by default, cutting wire overhead vs. JSON. Plain-text (`text/plain`) is also accepted and automatically wrapped server-side.
 
 ## Technical Stack
-- **Backend:** `Python 3.9+`, `FastAPI`, `Uvicorn`, `Redis Lists/Streams`.
-- **Client (Device):** Built natively with C++ (`Arduino.h`).
-- **Dashboard:** Zero-build vanilla HTML / JS querying dashboard internals safely wrapped via custom `.htpasswd` encryption middleware.
+- **Backend:** Python 3.9+, FastAPI, Uvicorn, Redis Streams.
+- **Client SDK:** C++ (Arduino/ESP-IDF), zero-malloc, mbedTLS HMAC.
+- **Dashboard:** Vanilla HTML/JS, no build step, protected by Basic Auth + session cookies.
 
-## Installation 
+---
+
+## Installation
 
 ### 1. Requirements
-Ensure your host machine explicitly has installed:
 - Python 3.9 or higher
-- Redis Server (running on localhost:6379 natively)
+- Redis Server (`sudo apt install redis-server` on Debian/Ubuntu)
 
-### 2. Backend Bootup
-You can start the server locally or for external access (e.g. on a Raspberry Pi).
+### 2. Start the Backend
+
 ```bash
 cd backend
-# For local access
-./start.sh
-# For external access (RPi)
-./start.sh --host 0.0.0.0
-```
-*Note: The script automatically verifies that Redis is running. If it's not, it will provide instructions on how to start it.*
 
-### 3. Dashboard Admin User
-To view the web-monitoring dashboard at `http://<your-ip>:8000/admin`, you must initialize an administrative login. 
+# Local development
+./start.sh
+
+# For external network access (e.g. Raspberry Pi)
+./start.sh --host 0.0.0.0
+
+# Custom port
+./start.sh --host 0.0.0.0 --port 9000
+```
+
+> The script checks that Redis is running before starting. If it's not, it will print the exact command to start it.
+
+### 3. Create the Admin User
+
 ```bash
 cd backend
 source venv/bin/activate
-python create_admin.py admin_user your_password
-```
-*This command generates a secure HMAC encrypted `admin.htpasswd` file, mapping to securely signed session cookies upon frontend login.*
-
-### 4. Remote Deployment Tips (Raspberry Pi)
-- **Redis Service**: Ensure Redis is enabled and starting on boot: `sudo systemctl enable redis-server`.
-- **Firewall**: If using `ufw`, allow port 8000: `sudo ufw allow 8000`.
-- **Backgrounding**: Use `nohup ./start.sh --host 0.0.0.0 &` or a `systemd` service to keep it running.
-
-## Using the CLI Toolkit
-You can test the queue manually without utilizing C++ hardware by invoking the included helper client utility script!
-
-First, login to the visual admin panel and create an IoT device to generate its Client-ID and Secret values.
-
-Then, execute arbitrary commands cleanly:
-
-**Publish to Queue (with 3600 second optional TTL):**
-```bash
-python test_client.py --client-id xxx --secret xxx publish sensor_data "{\"pulse\": true}" --ttl 3600
+python create_admin.py your_username your_password
 ```
 
-**Follow a Broadcast Queue:**
+Then open `http://<your-ip>:8000/admin` in a browser.
+
+### 4. Raspberry Pi Deployment Tips
+- **Auto-start Redis:** `sudo systemctl enable redis-server`
+- **Firewall:** `sudo ufw allow 8000`
+- **Run in background:** `nohup ./start.sh --host 0.0.0.0 &`
+- **Check connectivity:** `curl http://<rpi-ip>:8000/health`
+
+---
+
+## API Reference
+
+Full API documentation is in [`docs/api.md`](docs/api.md).
+
+### Quick Reference
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /health` | None | Liveness check — safe to call before SNTP sync |
+| `POST /q/{topic}` | HMAC | Publish a message to a queue |
+| `GET /q/{topic}` | HMAC | Consume the next message from a queue |
+| `POST /kv/{key}` | HMAC | Write a persistent KV value |
+| `GET /kv/{key}` | HMAC | Read a persistent KV value |
+| `GET /api/admin/keys/backup` | Admin | Download all client credentials as JSON |
+| `POST /api/admin/keys/restore` | Admin | Restore credentials from a backup file |
+
+Both `/q/` and `/kv/` accept `Content-Type: application/x-msgpack` (default) or `Content-Type: text/plain` (server wraps the string in MessagePack automatically).
+
+---
+
+## C++ Client SDK (v2.0.0)
+
+> **Breaking change from v1.x:** All methods now return `int` (HTTP status code) instead of `bool`. Check `result == 200` instead of `if (result)`.
+
+### Include
+
+```cpp
+#include "IoTClient.h"
+
+WiFiClient wifiClient;
+IoTClient iotClient(wifiClient, "192.168.1.100", 8000, "my-device", "hex-secret");
+iotClient.setTimeFunction([]() { return (uint32_t)time(nullptr); });
+```
+
+### Publish (MessagePack)
+
+```cpp
+uint8_t buf[64];
+// ... pack data into buf using cmp ...
+int status = iotClient.publishQueue("sensors/temp", buf, sizeof(buf));
+if (status == 200) Serial.println("OK");
+```
+
+### Publish (Raw String — no MessagePack library needed)
+
+```cpp
+// Server wraps it in MessagePack automatically (FR-1 + FR-4)
+int status = iotClient.publishQueue("device/status", "heartbeat");
+if (status == 200) Serial.println("Heartbeat sent");
+```
+
+### Consume
+
+```cpp
+uint8_t rxBuf[256];
+size_t rxLen = 0;
+int status = iotClient.consumeQueue("commands", rxBuf, sizeof(rxBuf), &rxLen);
+if (status == 200) {
+    // rxBuf contains a valid MessagePack message
+} else if (status == 204) {
+    // Queue is empty — nothing to do
+} else if (status == 401) {
+    Serial.println("Auth failure — check secret");
+} else if (status == -1) {
+    Serial.println("TCP connection failed");
+}
+```
+
+### KV Read/Write
+
+```cpp
+int status = iotClient.writeKV("config", buf, len);
+int status = iotClient.readKV("config", rxBuf, sizeof(rxBuf), &rxLen);
+```
+
+---
+
+## CLI Test Client
+
 ```bash
-# Safely loops and drains queue streams using rapid HTTP 204 short-circuit bounds
+cd backend
+source venv/bin/activate
+
+# Publish (JSON or plain string)
+python test_client.py --client-id xxx --secret xxx publish sensor_data '{"temp": 22.4}'
+
+# Follow a queue (polls until Ctrl-C)
 python test_client.py --client-id xxx --secret xxx follow sensor_data --delay 1.0
+
+# KV read/write
+python test_client.py --client-id xxx --secret xxx set device-config '{"interval": 60}'
+python test_client.py --client-id xxx --secret xxx get device-config
+
+# Point at a remote server
+python test_client.py --url http://192.168.1.50:8000 --client-id xxx --secret xxx publish heartbeat ok
 ```
 
-**Set and Read KV Storage Nodes:**
+---
+
+## Backup & Restore
+
+Client credentials (IDs, HMAC secrets, ACLs) can be exported and re-imported via the Admin Dashboard under **Backup / Restore**, or directly via the API:
+
 ```bash
-python test_client.py --client-id xxx --secret xxx set device-10 "{\"throttle\": 500}"
-python test_client.py --client-id xxx --secret xxx get device-10
+# Download backup
+curl -u admin:password http://localhost:8000/api/admin/keys/backup -o backup.json
+
+# Restore (skips existing clients)
+curl -u admin:password -X POST http://localhost:8000/api/admin/keys/restore \
+  -H 'Content-Type: application/json' -d @backup.json
+
+# Restore and overwrite existing clients
+curl -u admin:password -X POST "http://localhost:8000/api/admin/keys/restore?force=true" \
+  -H 'Content-Type: application/json' -d @backup.json
 ```
+
+> ⚠️ Backup files contain raw HMAC secrets. Treat them like a password manager export — never commit to version control.

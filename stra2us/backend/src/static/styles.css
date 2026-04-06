@@ -279,3 +279,13 @@ input:focus, select:focus { border-color: var(--accent-blue); }
 .close-btn { position: absolute; right: 20px; top: 20px; font-size: 24px; cursor: pointer; color: var(--text-muted); }
 .close-btn:hover { color: white; }
 .code-block-wrapper pre { background: black; padding: 20px; border-radius: 8px; overflow-x: auto; color: var(--accent-success); }
+
+/* Backup warning banner */
+.backup-warning {
+    border-left: 4px solid #f5a623;
+    background: rgba(245, 166, 35, 0.08);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+.backup-warning strong { color: #f5a623; }

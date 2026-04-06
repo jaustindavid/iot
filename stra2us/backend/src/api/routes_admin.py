@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import json
 import msgpack
+import time
 from core.redis_client import get_redis_client
 from core.security import generate_secret
 
@@ -11,6 +13,15 @@ router = APIRouter()
 class ClientCreate(BaseModel):
     client_id: str
     acl_read_write: str = "*"
+
+class ClientBackupEntry(BaseModel):
+    client_id: str
+    secret: str
+    acl: dict
+
+class BackupPayload(BaseModel):
+    exported_at: int
+    clients: List[ClientBackupEntry]
 
 @router.get("/keys")
 async def list_keys():
@@ -126,3 +137,62 @@ async def get_logs(limit: int = 50):
         except Exception:
             pass
     return logs
+
+
+# --- Backup / Restore ---
+
+@router.get("/keys/backup")
+async def backup_keys():
+    """Export all client IDs, secrets, and ACLs as a JSON blob.
+    WARNING: Response contains raw HMAC secrets. Treat like a password vault.
+    """
+    redis = get_redis_client()
+    secret_keys = await redis.keys("client:*:secret")
+    clients = []
+    for k in secret_keys:
+        if isinstance(k, bytes):
+            k = k.decode('utf-8')
+        client_id = k.split(":")[1]
+        secret = await redis.get(f"client:{client_id}:secret")
+        acl_json = await redis.get(f"client:{client_id}:acl")
+        secret_str = secret.decode('utf-8') if isinstance(secret, bytes) else secret
+        acl = json.loads(acl_json) if acl_json else {}
+        clients.append({
+            "client_id": client_id,
+            "secret": secret_str,
+            "acl": acl,
+        })
+
+    payload = {
+        "exported_at": int(time.time()),
+        "clients": clients,
+    }
+    return JSONResponse(content=payload, headers={
+        "Content-Disposition": "attachment; filename=stra2us_backup.json"
+    })
+
+
+@router.post("/keys/restore")
+async def restore_keys(payload: BackupPayload, force: bool = Query(False)):
+    """Restore client credentials from a backup JSON blob.
+    By default, skips clients that already exist.
+    Pass ?force=true to overwrite existing entries.
+    """
+    redis = get_redis_client()
+    results = {"restored": [], "skipped": [], "overwritten": []}
+
+    for client in payload.clients:
+        existing = await redis.get(f"client:{client.client_id}:secret")
+        if existing and not force:
+            results["skipped"].append(client.client_id)
+            continue
+
+        await redis.set(f"client:{client.client_id}:secret", client.secret)
+        await redis.set(f"client:{client.client_id}:acl", json.dumps(client.acl))
+
+        if existing:
+            results["overwritten"].append(client.client_id)
+        else:
+            results["restored"].append(client.client_id)
+
+    return results

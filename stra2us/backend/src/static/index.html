@@ -26,6 +26,7 @@
                 <li><a href="#" data-target="dashboard" class="active">Dashboard / Stats</a></li>
                 <li><a href="#" data-target="keys">Key Management</a></li>
                 <li><a href="#" data-target="logs">Activity Logs</a></li>
+                <li><a href="#" data-target="backup">Backup / Restore</a></li>
             </ul>
         </nav>
 
@@ -124,6 +125,37 @@
                             <!-- populated by js -->
                         </tbody>
                     </table>
+                </div>
+            </section>
+            <!-- Backup / Restore View -->
+            <section id="backup" class="view">
+                <header>
+                    <h1>Backup &amp; Restore</h1>
+                    <p class="subtitle">Export or import all client credentials. Protect your backup with the same care as a password manager file.</p>
+                </header>
+
+                <div class="card glass-panel form-card backup-warning">
+                    <p>&#9888; <strong>Security Warning:</strong> Backup files contain raw HMAC secrets in plaintext. Anyone with this file can authenticate as any of your devices. Store it securely and never commit it to version control.</p>
+                </div>
+
+                <div class="card glass-panel form-card">
+                    <h3>Download Backup</h3>
+                    <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:16px;">Downloads a <code>stra2us_backup.json</code> file containing all client IDs, secrets, and ACLs.</p>
+                    <button class="primary-btn" onclick="downloadBackup()">&#8659; Download Backup</button>
+                </div>
+
+                <div class="card glass-panel form-card">
+                    <h3>Restore from Backup</h3>
+                    <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:16px;">Upload a previously downloaded backup file. Existing clients will be skipped unless you enable Force Overwrite.</p>
+                    <div class="input-group">
+                        <input type="file" id="restoreFile" accept=".json" style="padding:10px;">
+                    </div>
+                    <div class="input-group" style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+                        <input type="checkbox" id="forceRestore" style="width:auto; padding:0;">
+                        <label for="forceRestore" style="color:var(--text-muted); font-size:0.9rem;">Force Overwrite (replace existing clients)</label>
+                    </div>
+                    <button class="primary-btn" style="margin-top:16px; background: linear-gradient(90deg, var(--accent-danger), #ff4488);" onclick="uploadRestore()">&#8657; Restore Backup</button>
+                    <div id="restoreResult" class="hidden alert-success" style="margin-top:16px;"></div>
                 </div>
             </section>
         </main>
