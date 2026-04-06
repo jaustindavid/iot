@@ -54,6 +54,10 @@ struct CoatiAgent {
   Point claimed_target = {-1, -1};
   int wait_ticks = 0;
   int bored_ticks = 0;
+
+  CoatiAgent(Point p, Point lp, bool c, std::vector<Point> path, Point target, int w, int b)
+      : pos(p), last_pos(lp), carrying(c) , current_path(path), claimed_target(target), wait_ticks(w), bored_ticks(b) {}
+  CoatiAgent() = default;
 };
 
 // ---- Wobbly Time ----
@@ -149,8 +153,8 @@ public:
   
   CoatiEngine() {
     dummy = new DummyDisplay();
-    agents.push_back({{8, 4}, {8, 4}, false, {}, {-1, -1}, 0, 0});
-    agents.push_back({{24, 4}, {24, 4}, false, {}, {-1, -1}, 0, 0});
+    agents.push_back(CoatiAgent{{8, 4}, {8, 4}, false, {}, {-1, -1}, 0, 0});
+    agents.push_back(CoatiAgent{{24, 4}, {24, 4}, false, {}, {-1, -1}, 0, 0});
     
     for(int x=0; x<32; x++) {
         for(int y=0; y<8; y++) {

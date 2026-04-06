@@ -8,6 +8,7 @@ esp32:
   board: esp32-c3-devkitm-1
   framework:
     type: esp-idf
+    version: 5.5.3
 
 # Enable Home Assistant API
 api:
@@ -19,6 +20,8 @@ wifi:
   password: !secret wifi_password
 
   # Enable fallback hotspot (captive portal) in case wifi connection fails
+  fast_connect: true
+  power_save_mode: NONE
   ap:
     ssid: "Bb32 Fallback Hotspot"
     password: "ByIg5i1tSdFp"
@@ -73,6 +76,7 @@ font:
     id: clock_font
 
 interval:
+
   - interval: 1s
     then:
       - lambda: |-
@@ -234,5 +238,5 @@ ota:
     password: "48d462d0fa84e4d6f0d4fc0f3086b2f4"
 
 logger:
-  level: DEBUG
+  level: INFO
     

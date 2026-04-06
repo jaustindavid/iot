@@ -231,3 +231,37 @@ Agents may only place at their exact claimed destination. An agent standing at a
 | Bored wander rate | 1 step / 1,000 ms | 20 `bored_ticks` × 50 ms/tick |
 | Wobbly time range | 120–300 s | Configurable in `bb32.yaml` |
 | Catch-up rate | ±30% | Configurable in `bb32.yaml` |
+
+---
+
+## 7. Engineering Rules
+
+### Rule #1 — DO NOT BREAK OTA
+
+Over-the-air update capability is the project's most critical operational primitive. Without it, every firmware change requires physical access to the device and a USB cable.
+
+**If OTA appears to be broken, STOP. Verify it with certainty before making any structural changes.** Specifically:
+
+1. Attempt the OTA flash directly by IP: `esphome run bb32.yaml --device 192.168.69.164 --no-logs`
+2. Confirm the exact error message. "Connection reset by peer" and "Authentication failed" are different problems with different fixes.
+3. Check whether the issue is OTA at all — a failure in a separate subsystem (e.g., a telemetry client failing to reach its server) will produce a similar-looking error in the logs but has nothing to do with OTA.
+4. Do not change the SDK version, LED driver, logging level, framerate, or any other structural parameter until OTA failure is confirmed with a direct flash attempt.
+
+---
+
+### Issue #5 — OTA Spiral: Misread Telemetry Error Triggers Unnecessary Structural Changes
+
+**Date:** 2026-04-06
+
+**Symptom:** OTA flashing appeared broken. A cascade of SDK version changes (5.1.6 → 4.4.6 → 5.1.6), LED driver swaps, framerate reductions, and logging changes were made in an attempt to "fix" OTA, breaking the device into a boot loop at one point.
+
+**Root Cause:** The original error was not an OTA failure at all. The Stra2us telemetry client was failing to reach its server (`192.168.153.x`) from a device on a different subnet (`192.168.69.x`) — a simple network routing issue. The "Failed to create socket" message was logged at the same severity level as OTA errors and was misread as evidence that OTA was broken.
+
+The actual OTA failure, when it was later tested directly, was a **protocol version mismatch**: the device had been originally flashed with OTA v1 firmware, but ESPHome 2025.5.2 defaults to the newer OTA v2 handshake. The fix was a single line: `version: 1` in the `ota:` config block to sync protocols (followed by a migration to v2 via one intentional USB flash).
+
+**Resolution:**
+- Added `version: 1` to OTA config to restore the handshake.
+- Performed one USB flash to migrate to OTA v2 (the modern default).
+- Verified OTA v2 works wirelessly. USB cable is no longer required for updates.
+
+**Lesson:** See **Rule #1** above. Verify OTA failure with a direct flash attempt before touching anything structural. A connection error in an unrelated subsystem is not evidence that OTA is broken.
