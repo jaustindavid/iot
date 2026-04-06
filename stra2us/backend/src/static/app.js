@@ -81,6 +81,7 @@ async function fetchStats() {
             <div><strong>${q.topic}</strong> (Msg Count: ${q.count})</div>
             <div>
                 <button class="btn-sm" onclick="peekData('q', '${q.topic}')">Peek</button>
+                <button class="btn-sm" onclick="openMonitor('${q.topic}')">Monitor</button>
                 <button class="btn-sm danger" onclick="deleteData('q', '${q.topic}')">Delete</button>
             </div>
         </div>
@@ -305,6 +306,21 @@ async function monitorPoll() {
     while (feed.children.length > 200) {
         feed.removeChild(feed.lastChild);
     }
+}
+
+function openMonitor(topic) {
+    // Navigate to the monitor view
+    document.querySelectorAll('.nav-links a').forEach(a => a.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active-view'));
+    const monitorLink = document.querySelector('.nav-links a[data-target="monitor"]');
+    if (monitorLink) monitorLink.classList.add('active');
+    document.getElementById('monitor').classList.add('active-view');
+
+    // Stop any existing session, pre-fill topic, start fresh
+    if (monitorActive) monitorStop();
+    monitorClear();
+    document.getElementById('monitorTopic').value = topic;
+    monitorStart();
 }
 
 function monitorStart() {
