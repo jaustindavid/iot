@@ -1,11 +1,11 @@
 # Coati Clock: High-Level Design Overview
 
 ## Abstract
-The **Coati Clock** is a custom firmware implementation for an ESP32-C3 microcontroller driving a 16x8 WS2812B LED matrix. It abandons traditional stateless digital clock rendering in favor of a localized, multi-agent game simulation. Instead of "blinking" to a new time layout each minute, autonomous AI agents (the "Coatis") physically carry and assemble the required pixels on the board, piece by piece, adhering to strict spatial constraints and pathfinding rules.
+The **Coati Clock** is a custom firmware implementation for an ESP32-C3 microcontroller driving a 32x8 WS2812B LED matrix. It abandons traditional stateless digital clock rendering in favor of a localized, multi-agent game simulation. Instead of "blinking" to a new time layout each minute, autonomous AI agents (the "Coatis") physically carry and assemble the required pixels on the board, piece by piece, adhering to strict spatial constraints and pathfinding rules.
 
 ## Hardware Footprint
 - **Controller:** Seeed Studio XIAO ESP32-C3
-- **Display:** 256 WS2812B LEDs, physically wired as a snaking 16x8 matrix.
+- **Display:** 256 WS2812B LEDs, physically wired as a snaking 32x8 matrix.
 - **Virtual Layout:** The physical matrix is remapped through a custom XYZ pixel mapper to function as a seamless 32x8 logical display.
 
 ## Ecosystem Architecture

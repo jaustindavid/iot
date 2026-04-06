@@ -558,35 +558,57 @@ public:
             }
         }
 
+        // --- "Floor is Lava" Escape ---
+        // When an idle non-carrying agent sits on a target_board cell, it risks
+        // being physically surrounded as surrounding clock pixels are placed. The
+        // agent cannot place a pixel itself (needs to carry one) and cannot pass
+        // through placed pixels, so it will become permanently trapped.
+        // Escape immediately to the nearest cell that is neither placed nor targeted.
+        if (a.current_path.empty() && a.claimed_target.x == -1 && !a.carrying &&
+            target_board[a.pos.x][a.pos.y] && !path_calculated_this_tick) {
+            std::vector<Point> safe_cells;
+            for (int x = 0; x < 32; x++)
+                for (int y = 0; y < 8; y++)
+                    if (!target_board[x][y] && !current_board[x][y])
+                        safe_cells.push_back({x, y});
+            if (!safe_cells.empty()) {
+                Point closest = find_closest(a.pos, safe_cells);
+                a.current_path = find_path(a.pos, closest, i);
+                path_calculated_this_tick = true;
+            }
+            continue;
+        }
+
         // --- Bored Wandering Logic ---
+        // One step, ~50% chance per trigger interval. Motion blur is handled by
+        // Phase 1's last_pos update, making the single step visually smooth.
         if (a.current_path.empty() && a.claimed_target.x == -1) {
-            // Less than one step per second. Tick is 50ms, so 20 ticks = 1 second.
             if (a.bored_ticks >= 20) {
                 a.bored_ticks = 0;
-                // Move random legal direction
-                std::vector<Point> valid_wander;
-                for (int dx = -1; dx <= 1; dx++) {
-                    for (int dy = -1; dy <= 1; dy++) {
-                        if (dx == 0 && dy == 0) continue;
-                        int nx = a.pos.x + dx;
-                        int ny = a.pos.y + dy;
-                        if (nx >= 0 && nx < 32 && ny >= 0 && ny < 8) {
-                            if (!current_board[nx][ny]) { // Don't step on clock pixels
-                                bool collision = false;
-                                for (size_t j = 0; j < agents.size(); j++) {
-                                    if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) collision = true;
-                                }
-                                if (!collision) {
-                                    valid_wander.push_back({nx, ny});
+                if (std::rand() % 2 == 0) {
+                    // Pick one valid adjacent cell that is neither a placed pixel,
+                    // nor a targeted (soon-to-be-placed) pixel, nor another agent.
+                    std::vector<Point> valid_wander;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dy = -1; dy <= 1; dy++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = a.pos.x + dx;
+                            int ny = a.pos.y + dy;
+                            if (nx >= 0 && nx < 32 && ny >= 0 && ny < 8) {
+                                if (!current_board[nx][ny] && !target_board[nx][ny]) {
+                                    bool collision = false;
+                                    for (size_t j = 0; j < agents.size(); j++) {
+                                        if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny)
+                                            collision = true;
+                                    }
+                                    if (!collision) valid_wander.push_back({nx, ny});
                                 }
                             }
                         }
                     }
-                }
-                
-                if (!valid_wander.empty()) {
-                    int r = std::rand() % valid_wander.size();
-                    a.current_path.push_back(valid_wander[r]);
+                    if (!valid_wander.empty()) {
+                        a.current_path.push_back(valid_wander[std::rand() % valid_wander.size()]);
+                    }
                 }
             }
         }

@@ -1,12 +1,22 @@
-# Engineering & Implementation Notes: Coati Clock
+# Coati Clock — Engineering & Implementation Reference
 
-This document covers the structural choices made while developing the underlying `coati_engine.h` physics engine driving the clock simulation.
+This document describes the architectural decisions, subsystem design, and known failure modes of the Coati Clock firmware. It is intended as a reference for engineers maintaining or extending this system. Sections are written to explain not only *what* was built, but *why* specific choices were made, so future engineers can reason about trade-offs when modifying the system.
 
 ---
 
-## The C++ Physics Engine
+## 1. System Overview
 
-The core of the logic is decoupled from ESPHome's internal node graph. Instead of registering an overriding `Component` with rigid setup/loop lifecycle bindings, the entire engine is instantiated as a static pointer natively inside the isolated display lambda in `bb32.yaml`:
+The Coati Clock is an ESPHome-based firmware for an ESP32-C3 microcontroller driving a 32×8 matrix of addressable WS2812B LEDs. The display shows the current time using a multi-agent simulation: two virtual "coati" sprites move individual illuminated pixels across the matrix to construct and maintain clock digit glyphs. The simulation runs in real time and is continuously re-animated as the displayed time changes.
+
+The device synchronizes to wall-clock time via SNTP but displays a "wobbly" virtual time — a configurable offset from real time, with a drift-correction algorithm that keeps the virtual clock self-consistent.
+
+---
+
+## 2. Architecture
+
+### 2.1 Physics Engine Isolation
+
+The core simulation logic resides entirely in `coati_engine.h` and is decoupled from ESPHome's internal component graph. Rather than subclassing `esphome::Component` (which would impose rigid setup/loop lifecycle bindings and trigger template instantiation conflicts in `GlobalsComponent` when marshalling complex custom structs), the engine is instantiated once as a heap-allocated object via a raw pointer inside the display lambda:
 
 ```cpp
 static CoatiEngine* engine = nullptr;
@@ -16,200 +26,208 @@ if (engine == nullptr) {
 }
 ```
 
-This isolates the engine context, prevents ESPHome template instantiation mismatch errors during `gcc` compilation (specifically relating to the `GlobalsComponent` trying to marshal complex custom structs), and gives the display lambda exclusive polling access via `engine->tick()`.
+The pointer is shared to the `interval:` component via an ESPHome `global:` variable typed as `void*`. This indirection allows the asynchronous font rasterization task to access the same engine instance without introducing a statically initialized global object, which can cause initialization order problems in embedded build systems.
 
-The engine pointer is shared to the `interval:` component via the `engine_ptr` global (a `void*` cast), allowing asynchronous font rasterization outside the render lambda.
+### 2.2 The DummyDisplay Font Intercept
 
----
+The pathfinding system requires knowledge of the exact pixel coordinates of each clock digit glyph. Extracting rasterized pixel data directly from an ESPHome `font::Font` object at runtime is impractical without access to the underlying BDF parser internals.
 
-## The `DummyDisplay` Intercept
+The solution is a mock display class, `DummyDisplay`, which subclasses `esphome::display::DisplayBuffer`. It satisfies the virtual interface with stub implementations of `get_width_internal()` and `get_height_internal()`, making ESPHome's font rendering pipeline treat it as a valid output device. The `draw_absolute_pixel_internal()` method is overridden to write pixel coordinates into a local boolean array instead of driving hardware.
 
-**Challenge:** To calculate pathfinding routes, the engine needs to know the exact grid coordinates of the incoming time text string. However, extracting rasterized pixels from an existing `font::Font` file programmatically is exceptionally difficult in barebones C++ without heavyweight graphics libraries.
+When `prepare_target()` is called, it invokes `dummy->strftime()` with the target time string. The resulting pixel map is captured in `pending_target[][]`.
 
-**Solution:** `coati_engine.h` defines a custom `DummyDisplay` class that inherits from `esphome::display::DisplayBuffer`.
-- By mocking `get_width_internal` and `get_height_internal`, we trick ESPHome into treating this object as a valid screen.
-- When `engine->prepare_target()` is called, it triggers `dummy->strftime(...)`.
-- We override `draw_absolute_pixel_internal()` to intercept every pixel drawn by the BDF font rendering engine, saving them as `true` inside a local boolean array instead of driving hardware pins.
-- The result is copied into `pending_target[][]` (a staging buffer), which is then atomically swapped into `target_board[][]` by `apply_pending_target()` inside the render lambda context. This prevents torn reads during the swap.
+### 2.3 Double-Buffered Target Rendering
 
----
+Font rasterization runs in the FreeRTOS timer task context (used by the ESPHome `interval:` component), which executes at higher priority than the main task. The display render lambda runs in the main task context. These two contexts share access to the engine's `target_board[][]` state.
 
-## Double-Buffered Target Rendering
+To prevent torn reads, target updates use a double-buffer pattern:
 
-Font rasterization runs in the `interval:` timer context (a FreeRTOS timer task at higher priority than the main loop). It writes to `pending_target[][]` and sets `target_pending = true`. The render lambda, running in the main task context, calls `apply_pending_target()` at the top of each frame, which atomically swaps in the new target and resets agent state (paths, wait/bored ticks). This prevents race conditions between font rasterization and the display pipeline.
+1. The interval task writes the newly rasterized glyph layout to `pending_target[][]` and sets the `volatile bool target_pending` flag.
+2. At the top of each render frame, the render lambda calls `apply_pending_target()`, which atomically swaps `pending_target` into `target_board` and resets agent state (clearing paths, wait counters, and bored counters).
 
----
+This ensures the render loop always sees a consistent, non-torn board state. Agent resets occur within the main task, preventing race conditions between target updates and in-flight pathfinding operations.
 
-## Wobbly Time
+### 2.4 Wobbly Time
 
-The device stays synced to real SNTP time but tracks and displays a "wobbly" virtual time advanced 2–5 minutes ahead (range configurable in `bb32.yaml`). The algorithm:
+The device synchronizes to real SNTP time but tracks and displays a virtual time offset by a configurable number of minutes ahead of wall-clock time. The algorithm operates as follows:
 
-- At startup (or when the current wobbly offset drifts outside the configured range), a new random target offset is chosen uniformly in `[wobble_min_sec, wobble_max_sec]`.
-- If wobbly time is **behind** its target: virtual seconds tick 30% faster than wall-clock seconds.
-- If wobbly time is **ahead** of its target: virtual seconds tick 30% slower.
-- The 30% rate is configurable (`wobble_catch_up_rate`).
+- At initialization (and whenever the accumulated offset drifts outside the configured range), a new target offset is sampled uniformly from the interval `[wobble_min_sec, wobble_max_sec]` (configured in `bb32.yaml`).
+- If the current virtual time is **behind** its target offset: each virtual second elapses at `1 + wobble_catch_up_rate` times the real rate (default: 1.30×).
+- If the current virtual time is **ahead** of its target offset: each virtual second elapses at `1 - wobble_catch_up_rate` times the real rate (default: 0.70×).
 
-This allows the clock to display a plausible but slightly drifted time, giving the coatis slack to catch up or slow down without jarring jumps.
+The result is a clock that displays a plausible but drifted time, self-correcting without visible jumps. Because the displayed time is always in the future relative to real time, visual latency introduced by pathfinding delays is perceptually acceptable.
 
 ---
 
-## Multi-Agent Decision Tree
+## 3. Multi-Agent Simulation
 
-The `CoatiEngine` holds an active vector of `CoatiAgent` structs. Decision execution during `tick()` is split into logical phases:
+### 3.1 Board State Model
 
-### 1. Goal Claiming (Economy)
-Before any pathfinding routes are drawn, the engine extracts the delta between `current_board` and `target_board` into `extras` (pixels to remove) and `missing` (pixels to add). Each agent claims exactly one destination, preventing duplicate work.
+Three parallel arrays define the state of every cell in the 32×8 grid:
 
-### 2. Budgeted A* Pathfinding
-The `find_path()` function implements time-budgeted A* with a configurable node expansion limit (`max_nodes = 40` by default):
+| Array | Type | Meaning |
+|---|---|---|
+| `current_board[32][8]` | `bool` | Whether a pixel is physically placed and lit |
+| `target_board[32][8]` | `bool` | Whether a pixel should be present in the current glyph |
+| `fade_board[32][8]` | `float` | Interpolated brightness [0.0, 1.0] for biological fade-in |
 
-- If the destination is reached within the budget, the full optimal path is returned.
-- If the budget is exhausted before reaching the destination, the path is returned to the **best frontier node** — the settled cell geometrically closest to the destination. This is the "downhill" fallback.
-- The agent walks the partial path, then re-plans on the next tick from its new (closer) position.
-- This produces naturally organic, meandering movement on long journeys and keeps per-tick CPU time bounded.
+The delta between `current_board` and `target_board` produces two task lists per tick:
+- **extras**: positions in `current_board` but not in `target_board` (pixels to remove)
+- **missing**: positions in `target_board` but not in `current_board` (pixels to add)
 
-Steps are costed: orthogonal = 1.0, diagonal = 1.414. Other agents apply a soft penalty (+20) rather than a hard block, preventing permanent path failures in narrow corridors.
+### 3.2 Agent Decision Phases
 
-### 3. Placement Guard (Claimed Target Only)
-Agents carrying a pixel may only **place** it at `a.pos == a.claimed_target`. They do NOT place at intermediate missing positions they happen to step through en route. This is critical with budgeted partial paths: the intermediate waypoint endpoint can coincidentally land on another clock pixel that needs filling, causing a misplaced pixel. See **Issue #4** in the issues log.
+Each call to `tick()` processes agents in two sequential phases.
 
-### 4. Deadlock Recovery & Escape
-In narrow passages, two agents can collide head-on:
-- Wait timeout is asymmetric by agent index (`3 + i * 2` ticks), so they don't break standoffs synchronously.
-- On timeout, the agent wipes its path and takes a single valid retreat step into an adjacent clear space.
+**Phase 1 — Movement:** Agents with a non-empty `current_path` take their next step. A collision system detects head-on conflicts and applies asymmetric timeout logic (patience = `3 + agent_index * 2` ticks) so agents do not break deadlocks synchronously. On timeout, the blocked agent executes a one-tile retreat into the nearest unoccupied adjacent cell.
 
-### 5. Endpoint Asymmetry
-Agents use `dumpster[i%2]` and `pool[i%2]` as their respective fetch/drop endpoints. This ensures each agent has its own dedicated slot on each end, preventing deadlocks at the pickup/dropoff points.
+**Phase 2 — Decision:** Agents with an empty path and no pending wait evaluate their situation and issue new orders:
+- A **carrying** agent heads toward its claimed missing position, the pool (disposal), or waits for new work.
+- A **non-carrying** agent heads toward an unclaimed extra (to pick up), the dumpster (to fetch from supply), or enters idle wander.
 
-### 6. Hardware-Safe Contexts (Interrupt Isolation)
-- **Pathing Stagger:** A `path_calculated_this_tick` flag limits `find_path()` to ONE agent per 50ms tick, flattening the CPU spike.
-- **Font Rasterization:** The BDF text rasterizer runs asynchronously via the `interval:` component, not inside the render lambda.
+To prevent duplicate work, each agent filters the global `extras` and `missing` lists against the `claimed_target` values of all other agents before selecting a destination.
 
-### 7. Idle Throttling
-When no work remains, agents use a `bored_ticks` counter and only take a random step every 20 ticks (~1,000ms), producing a docile crawling behavior instead of jittery noise.
+### 3.3 Budgeted A\* Pathfinding
+
+The `find_path()` function implements A\* with a configurable node-expansion budget (`max_nodes`, default 40). The function maintains three pre-allocated member arrays (`pf_visited`, `pf_parent`, `pf_cost`) and a pre-reserved priority queue backing store (`pf_q_storage`, capacity 448 entries). These are allocated once at construction and reused on every call, avoiding heap allocation during normal operation.
+
+**Partial path behavior:** If the destination is not reached within the node budget, the function returns the path to the **best frontier node** — the settled cell with the smallest Euclidean distance to the destination. The agent walks this partial path and re-plans on the next tick from its new (closer) position. Each successive re-plan covers a shorter distance, completing within budget. This iterative approach produces naturally meandering movement on long journeys, as each re-plan reflects the current obstacle state (other agents may have moved).
+
+**Soft agent avoidance:** Agent positions are treated as traversable with a +20 cost penalty rather than hard obstacles. This prevents permanent path-planning failure in narrow corridors where a hard block would leave no valid route.
+
+**Path stagger:** A per-tick boolean flag (`path_calculated_this_tick`) limits pathfinding to one agent per tick, distributing the computational cost across frames and preventing CPU spikes at the moment of a minute rollover (when all agent paths are simultaneously invalidated).
+
+### 3.4 Placement Guard
+
+Agents carrying a pixel may only place it when `a.pos == a.claimed_target`. This guard is critical with budgeted partial paths: the intermediate waypoint that terminates a partial path may coincidentally overlap with another position in the `missing` set. Without the guard, the agent would prematurely place its pixel at the wrong position. See **Issue #4** in the issues log.
+
+### 3.5 Endpoint Asymmetry
+
+Each agent uses `dumpster[i % 2]` and `pool[i % 2]` as its assigned fetch and disposal endpoints respectively. This prevents both agents from simultaneously targeting the same single-cell endpoint, which would cause a deadlock at the node with no valid resolution.
+
+### 3.6 Biological Fade-In
+
+When a pixel is placed, `fade_board[x][y]` is reset to 0.0 and advances by approximately 0.032 per render frame (reaching 1.0 in approximately 500ms at 33ms frame intervals). The fade advancement loop is gated on `current_board[x][y] == true`, ensuring that unoccupied positions never accumulate stale brightness values regardless of prior state.
+
+### 3.7 Idle Throttling
+
+When no extras or missing positions exist, agents enter idle mode. Rather than stepping every tick, agents accumulate a `bored_ticks` counter and take a single random step only when `bored_ticks >= 20` (approximately one step per 1,000ms). This produces docile, slow wandering behavior.
 
 ---
 
-## Render Pipeline
+## 4. Render Pipeline
 
 ```
-interval (1s)        render lambda (33ms)
-─────────────        ────────────────────────────────────────────────
-prepare_target()  →  apply_pending_target()   (atomic target swap)
-  write pending_      tick()                   (physics: 50ms budget)
-  target[][]          fade_board advancement   (active pixels only)
-                      memcpy snapshot          (current_board, fade_board)
-                      draw board pixels        (green, fade-weighted)
-                      draw agent sprites       (motion-interpolated)
+interval: (1s)            display lambda (33ms)
+──────────────────        ─────────────────────────────────────────────
+prepare_target()      →   apply_pending_target()   atomic target swap
+  rasterize glyph          tick()                  physics step (50ms gate)
+  write pending_target      fade_board advance      active pixels only
+  set target_pending        memcpy snapshot         board + fade arrays
+                            draw board pixels        green, fade-weighted
+                            draw agent sprites       motion-interpolated
 ```
 
-The render lambda runs at 33ms (≈30fps). Physics ticks fire every 50ms from within the lambda, giving ~1.5 render frames per physics step. Agent positions between ticks are motion-interpolated using `blend = elapsed / 50ms`.
-
-Pixel fade: when a pixel is placed, `fade_board[x][y]` is reset to 0.0 and advances by ~0.032 per frame (reaching 1.0 in ~500ms). The fade loop only advances pixels where `current_board[x][y]` is true, preventing stale accumulation on dark positions.
-
----
----
-
-# Known Issues & Engineering Log
-
-> This section documents bugs, root causes, and resolutions encountered during development. Future engineers: these **will** bite you again as complexity grows.
+The render lambda executes at 33ms intervals (≈30 fps). The physics tick fires from within the render lambda whenever at least 50ms have elapsed since the last tick, giving approximately 1.5 render frames per physics step. Agent positions are motion-interpolated between ticks using `blend = elapsed_ms / 50.0`.
 
 ---
 
-## Issue #1 — Stack Overflow Corrupting `current_board` (PRIMARY SPARKLE SOURCE)
+## 5. Known Issues & Engineering Log
 
-**Symptom:** Intermittent "sparkle" — random green pixels briefly illuminating near the drawn clock digits. More frequent during active coati movement. At startup, sparkle density tracked with how many clock pixels had been placed.
+> This section documents bugs discovered during development, their root causes, and their resolutions. Engineers extending this system should review these entries before modifying pathfinding, rendering, or memory layout, as the underlying constraints that produced each issue remain present.
 
-**Root Cause:** `find_path()` allocated its scratch arrays on the call stack:
+---
+
+### Issue #1 — Stack Overflow Corrupting `current_board` *(Primary Sparkle Source)*
+
+**Symptom:** Intermittent "sparkle" — random green pixels briefly illuminating near the drawn clock digits. Frequency correlated with active agent movement. At startup, sparkle density tracked proportionally with how many clock pixels had been placed.
+
+**Root Cause:** `find_path()` allocated its scratch arrays as call-stack locals:
+
 ```cpp
 bool visited[32][8];    // 256 bytes
-Point parent[32][8];    // 2048 bytes  ← Point is 8 bytes
+Point parent[32][8];    // 2048 bytes  (Point = two int32 fields)
 float cost[32][8];      // 1024 bytes
-// Total: ~3.3KB on stack per find_path() call
+// Total: ~3.3 KB of stack per find_path() call
 ```
-The ESP32-C3's main task stack (default ~8KB in ESPHome) was being overflowed when the render lambda's frame + `tick()` frame + `find_path()` frame all accumulated. On RISC-V, the stack grows downward and can corrupt adjacent heap memory. The `CoatiEngine` object is heap-allocated (`new CoatiEngine()`), so a stack underflow corrupted `current_board[][]` — causing random positions to flip `true` and briefly illuminate.
 
-**Resolution:** Moved `visited`, `parent`, and `cost` from stack-local to pre-allocated member variables of `CoatiEngine`:
-```cpp
-bool pf_visited[32][8];
-Point pf_parent[32][8];
-float pf_cost[32][8];
-```
-These live in the heap with the rest of the engine object. Stack usage per `find_path()` call dropped by ~3.3KB. Sparkle frequency dropped dramatically.
+The cumulative call-stack depth of the render lambda → `tick()` → `find_path()` chain exceeded the ESP32-C3 main task stack (ESPHome default: approximately 8 KB). On RISC-V, the stack grows downward into the heap. The `CoatiEngine` object is heap-allocated (`new CoatiEngine()`), and the stack underflow corrupted its `current_board[][]` member array — causing arbitrary positions to read as `true` and briefly illuminate.
 
-**Lesson:** On embedded targets with small default task stacks, any function allocating >1KB of stack locals inside a deep call chain is high risk. Always budget the complete call-stack depth: render_lambda + tick() + find_path() + priority_queue operations.
+**Resolution:** The three scratch arrays were moved from stack-local scope to pre-allocated member variables of `CoatiEngine` (`pf_visited`, `pf_parent`, `pf_cost`). These reside in the heap alongside the rest of the engine object. Per-call stack usage of `find_path()` dropped by approximately 3.3 KB. Sparkle frequency dropped dramatically.
+
+**Standing Constraint:** The main task stack remains a finite shared resource. Any function introduced into the render lambda → tick() call chain with significant stack allocation should be profiled. The current headroom is approximately 3–4 KB. Recursive functions, deep STL iterator chains, and large VLAs are high-risk additions.
 
 ---
 
-## Issue #2 — Priority Queue Heap Churn
+### Issue #2 — Priority Queue Heap Churn
 
-**Symptom:** Residual sparkle after Issue #1 fix. Correlated with active coati pathfinding.
+**Symptom:** Residual sparkle following the Issue #1 fix. Frequency still correlated with active pathfinding.
 
-**Root Cause:** `std::priority_queue` backed by `std::vector` performs heap reallocations as it grows. Each `find_path()` call created a new queue object at capacity 0, growing via repeated `new`/`copy`/`delete` cycles as nodes were pushed. On embedded targets, frequent small heap allocations cause fragmentation and occasionally trigger reallocation at inconvenient moments relative to the WS2812B RMT DMA window.
+**Root Cause:** `std::priority_queue`, backed by `std::vector`, performs heap reallocations as it grows. Each call to `find_path()` constructed a new queue object at zero capacity, which then grew via repeated allocate/copy/free cycles as nodes were pushed. On embedded targets with limited heap, frequent small allocations cause fragmentation and occasionally interleave with time-critical subsystems (specifically, ESPHome's RMT DMA callback infrastructure for WS2812B output).
 
-**Resolution:** Pre-reserve a `pf_q_storage` vector as a member variable of `CoatiEngine` and pass it as the backing container to the priority queue:
-```cpp
-pf_q_storage.reserve(448);  // 40 nodes * 8 neighbors + headroom
-// In find_path():
-pf_q_storage.clear();  // clears without freeing capacity
-std::priority_queue<..., CompareNode> q(CompareNode{}, pf_q_storage);
-```
-After first warm-up, no further heap reallocation occurs.
+**Resolution:** A `std::vector<std::pair<float, Point>>` member variable (`pf_q_storage`) is reserved to 448 entries at construction time and passed as the backing container to the priority queue. Before each call to `find_path()`, the vector is cleared with `pf_q_storage.clear()`, which resets its size to zero without releasing capacity. After the initial warm-up call, no further heap reallocation occurs during normal operation.
 
-**Lesson:** `std::priority_queue` (and any STL container) will allocate by default. On embedded, pre-reserve or use static storage. `clear()` on a vector preserves capacity; the priority_queue will reuse it.
+**Standing Constraint:** The 448-entry reservation is sized for a node budget of 40 (`max_nodes * 8 neighbors + headroom`). If `max_nodes` is significantly increased, `pf_q_storage.reserve()` in the constructor should be updated proportionally.
 
 ---
 
-## Issue #3 — Attempted O(N²) Dijkstra Replacement
+### Issue #3 — O(N²) Dijkstra Replacement Regression
 
-**Symptom:** Replacing A* with a simpler allocation-free O(N²) Dijkstra (linear min-scan instead of priority queue) caused sparkle to **return** at original intensity.
+**Symptom:** An attempt to replace A\* with a simpler, allocation-free O(N²) Dijkstra implementation (linear minimum scan over `pf_cost[][]` instead of a priority queue) caused sparkle to return at intensity comparable to the pre-fix baseline.
 
-**Root Cause:** Not fully diagnosed. The O(N²) scan (256 outer iterations × 256 inner cell reads) was expected to complete in < 1ms via early-exit when the destination was found. However, in practice the sparkle returned as severely as before the Issue #1 fix. Suspected causes: (a) pathological worst-case inputs hitting full O(N²) and displacing RMT DMA callbacks, or (b) a subtle interaction between the linear scan's memory access pattern and cache behavior that we weren't able to isolate. The reversion to priority_queue A* immediately restored the near-zero-sparkle behavior.
+**Root Cause:** Not definitively isolated. The O(N²) minimum scan was expected to complete in under 1ms per path via early exit when the destination was settled. However, the regression was immediate and severe. The leading hypotheses are: (a) in pathological cases (long paths through dense glyph obstacles), the full 256-iteration worst case was reached, producing CPU execution bursts that displaced FreeRTOS timer callbacks and/or RMT DMA service; or (b) the linear scan's sequential memory access pattern over a 256-element pf_cost array produced cache pressure that interacted poorly with the addressable LED DMA buffer at a critical timing boundary. The exact mechanism was not confirmed before the decision was made to revert.
 
-**Resolution:** Reverted to A* with priority_queue. Kept all the memory-layout improvements from Issue #1 and #2.
+**Resolution:** The O(N²) Dijkstra was abandoned. The A\* implementation with priority queue and pre-reserved backing store (see Issue #2) was restored. All memory-layout improvements from Issue #1 were retained.
 
-**Lesson:** On a single-core microcontroller, algorithm complexity matters less than execution time predictability and memory access locality. An "obviously simpler" algorithm can introduce unexpected timing problems if it changes allocation patterns, cache behavior, or interrupt-responsiveness of the main loop.
+**Lesson:** On a single-core microcontroller, algorithmic simplicity does not guarantee timing predictability. A change that eliminates dynamic allocation may introduce different timing pathologies through execution duration, memory access patterns, or interrupt latency. Any proposed replacement to the pathfinding core should be validated against a deployed device, not benchmarked in isolation.
 
 ---
 
-## Issue #4 — Budgeted Partial Paths Cause Misplaced Pixels ("Slow Sparkle")
+### Issue #4 — Budgeted Partial Paths Cause Misplaced Pixels *(Slow Sparkle)*
 
-**Symptom:** After implementing time-budgeted A* (stops after 40 node expansions, returns partial path to best frontier), a new artifact appeared: several LEDs lit up near the clock digits and stayed lit for multiple seconds before fading out. Distinctly different from the fast single-frame sparkle of Issues #1/#2.
+**Symptom:** Following the introduction of time-budgeted A\* with best-frontier fallback, a new artifact was observed: clusters of LEDs near the clock digits illuminated gradually and remained lit for several seconds before fading out. This "slow sparkle" was visually distinct from the fast single-frame artifacts of Issues #1 and #2.
 
-**Root Cause:** The budgeted A* returns a partial path whose endpoint is the geometrically closest settled node to the destination. This intermediate waypoint can **coincidentally be another clock pixel** that also happens to need placing (i.e., it's in the `missing` set).
+**Root Cause:** The budgeted A\* returns a partial path whose terminal node is the geometrically closest settled node to the destination — an intermediate waypoint, not the intended clock pixel. This intermediate waypoint may coincidentally occupy a position that is also present in the `missing` set (i.e., another clock pixel that has not yet been placed by any agent).
 
-The original placement guard was:
+The original placement condition was:
+
 ```cpp
 if (standing_on_missing && !current_board[a.pos.x][a.pos.y]) {
-    // place pixel HERE
+    // place pixel at a.pos
+}
 ```
 
-`standing_on_missing` is `true` for **any** missing position, not just the agent's claimed target. So an agent carrying a pixel, traveling toward missing position A via partial path, would stop at intermediate missing position B, place its pixel there, and continue without a pixel. Position B would then glow with the biological fade-in for several seconds until another agent picked it up as an extra.
+`standing_on_missing` evaluates to `true` for **any** missing position, not exclusively the agent's assigned target. A carrying agent would therefore place its pixel at a random intermediate missing position, producing a spurious illuminated pixel. This pixel would remain until a subsequent tick identified it as an `extra` and dispatched an agent to remove it — a process that could take several seconds depending on agent workload.
 
-**Resolution:** Added explicit claimed-target guard to placement:
+**Resolution:** A claimed-target guard was added to the placement condition:
+
 ```cpp
 bool at_claimed_target = (a.claimed_target.x != -1 && a.pos == a.claimed_target);
 if (standing_on_missing && !current_board[a.pos.x][a.pos.y] && at_claimed_target) {
+    // place pixel at a.pos
+}
 ```
 
-Agents now only place at their exact claimed destination. Passing through other missing positions triggers a re-plan, not a premature placement.
+Agents may only place at their exact claimed destination. An agent standing at any other missing position falls through to the re-plan path and continues toward its actual target.
 
-**Lesson:** Any change to **how agents move** (partial paths, alternate routing, A* tuning) requires re-auditing all the **action trigger conditions** that assume agents arrive at positions in predictable ways. The claimed_target guard should have been in place from the start — it's the invariant that makes the economy model correct.
+**Standing Constraint:** The claimed-target invariant must be preserved by any future modification to agent movement or path planning. Any mechanism that causes an agent to arrive at a position other than its `claimed_target` before the path is exhausted — including priority overrides, emergency reroutes, or inter-agent handoff schemes — must account for this placement guard. Opportunistic **pickup** of extras (which has no target-check guard) is intentional and correct; only *placement* requires the strict match.
 
 ---
 
-## Timing & Resource Budget Reference
+## 6. Timing & Resource Budget Reference
 
 | Resource | Value | Notes |
 |---|---|---|
-| ESP32-C3 CPU | 160 MHz | Single core RISC-V |
-| Main task stack | ~8KB | ESPHome default; deep call chains risky |
-| WS2812B data time | ~7.7ms | 256 LEDs × 24 bits × 1.25µs/bit |
-| Render interval | 33ms | ~30fps |
-| Physics tick | 50ms | Called from within render lambda |
-| A* node budget | 40 nodes | ~50µs typical, ~400µs worst-case |
-| pf_q_storage | 448 slots × 12B = ~5.4KB heap | Pre-reserved; no reallocation after warmup |
-| pf_visited/parent/cost | 3.3KB heap (member vars) | Was stack — caused Issue #1 |
-| board_snap / fade_snap | 1.3KB stack | In render lambda — acceptable |
-| Fade-in rate | ~0.032/frame | 0→1 in ~500ms at 33ms frame |
-| Bored wander rate | 1 step / 1000ms | 20 bored_ticks × 50ms/tick |
+| Processor | ESP32-C3, 160 MHz | Single-core RISC-V RV32IMC |
+| Main task stack | ~8 KB | ESPHome default; see Issue #1 |
+| WS2812B frame time | ~7.7 ms | 256 LEDs × 24 bits × 1.25 µs/bit |
+| Render interval | 33 ms (≈30 fps) | `update_interval` in `bb32.yaml` |
+| Physics tick gate | 50 ms | Evaluated per render frame |
+| A\* node budget | 40 nodes | `max_nodes` in `find_path()` |
+| `pf_q_storage` | 448 slots × 12 B ≈ 5.4 KB | Heap; pre-reserved at construction |
+| `pf_visited/parent/cost` | 3.3 KB | Heap (member vars); see Issue #1 |
+| `board_snap` / `fade_snap` | 1.3 KB | Stack in render lambda; acceptable |
+| Fade-in rate | ~0.032 / frame | 500 ms to full brightness at 33 ms/frame |
+| Bored wander rate | 1 step / 1,000 ms | 20 `bored_ticks` × 50 ms/tick |
+| Wobbly time range | 120–300 s | Configurable in `bb32.yaml` |
+| Catch-up rate | ±30% | Configurable in `bb32.yaml` |
