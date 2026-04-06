@@ -3,7 +3,7 @@ substitutions:
   stra2us_secret_hex: !secret stra2us_secret_hex
   stra2us_host: !secret stra2us_host
   firmware_host: !secret firmware_host
-  project_version: !env_var ESPHOME_PROJECT_VERSION dev
+  project_version: !env_var ESPHOME_PROJECT_VERSION 0000.00.00.0000
 
 esphome:
   name: bb32
@@ -59,7 +59,13 @@ update:
     id: firmware_update
     name: "bb32 Firmware"
     source: "http://${firmware_host}:8080/bb32_manifest.json"
-    update_interval: 6h
+    update_interval: 300s
+    on_update_available:
+      - logger.log:
+          format: "Pull OTA: newer firmware available (%s), applying..."
+          args: ["x.latest_version.c_str()"]
+      - update.perform:
+          id: firmware_update
 
 time:
   - platform: sntp

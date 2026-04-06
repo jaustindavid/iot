@@ -27,7 +27,8 @@ shift
 FLASH=false
 if [[ "${1:-}" == "--flash" ]]; then FLASH=true; fi
 
-RPI4_HOST="rpi4.local"
+RPI4_HOST="rpi4.local"                       # SSH target for scp/ssh
+FIRMWARE_DNS_HOST="stra2us.austindavid.com"  # DNS name the device uses to fetch binaries
 RPI4_USER="austin"
 RPI4_FIRMWARE_DIR="~/firmware"
 MANIFEST_FILE="${FIRMWARE_NAME}_manifest.json"
@@ -74,7 +75,7 @@ MANIFEST=$(cat <<EOF
     {
       "chipFamily": "ESP32-C3",
       "ota": {
-        "path": "http://$RPI4_HOST:8080/$FIRMWARE_NAME.ota.bin",
+        "path": "http://$FIRMWARE_DNS_HOST:8080/$FIRMWARE_NAME.ota.bin",
         "md5": "$MD5",
         "summary": "Built $VERSION"
       }

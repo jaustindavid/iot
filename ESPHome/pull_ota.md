@@ -29,8 +29,8 @@ rpi4 (192.168.153.78)
        └── bb33.ota.bin
 
 Coati Clock devices
-  └─ bb32 (192.168.69.164) polls bb32_manifest.json every 6h
-  └─ bb33 (next unit)      polls bb33_manifest.json every 6h
+  └─ bb32 (192.168.69.164) polls bb32_manifest.json every 5 min
+  └─ bb33 (next unit)      polls bb33_manifest.json every 5 min
   └─ each: if version > running → downloads its own .ota.bin → self-flashes → reboots
 ```
 
@@ -68,10 +68,10 @@ update:
   - platform: http_request   # manifest poller + version comparator
     name: "bb32 Firmware"
     source: "http://${firmware_host}:8080/bb32_manifest.json"
-    update_interval: 6h      # checks at boot, then every 6h
+    update_interval: 300s    # checks at boot, then every 5 minutes
 ```
 
-`firmware_host` is defined in `secrets.yaml` so the rpi4 IP stays out of version control.
+`firmware_host` is defined in `secrets.yaml` and resolves via real DNS (currently `stra2us.austindavid.com → 192.168.153.78`). A proper DNS name is used rather than a bare IP or mDNS hostname because the ESP32's cross-subnet mDNS resolution is unreliable — standard unicast DNS works from any subnet without additional infrastructure.
 
 ### Manifest format
 
@@ -85,7 +85,7 @@ The manifest is a JSON file read by the device on each update check:
     {
       "chipFamily": "ESP32-C3",
       "ota": {
-        "path": "http://192.168.153.78:8080/bb32.ota.bin",
+        "path": "http://stra2us.austindavid.com:8080/bb32.ota.bin",
         "md5": "a1b2c3d4...",
         "summary": "Built 2026.04.06.1630"
       }
@@ -255,6 +255,6 @@ The 6h polling interval handles the "device wakes up after a long sleep and pull
 
 This requires no new firmware download path — `perform()` triggers the existing `update:` component immediately. The combination of hourly/daily polling (Option 1) and on-demand trigger (Option 2) gives the full Particle-style experience:
 
-- **Sleeping/offline device:** pulls latest on next wake via polling ✅
+- **Sleeping/offline device:** pulls latest within 5 min of next wake via polling ✅
 - **Online device:** operator can push "check now" command via Stra2us ✅
 - **No inbound connections required:** both paths are device-initiated ✅
