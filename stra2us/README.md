@@ -24,21 +24,29 @@ Ensure your host machine explicitly has installed:
 - Redis Server (running on localhost:6379 natively)
 
 ### 2. Backend Bootup
-You can start the server locally with extreme ease.
+You can start the server locally or for external access (e.g. on a Raspberry Pi).
 ```bash
 cd backend
+# For local access
 ./start.sh
+# For external access (RPi)
+./start.sh --host 0.0.0.0
 ```
-*Note: This automatically initializes a virtual environment, installs dependencies, and boots `uvicorn` on port 8000.*
+*Note: The script automatically verifies that Redis is running. If it's not, it will provide instructions on how to start it.*
 
 ### 3. Dashboard Admin User
-To view the web-monitoring dashboard at `http://localhost:8000/admin`, you must initialize an administrative login. 
+To view the web-monitoring dashboard at `http://<your-ip>:8000/admin`, you must initialize an administrative login. 
 ```bash
 cd backend
 source venv/bin/activate
-python create_admin.py super_username super_password
+python create_admin.py admin_user your_password
 ```
-*This command seamlessly generates a secure HMAC encrypted `admin.htpasswd` file, mapping to securely signed session cookies upon frontend login.*
+*This command generates a secure HMAC encrypted `admin.htpasswd` file, mapping to securely signed session cookies upon frontend login.*
+
+### 4. Remote Deployment Tips (Raspberry Pi)
+- **Redis Service**: Ensure Redis is enabled and starting on boot: `sudo systemctl enable redis-server`.
+- **Firewall**: If using `ufw`, allow port 8000: `sudo ufw allow 8000`.
+- **Backgrounding**: Use `nohup ./start.sh --host 0.0.0.0 &` or a `systemd` service to keep it running.
 
 ## Using the CLI Toolkit
 You can test the queue manually without utilizing C++ hardware by invoking the included helper client utility script!

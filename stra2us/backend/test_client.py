@@ -57,15 +57,21 @@ def make_request(method, path, body_data, client_id, secret, base_url, params=No
         "Content-Type": "application/x-msgpack"
     }
     
-    url = f"{base_url}{uri}"
+    # Ensure URL doesn't have trailing slash if path has leading one
+    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=10.0) as client:
             if method == "POST":
                 return client.post(url, params=params, content=body, headers=headers)
             elif method == "GET":
                 return client.get(url, params=params, headers=headers)
+    except httpx.ConnectError:
+        logging.error(f"FATAL: Could not connect to {base_url}.")
+        if "127.0.0.1" in base_url or "localhost" in base_url:
+            logging.error("If your server is on a Raspberry Pi, use --url http://<RPI_IP>:8000")
+        sys.exit(1)
     except httpx.RequestError as e:
-        logging.error(f"Connection failed: {e}")
+        logging.error(f"Request failed: {e}")
         sys.exit(1)
 
 def try_parse_data(text):

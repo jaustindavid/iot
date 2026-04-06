@@ -35,9 +35,42 @@ function formatTime(unixTime) {
     return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
 }
 
+// 0. Redis Health Check
+async function checkRedisStatus() {
+    try {
+        const data = await fetchAPI('/stats'); // Stats relies on Redis
+        updateStatus(true);
+        return data;
+    } catch (e) {
+        updateStatus(false);
+        return null;
+    }
+}
+
+function updateStatus(isOnline) {
+    const dot = document.querySelector('.status-dot');
+    const text = document.getElementById('redisStatus');
+    if (isOnline) {
+        dot.className = 'status-dot online';
+        text.innerText = 'Connected';
+        text.style.color = 'var(--accent-success)';
+    } else {
+        dot.className = 'status-dot offline';
+        text.innerText = 'Offline';
+        text.style.color = 'var(--accent-danger)';
+    }
+}
+
 // 1. Dashboard / Stats
 async function fetchStats() {
-    const data = await fetchAPI('/stats');
+    const data = await checkRedisStatus();
+    if (!data) {
+        document.getElementById('queueCount').innerText = '--';
+        document.getElementById('kvCount').innerText = '--';
+        document.getElementById('queueList').innerHTML = '<div class="text-muted">Redis is unreachable. Please check the server logs.</div>';
+        document.getElementById('kvList').innerHTML = '<div class="text-muted">Redis is unreachable.</div>';
+        return;
+    }
     
     document.getElementById('queueCount').innerText = data.queues.length;
     document.getElementById('kvCount').innerText = data.kvs.length;
