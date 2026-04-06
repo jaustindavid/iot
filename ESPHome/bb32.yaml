@@ -2,13 +2,19 @@ substitutions:
   stra2us_client_id: !secret stra2us_client_id
   stra2us_secret_hex: !secret stra2us_secret_hex
   stra2us_host: !secret stra2us_host
+  firmware_host: !secret firmware_host
+  project_version: !env_var ESPHOME_PROJECT_VERSION dev
 
 esphome:
   name: bb32
   friendly_name: bb32
+  project:
+    name: coaticlock.bb32
+    version: "${project_version}"
   includes:
     - coati_engine.h
     - IoTClientIDF.h
+    - bb32_idf_includes.h
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -33,6 +39,27 @@ wifi:
     password: "ByIg5i1tSdFp"
 
 captive_portal:
+
+# --- Pull OTA ---
+# Device polls the firmware manifest every 6h and self-updates if a newer
+# version is available.  The manifest is served by a simple HTTP server on
+# rpi4 and updated by the deploy.sh script after each compile.
+http_request:
+  timeout: 30s
+  useragent: esphome/bb32
+
+ota:
+  - platform: http_request
+    id: ota_http
+  - platform: esphome
+    password: "48d462d0fa84e4d6f0d4fc0f3086b2f4"
+
+update:
+  - platform: http_request
+    id: firmware_update
+    name: "bb32 Firmware"
+    source: "http://${firmware_host}:8080/bb32_manifest.json"
+    update_interval: 6h
 
 time:
   - platform: sntp
@@ -129,13 +156,54 @@ interval:
   - interval: 60s
     then:
       - lambda: |-
+          // --- Uptime report ---
+          // Fields: up, heap, heap_lo, rssi, rst, fw
+          // heap_lo = minimum ever free heap (best memory-leak indicator)
+          // rst     = reset reason (PANIC/WDT → crash, POWERON → normal)
+
+          // Uptime
+          uint64_t us   = esp_timer_get_time();
+          uint32_t secs = (uint32_t)(us / 1000000ULL);
+          uint32_t days = secs / 86400; secs %= 86400;
+          uint32_t hrs  = secs / 3600;  secs %= 3600;
+          uint32_t mins = secs / 60;    secs %= 60;
+
+          // Reset reason string
+          const char* rst = "UNK";
+          switch (esp_reset_reason()) {
+            case ESP_RST_POWERON:  rst = "POWERON";  break;
+            case ESP_RST_SW:       rst = "SW";       break;
+            case ESP_RST_PANIC:    rst = "PANIC";    break;
+            case ESP_RST_INT_WDT:  rst = "INT_WDT";  break;
+            case ESP_RST_TASK_WDT: rst = "TASK_WDT"; break;
+            case ESP_RST_WDT:      rst = "WDT";      break;
+            case ESP_RST_BROWNOUT: rst = "BROWNOUT"; break;
+            case ESP_RST_DEEPSLEEP:rst = "SLEEP";    break;
+            default:               rst = "OTHER";    break;
+          }
+
+          // WiFi RSSI
+          wifi_ap_record_t ap_info;
+          int8_t rssi = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ? ap_info.rssi : 0;
+
+          // Build report string
+          char report[160];
+          snprintf(report, sizeof(report),
+            "up=%ud%uh%um heap=%lu heap_lo=%lu rssi=%d rst=%s fw=" ESPHOME_PROJECT_VERSION,
+            days, hrs, mins,
+            (unsigned long)esp_get_free_heap_size(),
+            (unsigned long)esp_get_minimum_free_heap_size(),
+            (int)rssi,
+            rst
+          );
+
           stra2us_publish(
             id(stra2us_host).c_str(),
             id(stra2us_port),
             id(stra2us_client_id).c_str(),
             id(stra2us_secret_hex).c_str(),
             "coaticlock",
-            "heartbeat"
+            report
           );
 
 light:
@@ -264,11 +332,7 @@ display:
         }
       }
 
-# Ensure these are present for OTA and Logs to work
-ota:
-  - platform: esphome
-    password: "48d462d0fa84e4d6f0d4fc0f3086b2f4"
-
+# Ensure logger is present
 logger:
   level: INFO
     
