@@ -275,8 +275,9 @@ async function monitorPoll() {
     const feed = document.getElementById('monitorFeed');
     let addedAny = false;
 
-    // messages arrive newest-first from the server
-    for (const msg of messages) {
+    // messages arrive newest-first from XREVRANGE; reverse so we prepend
+    // oldest-first, ending with the newest entry at the top of the feed.
+    for (const msg of [...messages].reverse()) {
         if (monitorSeenIds.has(msg.id)) continue;
         monitorSeenIds.add(msg.id);
         addedAny = true;
