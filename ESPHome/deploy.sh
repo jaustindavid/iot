@@ -10,6 +10,7 @@
 #
 # Prerequisites on rpi4:
 #   mkdir -p ~/firmware
+#   cd ~/firmware
 #   python3 -m http.server 8080 --bind 192.168.153.78   # run once, or as a service
 
 set -euo pipefail

@@ -156,7 +156,7 @@ The device name argument selects which `<name>.yaml` to compile and which manife
 mkdir -p ~/firmware
 cd ~/firmware
 
-# Start HTTP server (run once; persist with systemd or tmux)
+# Start HTTP server — must run from ~/firmware so files are served correctly
 python3 -m http.server 8080 --bind 192.168.153.78
 ```
 
