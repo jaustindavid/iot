@@ -5,6 +5,10 @@ substitutions:
   stra2us_port: !secret stra2us_port
   firmware_url: !secret firmware_url
   project_version: !env_var ESPHOME_PROJECT_VERSION 0000.00.00.0000
+  # Stra2us application namespace — used to build KV lookup keys:
+  #   device-specific : ${stratus_app}/${name}/<var_id>
+  #   app-wide default: ${stratus_app}/<var_id>
+  stratus_app: coaticlock
 
 esphome:
   name: bb32
@@ -115,23 +119,36 @@ globals:
   # --- Wobbly Time Settings ---
   # The clock always tries to display a time that is slightly ahead of reality.
   # The displayed time will drift randomly within [wobble_min_minutes, wobble_max_minutes].
+  #
+  # Stra2us-managed: each var is polled every 5 min from the KV store.
+  # Cascade: device key (${stratus_app}/${name}/<id>) checked first,
+  #          then app-wide default (${stratus_app}/<id>).
+
   - id: wobble_min_minutes
     type: int
     initial_value: '2'
+    # stratus_key: ${stratus_app}/${name}/wobble_min_minutes
+    #              ${stratus_app}/wobble_min_minutes
 
   - id: wobble_max_minutes
     type: int
     initial_value: '5'
+    # stratus_key: ${stratus_app}/${name}/wobble_max_minutes
+    #              ${stratus_app}/wobble_max_minutes
 
   # When the displayed time is behind its target, it runs this much faster than real time.
   - id: wobble_fast_rate
     type: float
     initial_value: '1.3'
+    # stratus_key: ${stratus_app}/${name}/wobble_fast_rate
+    #              ${stratus_app}/wobble_fast_rate
 
   # When the displayed time is ahead of its target, it runs this much slower.
   - id: wobble_slow_rate
     type: float
     initial_value: '0.7'
+    # stratus_key: ${stratus_app}/${name}/wobble_slow_rate
+    #              ${stratus_app}/wobble_slow_rate
 
   # Memory pointer to the WobblyTime instance
   - id: wobbly_ptr
@@ -231,14 +248,41 @@ interval:
             rst
           );
 
-          stra2us_publish(
-            id(stra2us_host).c_str(),
-            id(stra2us_port),
-            id(stra2us_client_id).c_str(),
-            id(stra2us_secret_hex).c_str(),
-            "coaticlock",
-            report
-          );
+          const char* h   = id(stra2us_host).c_str();
+          int          p   = id(stra2us_port);
+          const char* cid = id(stra2us_client_id).c_str();
+          const char* sec = id(stra2us_secret_hex).c_str();
+
+          // Heartbeat publish — opens (or reuses) the persistent socket.
+          stra2us_publish(h, p, cid, sec, "${stratus_app}", report);
+
+          // --- Stra2us config poll (every 5 heartbeats = ~5 minutes) ---
+          // Runs immediately after the publish so the socket is already open.
+          // Cascade: device-specific key checked first, app-wide default second.
+          static uint8_t kv_countdown = 0;
+          if (kv_countdown == 0) {
+            kv_countdown = 4;  // next poll in 5 cycles
+            char val[32];
+
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_min_minutes", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_min_minutes",         val, sizeof(val)))
+              id(wobble_min_minutes) = atoi(val);
+
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_max_minutes", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_max_minutes",         val, sizeof(val)))
+              id(wobble_max_minutes) = atoi(val);
+
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_fast_rate", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_fast_rate",         val, sizeof(val)))
+              id(wobble_fast_rate) = atof(val);
+
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_slow_rate", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_slow_rate",         val, sizeof(val)))
+              id(wobble_slow_rate) = atof(val);
+
+          } else {
+            kv_countdown--;
+          }
 
 # 2. Define the Light Sensor and Auto-Dimming logic
 sensor:

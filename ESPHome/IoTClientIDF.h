@@ -1,22 +1,36 @@
 #pragma once
 // Native Stra2us client using POSIX BSD sockets — no esp_http_client dependency.
-// BSD sockets are always available in ESP-IDF; no cmake component tweaks needed.
 //
-// Signing scheme matches upstream IoTClient:
-//   HMAC-SHA256 over: uri + body_bytes + timestamp_string
-//   Headers: X-Client-ID, X-Timestamp, X-Signature
+// Connection model: persistent keep-alive socket.
+//   The first call in a cycle connects; subsequent calls in the same cycle
+//   reuse the open socket (server keepalive timeout >> time between calls in
+//   one lambda execution).  Between cycles (~60 s) the server will have closed
+//   its end; the next call detects the dead socket on write, reconnects, and
+//   retries the request once automatically.
+//
+// Signing scheme: HMAC-SHA256 over (uri + body_bytes + timestamp_string)
+// Headers: X-Client-ID, X-Timestamp, X-Signature
 
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <cerrno>
-#include <fcntl.h>       // O_NONBLOCK
+#include <fcntl.h>
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/md.h"
 #include "esp_log.h"
 
 static const char* STRA2US_TAG = "stra2us";
+
+// Persistent socket — shared across all calls within a single ESPHome cycle.
+// Reset to -1 whenever the connection is lost; re-established on next call.
+static int s_stra2us_fd = -1;
+
+
+// ============================================================
+// Internal helpers
+// ============================================================
 
 static void _s2_hex_to_bytes(const char* hex, uint8_t* out, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -26,10 +40,10 @@ static void _s2_hex_to_bytes(const char* hex, uint8_t* out, size_t n) {
 }
 
 static void _s2_sign(const char* secret_hex,
-                      const char* uri,
-                      const char* body, size_t body_len,
-                      uint32_t ts,
-                      char* out_hex /* 65 bytes */) {
+                     const char* uri,
+                     const char* body, size_t body_len,
+                     uint32_t ts,
+                     char* out_hex /* 65 bytes */) {
     uint8_t secret[32];
     _s2_hex_to_bytes(secret_hex, secret, 32);
 
@@ -51,21 +65,19 @@ static void _s2_sign(const char* secret_hex,
     out_hex[64] = '\0';
 }
 
-// Publish a plain-text string to a Stra2us queue topic (FR-1: text/plain).
-// Returns HTTP status code, or -1 on connection failure.
-static int stra2us_publish(const char* host, int port,
-                            const char* client_id, const char* secret_hex,
-                            const char* topic,     const char* message) {
-    char uri[64];
-    snprintf(uri, sizeof(uri), "/q/%s", topic);
+// Close the persistent socket and reset state.
+static void _s2_close() {
+    if (s_stra2us_fd >= 0) {
+        lwip_close(s_stra2us_fd);
+        s_stra2us_fd = -1;
+        ESP_LOGI(STRA2US_TAG, "socket closed");
+    }
+}
 
-    uint32_t ts       = (uint32_t)::time(nullptr);
-    size_t   body_len = strlen(message);
+// Return the open fd, connecting first if needed.  -1 on failure.
+static int _s2_ensure_connected(const char* host, int port) {
+    if (s_stra2us_fd >= 0) return s_stra2us_fd;
 
-    char sig[65];
-    _s2_sign(secret_hex, uri, message, body_len, ts, sig);
-
-    // Resolve host via lwip DNS
     struct addrinfo hints{};
     addrinfo* res = nullptr;
     hints.ai_family   = AF_INET;
@@ -78,53 +90,144 @@ static int stra2us_publish(const char* host, int port,
         return -1;
     }
 
-    // Use lwip_ prefixed calls to avoid collision with esphome::socket namespace
     int fd = lwip_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { lwip_freeaddrinfo(res); return -1; }
 
+    // 5 s recv/send timeout for data phase
     struct timeval tv = {5, 0};
     lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    // Non-blocking connect with a hard 4s timeout.
-    // SO_SNDTIMEO is silently ignored by lwip_connect(); without this the call
-    // blocks until the TCP stack gives up (~75s), killing the ESPHome WDT.
+    // Non-blocking connect with a hard 4 s select() timeout.
+    // lwip_connect() ignores SO_SNDTIMEO; without select() the call blocks
+    // until the TCP stack gives up (~75 s), which kills the ESPHome WDT.
     int flags = lwip_fcntl(fd, F_GETFL, 0);
     lwip_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     int cr = lwip_connect(fd, res->ai_addr, res->ai_addrlen);
     if (cr != 0 && errno != EINPROGRESS) {
-        ESP_LOGE(STRA2US_TAG, "Connect failed to %s:%d (err %d)", host, port, errno);
-        lwip_freeaddrinfo(res);
-        lwip_close(fd);
-        return -1;
+        ESP_LOGE(STRA2US_TAG, "connect failed %s:%d err=%d", host, port, errno);
+        lwip_freeaddrinfo(res); lwip_close(fd); return -1;
     }
 
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    struct timeval conn_tv = {4, 0};  // 4s max — well inside 15s WDT budget
-    int sr = lwip_select(fd + 1, nullptr, &wfds, nullptr, &conn_tv);
-    if (sr <= 0) {
-        ESP_LOGE(STRA2US_TAG, "Connect timeout to %s:%d", host, port);
-        lwip_freeaddrinfo(res);
-        lwip_close(fd);
-        return -1;
+    fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
+    struct timeval conn_tv = {4, 0};
+    if (lwip_select(fd + 1, nullptr, &wfds, nullptr, &conn_tv) <= 0) {
+        ESP_LOGE(STRA2US_TAG, "connect timeout %s:%d", host, port);
+        lwip_freeaddrinfo(res); lwip_close(fd); return -1;
     }
     int so_err = 0; socklen_t so_len = sizeof(so_err);
     lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
     if (so_err != 0) {
-        ESP_LOGE(STRA2US_TAG, "Connect refused %s:%d (%d)", host, port, so_err);
-        lwip_freeaddrinfo(res);
-        lwip_close(fd);
-        return -1;
+        ESP_LOGE(STRA2US_TAG, "connect refused %s:%d err=%d", host, port, so_err);
+        lwip_freeaddrinfo(res); lwip_close(fd); return -1;
     }
 
-    // Restore blocking mode; SO_RCVTIMEO/SO_SNDTIMEO (5s) handle the rest.
-    lwip_fcntl(fd, F_SETFL, flags);
+    lwip_fcntl(fd, F_SETFL, flags);  // restore blocking
     lwip_freeaddrinfo(res);
+    s_stra2us_fd = fd;
+    ESP_LOGI(STRA2US_TAG, "connected to %s:%d fd=%d", host, port, fd);
+    return fd;
+}
 
-    // Build HTTP/1.1 request
+// Send all bytes, retrying on partial writes.  Returns false (and closes
+// socket) on error.
+static bool _s2_send_all(const char* data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = lwip_send(s_stra2us_fd, data + sent, len - sent, 0);
+        if (n <= 0) { _s2_close(); return false; }
+        sent += n;
+    }
+    return true;
+}
+
+// Read the full HTTP response from the persistent socket.
+//   - Parses the status code from the status line.
+//   - Parses Content-Length to consume exactly the right body bytes, leaving
+//     the socket positioned at the start of the next response.
+//   - Copies up to (body_out_len - 1) body bytes into body_out if non-null.
+//   - Returns HTTP status code, or -1 on socket error (socket is closed).
+static int _s2_read_response(char* body_out, size_t body_out_len) {
+    int fd = s_stra2us_fd;
+    char buf[512];
+    int total = 0;
+
+    // Read until we have the complete header block (\r\n\r\n).
+    while (total < (int)sizeof(buf) - 1) {
+        int n = lwip_recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
+        if (n <= 0) { _s2_close(); return -1; }
+        total += n;
+        buf[total] = '\0';
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+
+    // Parse status code from "HTTP/1.1 NNN ..."
+    int status = -1;
+    const char* sp = strchr(buf, ' ');
+    if (sp) status = atoi(sp + 1);
+
+    // Parse Content-Length.  FastAPI/uvicorn sends lowercase headers.
+    int content_length = 0;
+    const char* cl = strstr(buf, "content-length:");
+    if (!cl) cl = strstr(buf, "Content-Length:");
+    if (cl) {
+        cl += 15;  // both spellings are 15 chars
+        while (*cl == ' ') cl++;
+        content_length = atoi(cl);
+    }
+
+    // Locate body start
+    const char* hdr_end = strstr(buf, "\r\n\r\n");
+    if (!hdr_end) { _s2_close(); return -1; }
+    int hdr_len   = (int)(hdr_end - buf) + 4;
+    int body_have = total - hdr_len;
+    const char* body_start = buf + hdr_len;
+
+    // Hand body to caller
+    if (body_out && body_out_len > 0 && body_have > 0) {
+        int copy = (body_have < (int)body_out_len - 1)
+                   ? body_have : (int)body_out_len - 1;
+        memcpy(body_out, body_start, copy);
+        body_out[copy] = '\0';
+    }
+
+    // Drain any body bytes that didn't fit in buf, so the socket is clean
+    // for the next pipelined request.
+    int remaining = content_length - body_have;
+    char trash[64];
+    while (remaining > 0) {
+        int n = lwip_recv(fd, trash,
+                          (remaining < (int)sizeof(trash))
+                              ? remaining : (int)sizeof(trash), 0);
+        if (n <= 0) { _s2_close(); return -1; }
+        remaining -= n;
+    }
+
+    return status;
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+// Publish a plain-text string to a Stra2us queue topic.
+// Returns the HTTP status code, or -1 on connection failure.
+//
+// Uses (and keeps open) the shared persistent socket.  If the socket has
+// been closed by the server since the last call, it reconnects and retries
+// the request exactly once.
+static int stra2us_publish(const char* host, int port,
+                            const char* client_id, const char* secret_hex,
+                            const char* topic,     const char* message) {
+    char uri[64];
+    snprintf(uri, sizeof(uri), "/q/%s", topic);
+
+    uint32_t ts       = (uint32_t)::time(nullptr);
+    size_t   body_len = strlen(message);
+    char sig[65];
+    _s2_sign(secret_hex, uri, message, body_len, ts, sig);
+
     char req[768];
     int req_len = snprintf(req, sizeof(req),
         "POST %s HTTP/1.1\r\n"
@@ -134,25 +237,104 @@ static int stra2us_publish(const char* host, int port,
         "X-Client-ID: %s\r\n"
         "X-Timestamp: %lu\r\n"
         "X-Signature: %s\r\n"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n"
         "%s",
         uri, host, port, body_len,
         client_id, (unsigned long)ts, sig,
         message);
 
-    lwip_send(fd, req, req_len, 0);
+    // Try once; on dead-socket error reconnect and retry once.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (_s2_ensure_connected(host, port) < 0) return -1;
+        if (_s2_send_all(req, req_len)) break;
+        if (attempt == 1) return -1;  // retry failed
+        // s_stra2us_fd is now -1 (closed by _s2_send_all); loop reconnects
+    }
 
-    // Read just the status line
-    char resp[64] = {};
-    lwip_recv(fd, resp, sizeof(resp) - 1, 0);
-    lwip_close(fd);
-
-    // Parse "HTTP/1.1 NNN ..."
-    int status = -1;
-    const char* sp = strchr(resp, ' ');
-    if (sp) status = atoi(sp + 1);
-
-    ESP_LOGI(STRA2US_TAG, "POST /q/%s -> %d", topic, status);
+    int status = _s2_read_response(nullptr, 0);
+    ESP_LOGI(STRA2US_TAG, "POST %s -> %d", uri, status);
     return status;
+}
+
+// Read a KV value from Stra2us.
+//
+// Checks the key in the order provided; the first hit wins (cascade pattern):
+//   stra2us_kv_get(..., "coaticlock/bb32/wobble_max_minutes", val, sizeof(val))
+//   stra2us_kv_get(..., "coaticlock/wobble_max_minutes",      val, sizeof(val))
+//
+// Returns true and fills val_out (null-terminated string) when the key exists
+// and holds a msgpack-encoded plain-text value (as written by POST /kv with
+// Content-Type: text/plain).
+// Returns false when the key is absent, or on any network/parse error.
+//
+// Uses the same shared persistent socket as stra2us_publish().
+static bool stra2us_kv_get(const char* host, int port,
+                            const char* client_id, const char* secret_hex,
+                            const char* key,
+                            char* val_out, size_t val_out_len) {
+    char uri[128];
+    snprintf(uri, sizeof(uri), "/kv/%s", key);
+
+    uint32_t ts = (uint32_t)::time(nullptr);
+    char sig[65];
+    _s2_sign(secret_hex, uri, nullptr, 0, ts, sig);
+
+    char req[512];
+    int req_len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "X-Client-ID: %s\r\n"
+        "X-Timestamp: %lu\r\n"
+        "X-Signature: %s\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        uri, host, port,
+        client_id, (unsigned long)ts, sig);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (_s2_ensure_connected(host, port) < 0) return false;
+        if (_s2_send_all(req, req_len)) break;
+        if (attempt == 1) return false;
+    }
+
+    // Body is small: either msgpack-encoded string (hit) or
+    // msgpack-encoded {"status":"not_found"} map (miss).
+    char body[64] = {};
+    int status = _s2_read_response(body, sizeof(body));
+    if (status != 200) {
+        ESP_LOGW(STRA2US_TAG, "GET %s -> %d", uri, status);
+        return false;
+    }
+
+    // Decode the msgpack response.
+    // Values written with text/plain are stored as msgpack strings:
+    //   fixstr  0xa0..0xbf : 1-byte header, len in low 5 bits
+    //   str8    0xd9       : 2-byte header, len in next byte
+    //   str16   0xda       : 3-byte header, len in next 2 bytes (big-endian)
+    // Anything else (e.g. fixmap 0x81 = {"status":"not_found"}) is a miss.
+    uint8_t* b = (uint8_t*)body;
+    const char* str_data = nullptr;
+    int str_len = 0;
+
+    if ((b[0] & 0xe0) == 0xa0) {           // fixstr
+        str_len  = b[0] & 0x1f;
+        str_data = body + 1;
+    } else if (b[0] == 0xd9) {             // str8
+        str_len  = b[1];
+        str_data = body + 2;
+    } else if (b[0] == 0xda) {             // str16
+        str_len  = ((uint16_t)b[1] << 8) | b[2];
+        str_data = body + 3;
+    } else {
+        // Not a string — treat as not-found (catches the {"status":"not_found"} map)
+        ESP_LOGI(STRA2US_TAG, "GET %s -> not_found", uri);
+        return false;
+    }
+
+    int copy = (str_len < (int)val_out_len - 1) ? str_len : (int)val_out_len - 1;
+    memcpy(val_out, str_data, copy);
+    val_out[copy] = '\0';
+    ESP_LOGI(STRA2US_TAG, "GET %s -> \"%s\"", uri, val_out);
+    return true;
 }

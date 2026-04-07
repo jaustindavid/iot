@@ -101,7 +101,7 @@ async def peek_queue(topic: str):
     except Exception:
         return {"status": "ok", "message": "unparseable_msgpack", "hex": payload.hex()}
 
-@router.get("/peek/kv/{key}")
+@router.get("/peek/kv/{key:path}")
 async def peek_kv(key: str):
     redis = get_redis_client()
     msg = await redis.get(f"kv:{key}")
@@ -114,7 +114,7 @@ async def peek_kv(key: str):
     except Exception:
         return {"status": "ok", "message": "unparseable_msgpack", "hex": msg.hex()}
 
-@router.delete("/kv/{key}")
+@router.delete("/kv/{key:path}")
 async def delete_kv(key: str):
     redis = get_redis_client()
     await redis.delete(f"kv:{key}")

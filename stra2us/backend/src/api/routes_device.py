@@ -125,7 +125,7 @@ async def consume_message(
         # advance cursor and keep polling if all current batch were expired
         await redis.set(cursor_key, last_id)
 
-@router.post("/kv/{key}", response_class=MsgPackResponse)
+@router.post("/kv/{key:path}", response_class=MsgPackResponse)
 async def write_kv(
     key: str, 
     request: Request,
@@ -152,7 +152,7 @@ async def write_kv(
 
     return {"status": "ok"}
 
-@router.get("/kv/{key}", response_class=MsgPackResponse)
+@router.get("/kv/{key:path}", response_class=MsgPackResponse)
 async def read_kv(
     key: str,
     context: dict = Depends(verify_device_request)
