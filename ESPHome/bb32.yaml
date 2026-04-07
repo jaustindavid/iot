@@ -61,11 +61,22 @@ update:
     source: "http://${firmware_host}:8080/bb32_manifest.json"
     update_interval: 300s
     on_update_available:
-      - logger.log:
-          format: "Pull OTA: newer firmware available (%s), applying..."
-          args: ["x.latest_version.c_str()"]
-      - update.perform:
-          id: firmware_update
+      - lambda: |-
+          // Never auto-update a dev build — it would immediately revert to the
+          // server version, breaking the local development workflow.
+          if (strcmp(ESPHOME_PROJECT_VERSION, "0000.00.00.0000") == 0) {
+            ESP_LOGI("ota", "Dev build detected, skipping pull OTA");
+            return;
+          }
+          ESP_LOGI("ota", "Pull OTA: newer firmware available (%s), applying...",
+                   x.latest_version.c_str());
+          id(firmware_update).perform(false);
+
+# 1. Define the I2C bus on the Xiao pins
+i2c:
+  sda: GPIO6  # Physical pin D4 (Blue wire)
+  scl: GPIO7  # Physical pin D5 (Yellow wire)
+  scan: true
 
 time:
   - platform: sntp
@@ -83,6 +94,10 @@ globals:
     type: 'int'
     initial_value: '-1'
     restore_value: no
+
+  - id: global_brightness
+    type: float
+    initial_value: '1.0'
 
   # --- Wobbly Time Settings ---
   # The clock always tries to display a time that is slightly ahead of reality.
@@ -212,6 +227,21 @@ interval:
             report
           );
 
+# 2. Define the Light Sensor and Auto-Dimming logic
+sensor:
+  - platform: bh1750
+    name: "Ambient Light"
+    id: ambient_light
+    address: 0x23
+    update_interval: 10s
+    on_value:
+      then:
+        - lambda: |-
+            float target = x / 500.0f;
+            target = clamp(target, 0.1f, 1.0f);
+            // Simple low-pass filter: 20% new value, 80% old value
+            id(global_brightness) = (target * 0.2f) + (id(global_brightness) * 0.8f);
+
 light:
   - platform: esp32_rmt_led_strip
     rgb_order: GRB
@@ -277,11 +307,12 @@ display:
       memcpy(board_snap, engine->current_board, sizeof(board_snap));
       memcpy(fade_snap,  engine->fade_board,    sizeof(fade_snap));
 
-      Color green = Color(0, 255, 0);
-      Color red = Color(255, 0, 0);
-      Color blue = Color(0, 0, 255);
-      Color white = Color(255, 255, 255);
-      Color cyan = Color(0, 255, 255);
+      float bri = id(global_brightness);
+      Color green = Color(0,               (uint8_t)(255 * bri), 0);
+      Color red   = Color((uint8_t)(255 * bri), 0,               0);
+      Color blue  = Color(0,               0,               (uint8_t)(255 * bri));
+      Color white = Color((uint8_t)(255 * bri), (uint8_t)(255 * bri), (uint8_t)(255 * bri));
+      Color cyan  = Color(0,               (uint8_t)(255 * bri), (uint8_t)(255 * bri));
       
       // Draw static endpoints (Dumpster & Pool)
       it.draw_pixel_at(0, 7, red);
@@ -294,7 +325,7 @@ display:
         for (int y = 0; y < 8; y++) {
           if (board_snap[x][y]) {
             if (y == 7 && (x <= 1 || x >= 30)) continue;
-            it.draw_pixel_at(x, y, Color(0, (uint8_t)(255 * fade_snap[x][y]), 0));
+            it.draw_pixel_at(x, y, Color(0, (uint8_t)(255 * fade_snap[x][y] * bri), 0));
           }
         }
       }
@@ -306,7 +337,7 @@ display:
         Color agent_color;
         if (agent.carrying) {
            float pulse = 0.7f + 0.3f * sin(now / 150.0f);
-           agent_color = Color(255 * pulse, 255 * pulse, 0); 
+           agent_color = Color((uint8_t)(255 * pulse * bri), (uint8_t)(255 * pulse * bri), 0);
         } else {
            if (i == 0) agent_color = white;
            else agent_color = cyan;
@@ -315,7 +346,7 @@ display:
         // Frustration shimmer
         if (agent.wait_ticks > 1) {
             float shim = (sin(now / 30.0f) > 0) ? 1.0f : 0.0f;
-            if (shim > 0.5f) agent_color = Color(255, 100, 100);
+            if (shim > 0.5f) agent_color = Color((uint8_t)(255*bri), (uint8_t)(100*bri), (uint8_t)(100*bri));
         }
         
         if (agent.pos == agent.last_pos) {
@@ -340,5 +371,4 @@ display:
 
 # Ensure logger is present
 logger:
-  level: INFO
-    
+  level: DEBUG
