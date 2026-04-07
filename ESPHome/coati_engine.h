@@ -54,6 +54,9 @@ struct CoatiAgent {
   Point claimed_target = {-1, -1};
   int wait_ticks = 0;
   int bored_ticks = 0;
+  int wash_ticks = 0;  // > 0: currently dunking at pool (counts down each tick)
+  bool washed = false; // true: this carry has been washed, ready to place
+  int pause_ticks = 0; // > 0: frozen after pickup/placement (counts down each tick)
 
   CoatiAgent(Point p, Point lp, bool c, std::vector<Point> path, Point target, int w, int b)
       : pos(p), last_pos(lp), carrying(c) , current_path(path), claimed_target(target), wait_ticks(w), bored_ticks(b) {}
@@ -147,6 +150,14 @@ public:
   std::vector<std::pair<float, Point>> pf_q_storage;
   
   std::vector<CoatiAgent> agents;
+  int pool_user = -1;  // index of agent currently using the pool (-1 = free)
+
+  // Pre-allocated work vectors for tick() — promoted from locals to members
+  // so they are never heap-allocated/freed on the hot 20 Hz path.
+  // Always call .clear() before use; capacity is never shrunk.
+  std::vector<Point> tk_extras, tk_missing;
+  std::vector<Point> tk_avail_e, tk_avail_m;
+  std::vector<Point> tk_wander;
   
   std::vector<Point> dumpster = {{0, 7}, {1, 7}};
   std::vector<Point> pool = {{30, 7}, {31, 7}};
@@ -166,6 +177,11 @@ public:
     // Reserve queue backing once so pathfinding never reallocates on the heap.
     // 40 nodes * 8 neighbors = 320 max pushes; 448 gives comfortable headroom.
     pf_q_storage.reserve(448);
+    // Pre-reserve tick() work vectors to prevent heap fragmentation from the
+    // repeated alloc/free cycle that occurs at 20 Hz over many minutes.
+    tk_extras.reserve(64);  tk_missing.reserve(64);
+    tk_avail_e.reserve(64); tk_avail_m.reserve(64);
+    tk_wander.reserve(16);
   }
 
   // Called from the FreeRTOS timer/interval context.
@@ -195,11 +211,15 @@ public:
         target_board[x][y] = pending_target[x][y];
       }
     // Reset agents fully — clear frustration state so shimmer doesn't misfire
+    pool_user = -1;
     for (auto &agent : agents) {
       agent.claimed_target = {-1, -1};
       agent.current_path.clear();
       agent.wait_ticks = 0;
       agent.bored_ticks = 0;
+      agent.wash_ticks = 0;
+      agent.washed = false;
+      agent.pause_ticks = 0;
     }
     ESP_LOGW("coati", "TARGET APPLIED: +%d -%d pixels, agents reset", added, removed);
   }
@@ -309,8 +329,8 @@ public:
   }
 
   void tick() {
-    std::vector<Point> extras;
-    std::vector<Point> missing;
+    tk_extras.clear();
+    tk_missing.clear();
     
     // Recalculate available tasks
     for (int x = 0; x < 32; x++) {
@@ -320,10 +340,10 @@ public:
         if (is_dumpster || is_pool) continue;
 
         if (current_board[x][y] && !target_board[x][y]) {
-          extras.push_back({x, y});
+          tk_extras.push_back({x, y});
         }
         if (!current_board[x][y] && target_board[x][y]) {
-          missing.push_back({x, y});
+          tk_missing.push_back({x, y});
         }
       }
     }
@@ -393,96 +413,165 @@ public:
     for (size_t i = 0; i < agents.size(); i++) {
         CoatiAgent& a = agents[i];
         if (!a.current_path.empty() || a.wait_ticks > 0) continue; // Already moving or blocked
+        if (a.pause_ticks > 0) { a.pause_ticks--; continue; }      // Dainty pause after pickup/place
 
         // Re-filter available arrays for this specific agent's decision processing
-        std::vector<Point> available_extras;
-        for (auto e : extras) {
+        tk_avail_e.clear();
+        for (auto e : tk_extras) {
             bool claimed = false;
             for (size_t j = 0; j < agents.size(); j++) {
                 if (i != j && agents[j].claimed_target == e) claimed = true;
             }
-            if (!claimed) available_extras.push_back(e);
+            if (!claimed) tk_avail_e.push_back(e);
         }
-        std::vector<Point> available_missing;
-        for (auto m : missing) {
+        tk_avail_m.clear();
+        for (auto m : tk_missing) {
             bool claimed = false;
             for (size_t j = 0; j < agents.size(); j++) {
                 if (i != j && agents[j].claimed_target == m) claimed = true;
             }
-            if (!claimed) available_missing.push_back(m);
+            if (!claimed) tk_avail_m.push_back(m);
         }
 
         if (a.carrying) {
+            // =================================================================
+            // PHASE A — WASHING: visit pool and dunk before placing
+            // =================================================================
+            if (!a.washed) {
+
+                // --- Actively dunking: bob between pool level and y-1 ---
+                if (a.wash_ticks > 0) {
+                    a.wash_ticks--;
+                    if (a.wash_ticks == 0) {
+                        // Dunking complete — release pool and move to placement phase
+                        a.washed = true;
+                        if (pool_user == (int)i) pool_user = -1;
+                        a.claimed_target = {-1, -1};
+                        ESP_LOGD("coati", "WASHED [%d] done", (int)i);
+                    } else {
+                        // Queue next bob step: emerge (y-1) or dunk (pool.y)
+                        Point spot = pool[i % pool.size()];
+                        if (a.pos.y == spot.y)
+                            a.current_path = {{spot.x, spot.y - 1}};  // emerge
+                        else
+                            a.current_path = {spot};                   // dunk
+                    }
+                    continue;
+                }
+
+                // --- At pool: claim and start dunking ---
+                bool at_my_pool = (a.pos == pool[i % pool.size()]);
+                if (at_my_pool) {
+                    if (pool_user == -1 || pool_user == (int)i) {
+                        pool_user = (int)i;
+                        a.wash_ticks = 5;  // 2.5 bobs (5 half-steps)
+                        Point spot = pool[i % pool.size()];
+                        a.current_path = {{spot.x, spot.y - 1}};  // first emerge
+                        ESP_LOGD("coati", "WASHING [%d] starting", (int)i);
+                    }
+                    // else pool busy — wait in place this tick
+                    continue;
+                }
+
+                // --- Not at pool yet ---
+                if (path_calculated_this_tick) continue;
+
+                if (pool_user == -1 || pool_user == (int)i) {
+                    // Pool is free (or ours): head there — continue to skip escape logic
+                    Point pool_dest = pool[i % pool.size()];
+                    a.current_path = find_path(a.pos, pool_dest, i);
+                    a.claimed_target = pool_dest;
+                    path_calculated_this_tick = true;
+                    continue;  // has a path, no need for escape logic
+                } else {
+                    // Pool is busy: wander nearby rather than crowding the approach.
+                    // Do NOT continue here — fall through to panic escape logic below
+                    // so two agents waiting for the pool can break a mutual deadlock.
+                    a.bored_ticks++;
+                    if (a.bored_ticks >= 8) {
+                        a.bored_ticks = 0;
+                        if (std::rand() % 2 == 0) {
+                            tk_wander.clear();
+                            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+                                if (dx == 0 && dy == 0) continue;
+                                int nx = a.pos.x + dx, ny = a.pos.y + dy;
+                                bool is_pool_cell = (ny == 7 && (nx == 30 || nx == 31));
+                                if (nx >= 0 && nx < 32 && ny >= 0 && ny < 8 &&
+                                    !current_board[nx][ny] && !is_pool_cell) {
+                                    bool clash = false;
+                                    for (size_t j = 0; j < agents.size(); j++)
+                                        if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) clash = true;
+                                    if (!clash) tk_wander.push_back({nx, ny});
+                                }
+                            }
+                            if (!tk_wander.empty())
+                                a.current_path.push_back(tk_wander[std::rand() % tk_wander.size()]);
+                        }
+                    }
+                }
+                // Fall through: panic escape / deadlock-break logic runs below
+            }
+
+            // =================================================================
+            // PHASE B — PLACING: washed pixel, find a missing slot or dispose
+            // =================================================================
             bool standing_on_missing = false;
-            for (auto m : missing) if (a.pos == m) standing_on_missing = true;
+            for (auto m : tk_missing) if (a.pos == m) standing_on_missing = true;
             bool standing_on_pool = false;
             for (auto p : pool) if (a.pos == p) standing_on_pool = true;
 
-            // Only place at the exact claimed target, not at any missing position we
-            // happen to pass through. With budgeted partial paths, the intermediate
-            // waypoint could coincidentally be another missing clock position, causing
-            // a misplaced pixel (the "slow sparkle" bug).
             bool at_claimed_target = (a.claimed_target.x != -1 && a.pos == a.claimed_target);
             if (standing_on_missing && !current_board[a.pos.x][a.pos.y] && at_claimed_target) {
-                // Warn if fade_board had accumulated a stale non-zero value — potential sparkle source
-                if (fade_board[a.pos.x][a.pos.y] > 0.05f) {
+                if (fade_board[a.pos.x][a.pos.y] > 0.05f)
                     ESP_LOGW("coati", "STALE FADE at (%d,%d): %.2f before placement", a.pos.x, a.pos.y, fade_board[a.pos.x][a.pos.y]);
-                }
                 current_board[a.pos.x][a.pos.y] = true;
                 fade_board[a.pos.x][a.pos.y] = 0.0f;
                 a.carrying = false;
+                a.washed = false;
                 a.claimed_target = {-1, -1};
+                a.pause_ticks = 4;  // Pause to "place" daintily
                 ESP_LOGD("coati", "PLACE [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                 continue;
             } else if (standing_on_pool) {
-                // Dunk if: no missing slots at all, OR we have no reachable unclaimed target
-                bool has_reachable = false;
-                if (!available_missing.empty()) {
-                    Point dest = find_closest(a.pos, available_missing);
-                    if (dest.x != -1) has_reachable = true;
-                }
+                // No reachable missing slots — dispose
+                bool has_reachable = !tk_avail_m.empty() &&
+                                     find_closest(a.pos, tk_avail_m).x != -1;
                 if (!has_reachable) {
                     a.carrying = false;
+                    a.washed = false;
                     a.claimed_target = {-1, -1};
-                    ESP_LOGD("coati", "DUNK [%d] at pool", (int)i);
+                    ESP_LOGD("coati", "DISPOSE [%d] at pool", (int)i);
                     continue;
                 }
             }
-            
-            if (path_calculated_this_tick) continue; // STAGGER PATHFINDING
 
-            if (!available_missing.empty()) {
-                Point dest = find_closest(a.pos, available_missing);
+            if (path_calculated_this_tick) continue;
+
+            if (!tk_avail_m.empty()) {
+                Point dest = find_closest(a.pos, tk_avail_m);
                 if (dest.x != -1) {
                     a.current_path = find_path(a.pos, dest, i);
                     if (!a.current_path.empty()) {
                         a.claimed_target = dest;
                     } else {
-                        // Fallback: try ALL available missing
-                        for(auto m : available_missing) {
+                        for (auto m : tk_avail_m) {
                             a.current_path = find_path(a.pos, m, i);
-                            if (!a.current_path.empty()) {
-                                a.claimed_target = m; break;
-                            }
+                            if (!a.current_path.empty()) { a.claimed_target = m; break; }
                         }
                     }
                     path_calculated_this_tick = true;
                 }
-            } else if (!available_extras.empty() || a.carrying) { // We MUST dispose of our payload at the Pool if there are no missing targets!
-                // Spread agents across separate pool cells to avoid exit deadlock
+            } else {
+                // No missing slots after washing — head to pool to dispose
                 Point pool_dest = pool[i % pool.size()];
                 a.current_path = find_path(a.pos, pool_dest, i);
                 a.claimed_target = pool_dest;
                 path_calculated_this_tick = true;
-            } else {
-                // Done! Wait for target to change.
-                a.claimed_target = {-1, -1};
-                a.bored_ticks++;
             }
         } else {
             // Not carrying
             bool standing_on_extra = false;
-            for (auto e : extras) if (a.pos == e) standing_on_extra = true;
+            for (auto e : tk_extras) if (a.pos == e) standing_on_extra = true;
             bool standing_on_dumpster = false;
             for (auto d : dumpster) if (a.pos == d) standing_on_dumpster = true;
 
@@ -491,24 +580,26 @@ public:
                 fade_board[a.pos.x][a.pos.y] = 0.0f;
                 a.carrying = true;
                 a.claimed_target = {-1, -1};
+                a.pause_ticks = 4;  // Pause to "pick up" daintily
                 ESP_LOGD("coati", "PICKUP [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                 continue;
-            } else if (standing_on_dumpster && !available_missing.empty()) {
+            } else if (standing_on_dumpster && !tk_avail_m.empty()) {
                 a.carrying = true;
                 a.claimed_target = {-1, -1};
+                a.pause_ticks = 4;  // Pause to "fetch" daintily
                 ESP_LOGD("coati", "FETCH [%d] from dumpster", (int)i);
                 continue;
             }
             
             if (path_calculated_this_tick) continue; // STAGGER PATHFINDING
 
-            if (!available_extras.empty()) {
-                Point dest = find_closest(a.pos, available_extras);
+            if (!tk_avail_e.empty()) {
+                Point dest = find_closest(a.pos, tk_avail_e);
                 a.current_path = find_path(a.pos, dest, i);
                 if (!a.current_path.empty()) {
                     a.claimed_target = dest;
                 } else {
-                    for(auto e : available_extras) {
+                    for(auto e : tk_avail_e) {
                         a.current_path = find_path(a.pos, e, i);
                         if (!a.current_path.empty()) {
                             a.claimed_target = e; break;
@@ -516,7 +607,7 @@ public:
                     }
                 }
                 path_calculated_this_tick = true;
-            } else if (!available_missing.empty()) {
+            } else if (!tk_avail_m.empty()) {
                 // Spread agents across separate dumpster cells to avoid exit deadlock
                 Point fetch_dest = dumpster[i % dumpster.size()];
                 a.current_path = find_path(a.pos, fetch_dest, i);
@@ -530,9 +621,8 @@ public:
         }
 
         // --- Panic Escape Logic ---
-        // If we have tasks or are carrying a pixel, but failed to find ANY valid path (likely trapped by another agent)
-        if (a.current_path.empty() && a.claimed_target.x == -1 && 
-           (a.carrying || !available_missing.empty() || !available_extras.empty())) 
+        if (a.current_path.empty() && a.claimed_target.x == -1 &&
+           (a.carrying || !tk_avail_m.empty() || !tk_avail_e.empty()))
         {
             a.wait_ticks++;
             // Wait briefly to see if the blocking agent moves out of our way naturally
@@ -570,13 +660,13 @@ public:
         // Escape immediately to the nearest cell that is neither placed nor targeted.
         if (a.current_path.empty() && a.claimed_target.x == -1 && !a.carrying &&
             target_board[a.pos.x][a.pos.y] && !path_calculated_this_tick) {
-            std::vector<Point> safe_cells;
+            tk_wander.clear();
             for (int x = 0; x < 32; x++)
                 for (int y = 0; y < 8; y++)
                     if (!target_board[x][y] && !current_board[x][y])
-                        safe_cells.push_back({x, y});
-            if (!safe_cells.empty()) {
-                Point closest = find_closest(a.pos, safe_cells);
+                        tk_wander.push_back({x, y});
+            if (!tk_wander.empty()) {
+                Point closest = find_closest(a.pos, tk_wander);
                 a.current_path = find_path(a.pos, closest, i);
                 path_calculated_this_tick = true;
             }
@@ -590,9 +680,7 @@ public:
             if (a.bored_ticks >= 20) {
                 a.bored_ticks = 0;
                 if (std::rand() % 2 == 0) {
-                    // Pick one valid adjacent cell that is neither a placed pixel,
-                    // nor a targeted (soon-to-be-placed) pixel, nor another agent.
-                    std::vector<Point> valid_wander;
+                    tk_wander.clear();
                     for (int dx = -1; dx <= 1; dx++) {
                         for (int dy = -1; dy <= 1; dy++) {
                             if (dx == 0 && dy == 0) continue;
@@ -605,13 +693,13 @@ public:
                                         if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny)
                                             collision = true;
                                     }
-                                    if (!collision) valid_wander.push_back({nx, ny});
+                                    if (!collision) tk_wander.push_back({nx, ny});
                                 }
                             }
                         }
                     }
-                    if (!valid_wander.empty()) {
-                        a.current_path.push_back(valid_wander[std::rand() % valid_wander.size()]);
+                    if (!tk_wander.empty()) {
+                        a.current_path.push_back(tk_wander[std::rand() % tk_wander.size()]);
                     }
                 }
             }

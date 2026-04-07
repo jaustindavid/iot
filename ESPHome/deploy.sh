@@ -27,10 +27,10 @@ shift
 FLASH=false
 if [[ "${1:-}" == "--flash" ]]; then FLASH=true; fi
 
-RPI4_HOST="rpi4.local"                       # SSH target for scp/ssh
+RPI4_HOST="synog.local"                       # SSH target for scp/ssh
 FIRMWARE_DNS_HOST="stra2us.austindavid.com"  # DNS name the device uses to fetch binaries
 RPI4_USER="austin"
-RPI4_FIRMWARE_DIR="~/firmware"
+RPI4_FIRMWARE_DIR="stra2us/firmware"
 MANIFEST_FILE="${FIRMWARE_NAME}_manifest.json"
 
 # Device IP lookup (add entries here as the fleet grows)
@@ -87,7 +87,8 @@ EOF
 
 echo "==> Copying firmware to $RPI4_HOST:$RPI4_FIRMWARE_DIR ..."
 scp "$OTA_BIN" "$RPI4_USER@$RPI4_HOST:$RPI4_FIRMWARE_DIR/$FIRMWARE_NAME.ota.bin"
-echo "$MANIFEST" | ssh "$RPI4_USER@$RPI4_HOST" "cat > $RPI4_FIRMWARE_DIR/$MANIFEST_FILE"
+echo "$MANIFEST" > $MANIFEST_FILE  # | ssh "$RPI4_USER@$RPI4_HOST" "cat > $RPI4_FIRMWARE_DIR/$MANIFEST_FILE"
+scp "$MANIFEST_FILE" "$RPI4_USER@$RPI4_HOST:$RPI4_FIRMWARE_DIR/"
 
 echo "==> Manifest updated on $RPI4_HOST:"
 echo "$MANIFEST"

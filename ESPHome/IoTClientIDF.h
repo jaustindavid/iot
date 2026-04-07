@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ctime>
 #include <cerrno>
+#include <fcntl.h>       // O_NONBLOCK
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/md.h"
@@ -85,12 +86,42 @@ static int stra2us_publish(const char* host, int port,
     lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (lwip_connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    // Non-blocking connect with a hard 4s timeout.
+    // SO_SNDTIMEO is silently ignored by lwip_connect(); without this the call
+    // blocks until the TCP stack gives up (~75s), killing the ESPHome WDT.
+    int flags = lwip_fcntl(fd, F_GETFL, 0);
+    lwip_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int cr = lwip_connect(fd, res->ai_addr, res->ai_addrlen);
+    if (cr != 0 && errno != EINPROGRESS) {
         ESP_LOGE(STRA2US_TAG, "Connect failed to %s:%d (err %d)", host, port, errno);
         lwip_freeaddrinfo(res);
         lwip_close(fd);
         return -1;
     }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval conn_tv = {4, 0};  // 4s max — well inside 15s WDT budget
+    int sr = lwip_select(fd + 1, nullptr, &wfds, nullptr, &conn_tv);
+    if (sr <= 0) {
+        ESP_LOGE(STRA2US_TAG, "Connect timeout to %s:%d", host, port);
+        lwip_freeaddrinfo(res);
+        lwip_close(fd);
+        return -1;
+    }
+    int so_err = 0; socklen_t so_len = sizeof(so_err);
+    lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
+    if (so_err != 0) {
+        ESP_LOGE(STRA2US_TAG, "Connect refused %s:%d (%d)", host, port, so_err);
+        lwip_freeaddrinfo(res);
+        lwip_close(fd);
+        return -1;
+    }
+
+    // Restore blocking mode; SO_RCVTIMEO/SO_SNDTIMEO (5s) handle the rest.
+    lwip_fcntl(fd, F_SETFL, flags);
     lwip_freeaddrinfo(res);
 
     // Build HTTP/1.1 request

@@ -95,8 +95,15 @@ app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
 # Device API
 app.include_router(device_router, tags=["device"])
 
-# Mount Static UI (Protected via external .htaccess in production as specified by user)
-app.mount("/admin", StaticFiles(directory="src/static", html=True), name="static")
+# Mount Static UI
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app.mount("/admin", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True), name="static")
+
+# Mount Firmware OTA directory (provided via volume mount in Docker)
+FIRMWARE_DIR = "/firmware"
+if not os.path.exists(FIRMWARE_DIR):
+    os.makedirs(FIRMWARE_DIR, exist_ok=True)
+app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 
 @app.get("/health")
 def health_check():

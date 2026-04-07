@@ -2,7 +2,8 @@ substitutions:
   stra2us_client_id: !secret stra2us_client_id
   stra2us_secret_hex: !secret stra2us_secret_hex
   stra2us_host: !secret stra2us_host
-  firmware_host: !secret firmware_host
+  stra2us_port: !secret stra2us_port
+  firmware_url: !secret firmware_url
   project_version: !env_var ESPHOME_PROJECT_VERSION 0000.00.00.0000
 
 esphome:
@@ -24,6 +25,7 @@ esp32:
 
 # Enable Home Assistant API
 api:
+  reboot_timeout: 0s   # Default 15min timeout causes rst=SW when no HA client connects
   encryption:
     key: "ZkIcQPXumySkKDYUxq3PFE6oZxuMusI6gNv1VTd/Z98="
 
@@ -45,7 +47,7 @@ captive_portal:
 # version is available.  The manifest is served by a simple HTTP server on
 # rpi4 and updated by the deploy.sh script after each compile.
 http_request:
-  timeout: 30s
+  timeout: 10s
   useragent: esphome/bb32
 
 ota:
@@ -58,7 +60,7 @@ update:
   - platform: http_request
     id: firmware_update
     name: "bb32 Firmware"
-    source: "http://${firmware_host}:8080/bb32_manifest.json"
+    source: "${firmware_url}/bb32_manifest.json"
     update_interval: 300s
     on_update_available:
       - lambda: |-
@@ -70,6 +72,17 @@ update:
           }
           ESP_LOGI("ota", "Pull OTA: newer firmware available (%s), applying...",
                    x.latest_version.c_str());
+          char ota_msg[80];
+          snprintf(ota_msg, sizeof(ota_msg), "ota fw=%s->%s",
+                   ESPHOME_PROJECT_VERSION, x.latest_version.c_str());
+          stra2us_publish(
+            id(stra2us_host).c_str(),
+            id(stra2us_port),
+            id(stra2us_client_id).c_str(),
+            id(stra2us_secret_hex).c_str(),
+            "coaticlock",
+            ota_msg
+          );
           id(firmware_update).perform(false);
 
 # 1. Define the I2C bus on the Xiao pins
@@ -97,7 +110,7 @@ globals:
 
   - id: global_brightness
     type: float
-    initial_value: '1.0'
+    initial_value: '0.7'
 
   # --- Wobbly Time Settings ---
   # The clock always tries to display a time that is slightly ahead of reality.
@@ -131,7 +144,7 @@ globals:
     initial_value: '"${stra2us_host}"'
   - id: stra2us_port
     type: int
-    initial_value: '8000'
+    initial_value: '${stra2us_port}'
   - id: stra2us_client_id
     type: std::string
     initial_value: '"${stra2us_client_id}"'
@@ -238,7 +251,7 @@ sensor:
       then:
         - lambda: |-
             float target = x / 500.0f;
-            target = clamp(target, 0.1f, 1.0f);
+            target = clamp(target, 0.2f, 1.0f);
             // Simple low-pass filter: 20% new value, 80% old value
             id(global_brightness) = (target * 0.2f) + (id(global_brightness) * 0.8f);
 

@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  stra2us-iot:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stra2us-iot
+    ports:
+      - "8153:8153"
+    volumes:
+      # Map host firmware folder for OTA binaries
+      - ./firmware:/firmware
+      
+      # Map host data folder for Redis persistence
+      - ./redis_data:/data
+      
+      # Map host backend folder for the application software (checked out from GitHub)
+      - ./backend:/app
+    environment:
+      - REDIS_URL=redis://localhost:6379
+      - PYTHONPATH=/app/src
+    restart: unless-stopped
