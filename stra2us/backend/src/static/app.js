@@ -21,12 +21,13 @@ document.querySelectorAll('.nav-links a').forEach(link => {
     });
 });
 
-// Helper for HTTP requests
+// Helper for HTTP requests — returns {ok, status, data}
 async function fetchAPI(endpoint, method = 'GET', body = null) {
     const options = { method, headers: { 'Content-Type': 'application/json' } };
     if (body) options.body = JSON.stringify(body);
     const res = await fetch(`${API_BASE}${endpoint}`, options);
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
 }
 
 // Format Time
@@ -38,9 +39,9 @@ function formatTime(unixTime) {
 // 0. Redis Health Check
 async function checkRedisStatus() {
     try {
-        const data = await fetchAPI('/stats'); // Stats relies on Redis
-        updateStatus(true);
-        return data;
+        const { ok, data } = await fetchAPI('/stats');
+        updateStatus(ok);
+        return ok ? data : null;
     } catch (e) {
         updateStatus(false);
         return null;
@@ -100,20 +101,16 @@ async function fetchStats() {
 }
 
 async function peekData(type, keyId) {
-    const data = await fetchAPI(`/peek/${type}/${keyId}`);
-    
+    const { data } = await fetchAPI(`/peek/${type}/${keyId}`);
     const modal = document.getElementById('peekModal');
-    const title = document.getElementById('peekTitle');
+    document.getElementById('peekTitle').innerText = `Data: ${type}/${keyId}`;
     const code = document.getElementById('peekDataContent');
-    
-    title.innerText = `Data: ${type}/${keyId}`;
     if (data.status === 'empty') {
         code.innerText = 'Empty / Value Not Found';
     } else {
         const decoded = JSON.stringify(data.message, null, 2);
         code.innerText = `Decoded MessagePack:\n${decoded}\n\nHex Format:\n${data.hex}`;
     }
-    
     modal.style.display = 'block';
 }
 
@@ -145,7 +142,7 @@ function formatAclSummary(acl) {
 }
 
 async function fetchKeys() {
-    const clients = await fetchAPI('/keys');
+    const { data: clients } = await fetchAPI('/keys');
     allClientsData = {};
     clients.forEach(c => allClientsData[c.client_id] = c);
 
@@ -165,9 +162,14 @@ async function fetchKeys() {
 document.getElementById('keyForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const clientId = document.getElementById('newClientId').value.trim();
-    const res = await fetchAPI('/keys', 'POST', { client_id: clientId });
+    const { ok, data: res } = await fetchAPI('/keys', 'POST', { client_id: clientId });
 
     const display = document.getElementById('newSecretDisplay');
+    if (!ok) {
+        display.innerHTML = `<strong style="color:var(--accent-danger);">Error:</strong> ${res.detail || 'Unknown error'}`;
+        display.classList.remove('hidden');
+        return;
+    }
     display.innerHTML = `<strong>Success!</strong> Secret key generated.<br><br>
                          Client ID: <code>${res.client_id}</code><br>
                          Key (Hex): <code>${res.secret}</code><br><br>
@@ -259,9 +261,13 @@ function aclAddRule() {
 }
 
 async function saveAcl() {
-    await fetchAPI(`/keys/${aclEditingClientId}/acl`, 'PUT', {
+    const { ok, status, data } = await fetchAPI(`/keys/${aclEditingClientId}/acl`, 'PUT', {
         permissions: aclCurrentPermissions
     });
+    if (!ok) {
+        alert(`Save failed (HTTP ${status}): ${data.detail || JSON.stringify(data)}`);
+        return;
+    }
     closeAclModal();
     fetchKeys();
 }
@@ -273,7 +279,7 @@ document.getElementById('aclNewPrefix').addEventListener('keydown', e => {
 
 // 3. Activity Logs
 async function fetchLogs() {
-    const logs = await fetchAPI('/logs?limit=50');
+    const { data: logs } = await fetchAPI('/logs?limit=50');
     const tbody = document.getElementById('logsTableBody');
     tbody.innerHTML = logs.map(l => `
         <tr>
