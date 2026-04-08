@@ -64,12 +64,13 @@ struct CoatiAgent {
 };
 
 // ---- Wobbly Time ----
-// Tracks a virtual "display" time that stays 2-5 minutes ahead of real time.
+// Tracks a virtual "display" time that stays ahead of real time by a random
+// amount in [wobble_min_seconds, wobble_max_seconds].
 // It ticks faster when behind its target offset, slower when ahead.
 // Parameters are injected from YAML globals.
 struct WobblyTime {
-  int wobble_min_minutes;   // Min advance (e.g. 2)
-  int wobble_max_minutes;   // Max advance (e.g. 5)
+  int wobble_min_seconds;   // Min advance in seconds (e.g. 120)
+  int wobble_max_seconds;   // Max advance in seconds (e.g. 300)
   float fast_rate;          // Rate multiplier when catching up (e.g. 1.3)
   float slow_rate;          // Rate multiplier when ahead (e.g. 0.7)
 
@@ -79,15 +80,15 @@ struct WobblyTime {
   bool initialized;
 
   WobblyTime(int mn, int mx, float fast, float slow)
-    : wobble_min_minutes(mn), wobble_max_minutes(mx),
+    : wobble_min_seconds(mn), wobble_max_seconds(mx),
       fast_rate(fast), slow_rate(slow),
       target_offset_secs(0), virtual_epoch_secs(0),
       last_wall_ms(0), initialized(false) {}
 
   void seed(ESPTime real_now) {
-    // Pick initial random target in [min, max] minutes ahead
-    int range_secs = (wobble_max_minutes - wobble_min_minutes) * 60;
-    target_offset_secs = wobble_min_minutes * 60 + (rand() % (range_secs + 1));
+    // Pick initial random target in [min, max] seconds ahead
+    int range_secs = wobble_max_seconds - wobble_min_seconds;
+    target_offset_secs = wobble_min_seconds + (rand() % (range_secs + 1));
     virtual_epoch_secs = real_now.timestamp + target_offset_secs;
     last_wall_ms = millis();
     initialized = true;
@@ -113,8 +114,8 @@ struct WobblyTime {
 
     // If we've reached the target offset, pick a new target
     if (std::abs(current_offset - target_offset_secs) < 5.0) {
-      int range_secs = (wobble_max_minutes - wobble_min_minutes) * 60;
-      target_offset_secs = wobble_min_minutes * 60 + (rand() % (range_secs + 1));
+      int range_secs = wobble_max_seconds - wobble_min_seconds;
+      target_offset_secs = wobble_min_seconds + (rand() % (range_secs + 1));
     }
 
     return make_time(virtual_epoch_secs);

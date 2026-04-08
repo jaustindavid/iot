@@ -1,4 +1,5 @@
 substitutions:
+  name: bb32
   stra2us_client_id: !secret stra2us_client_id
   stra2us_secret_hex: !secret stra2us_secret_hex
   stra2us_host: !secret stra2us_host
@@ -11,8 +12,8 @@ substitutions:
   stratus_app: coaticlock
 
 esphome:
-  name: bb32
-  friendly_name: bb32
+  name: ${name}
+  friendly_name: ${name}
   project:
     name: coaticlock.bb32
     version: "${project_version}"
@@ -124,17 +125,17 @@ globals:
   # Cascade: device key (${stratus_app}/${name}/<id>) checked first,
   #          then app-wide default (${stratus_app}/<id>).
 
-  - id: wobble_min_minutes
+  - id: wobble_min_seconds
     type: int
-    initial_value: '2'
-    # stratus_key: ${stratus_app}/${name}/wobble_min_minutes
-    #              ${stratus_app}/wobble_min_minutes
+    initial_value: '120'
+    # stratus_key: ${stratus_app}/${name}/wobble_min_seconds
+    #              ${stratus_app}/wobble_min_seconds
 
-  - id: wobble_max_minutes
+  - id: wobble_max_seconds
     type: int
-    initial_value: '5'
-    # stratus_key: ${stratus_app}/${name}/wobble_max_minutes
-    #              ${stratus_app}/wobble_max_minutes
+    initial_value: '300'
+    # stratus_key: ${stratus_app}/${name}/wobble_max_seconds
+    #              ${stratus_app}/wobble_max_seconds
 
   # When the displayed time is behind its target, it runs this much faster than real time.
   - id: wobble_fast_rate
@@ -181,8 +182,8 @@ interval:
           // Initialize WobblyTime singleton on first run
           if (id(wobbly_ptr) == nullptr) {
             WobblyTime* wt = new WobblyTime(
-              id(wobble_min_minutes),
-              id(wobble_max_minutes),
+              id(wobble_min_seconds),
+              id(wobble_max_seconds),
               id(wobble_fast_rate),
               id(wobble_slow_rate)
             );
@@ -264,13 +265,13 @@ interval:
             kv_countdown = 4;  // next poll in 5 cycles
             char val[32];
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_min_minutes", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_min_minutes",         val, sizeof(val)))
-              id(wobble_min_minutes) = atoi(val);
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_min_seconds", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_min_seconds",         val, sizeof(val)))
+              id(wobble_min_seconds) = atoi(val);
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_max_minutes", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_max_minutes",         val, sizeof(val)))
-              id(wobble_max_minutes) = atoi(val);
+            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_max_seconds", val, sizeof(val))
+             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_max_seconds",         val, sizeof(val)))
+              id(wobble_max_seconds) = atoi(val);
 
             if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_fast_rate", val, sizeof(val))
              || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_fast_rate",         val, sizeof(val)))
