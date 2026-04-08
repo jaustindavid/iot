@@ -195,7 +195,13 @@ interval:
             WobblyTime* wt = (WobblyTime*)id(wobbly_ptr);
             auto real_now = id(sntp_time).now();
             if (!real_now.is_valid()) return;
-            
+
+            // Sync WobblyTime parameters from globals (updated by KV poll)
+            wt->wobble_min_seconds = id(wobble_min_seconds);
+            wt->wobble_max_seconds = id(wobble_max_seconds);
+            wt->fast_rate          = id(wobble_fast_rate);
+            wt->slow_rate          = id(wobble_slow_rate);
+
             // Advance virtual time and extract the display minute
             auto virtual_now = wt->advance(real_now);
             if (virtual_now.minute != id(engine_last_minute)) {
@@ -205,7 +211,7 @@ interval:
             }
           }
 
-  - interval: 60s
+  - interval: 30s
     then:
       - lambda: |-
           // --- Uptime report ---
@@ -238,15 +244,24 @@ interval:
           wifi_ap_record_t ap_info;
           int8_t rssi = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ? ap_info.rssi : 0;
 
+          // Current and target advance from WobblyTime
+          WobblyTime* wt_hb = (WobblyTime*)id(wobbly_ptr);
+          auto real_now_hb  = id(sntp_time).now();
+          int adv_cur = (wt_hb && wt_hb->initialized && real_now_hb.is_valid())
+                        ? (int)(wt_hb->virtual_epoch_secs - real_now_hb.timestamp) : -1;
+          int adv_tgt = wt_hb ? (int)wt_hb->target_offset_secs : -1;
+
           // Build report string
-          char report[160];
+          char report[192];
           snprintf(report, sizeof(report),
-            "up=%ud%uh%um heap=%lu heap_lo=%lu rssi=%d rst=%s fw=" ESPHOME_PROJECT_VERSION,
+            "up=%ud%uh%um heap=%lu heap_lo=%lu rssi=%d rst=%s fw=" ESPHOME_PROJECT_VERSION
+            " adv_cur=%d adv_tgt=%d",
             days, hrs, mins,
             (unsigned long)esp_get_free_heap_size(),
             (unsigned long)esp_get_minimum_free_heap_size(),
             (int)rssi,
-            rst
+            rst,
+            adv_cur, adv_tgt
           );
 
           const char* h   = id(stra2us_host).c_str();

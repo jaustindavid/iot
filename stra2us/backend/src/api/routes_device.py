@@ -161,7 +161,7 @@ async def read_kv(
     redis = get_redis_client()
     val = await redis.get(f"kv:{key}")
 
-    if not val:
+    if val is None:
         return {"status": "not_found"}
         
     return Response(content=val, media_type="application/x-msgpack")

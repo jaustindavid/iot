@@ -184,25 +184,39 @@ static int _s2_read_response(char* body_out, size_t body_out_len) {
     int body_have = total - hdr_len;
     const char* body_start = buf + hdr_len;
 
-    // Hand body to caller
+    // Hand body to caller — first from bytes already in buf alongside headers.
+    int body_filled = 0;
     if (body_out && body_out_len > 0 && body_have > 0) {
         int copy = (body_have < (int)body_out_len - 1)
                    ? body_have : (int)body_out_len - 1;
         memcpy(body_out, body_start, copy);
-        body_out[copy] = '\0';
+        body_filled = copy;
     }
 
-    // Drain any body bytes that didn't fit in buf, so the socket is clean
-    // for the next pipelined request.
+    // Read any remaining body bytes still in flight.
+    // Fill body_out first (handles the case where headers and body arrived in
+    // separate TCP packets — body_have==0 but content_length>0), then drain
+    // any overflow to trash so the socket is clean for the next request.
     int remaining = content_length - body_have;
-    char trash[64];
     while (remaining > 0) {
-        int n = lwip_recv(fd, trash,
-                          (remaining < (int)sizeof(trash))
-                              ? remaining : (int)sizeof(trash), 0);
-        if (n <= 0) { _s2_close(); return -1; }
-        remaining -= n;
+        if (body_out && body_out_len > 0 && body_filled < (int)body_out_len - 1) {
+            int space   = (int)body_out_len - 1 - body_filled;
+            int to_read = remaining < space ? remaining : space;
+            int n = lwip_recv(fd, body_out + body_filled, to_read, 0);
+            if (n <= 0) { _s2_close(); return -1; }
+            body_filled += n;
+            remaining   -= n;
+        } else {
+            char trash[64];
+            int to_read = remaining < (int)sizeof(trash) ? remaining : (int)sizeof(trash);
+            int n = lwip_recv(fd, trash, to_read, 0);
+            if (n <= 0) { _s2_close(); return -1; }
+            remaining -= n;
+        }
     }
+    if (body_out && body_out_len > 0)
+        body_out[body_filled] = '\0';
+
 
     return status;
 }
@@ -253,6 +267,15 @@ static int stra2us_publish(const char* host, int port,
     }
 
     int status = _s2_read_response(nullptr, 0);
+    if (status == -1) {
+        // The server closed the keepalive connection between our write and
+        // read (common after the 60 s idle gap between heartbeats). The send
+        // likely succeeded, but we can't confirm — resend on a fresh socket.
+        // Duplicate heartbeats are harmless for telemetry.
+        ESP_LOGW(STRA2US_TAG, "POST %s read failed, retrying on new socket", uri);
+        if (_s2_ensure_connected(host, port) >= 0 && _s2_send_all(req, req_len))
+            status = _s2_read_response(nullptr, 0);
+    }
     ESP_LOGI(STRA2US_TAG, "POST %s -> %d", uri, status);
     return status;
 }
@@ -302,34 +325,72 @@ static bool stra2us_kv_get(const char* host, int port,
     // msgpack-encoded {"status":"not_found"} map (miss).
     char body[64] = {};
     int status = _s2_read_response(body, sizeof(body));
+    if (status == -1) {
+        // Read failed after send — keepalive connection closed by server.
+        // Retry GET on a fresh socket; GETs are naturally idempotent.
+        ESP_LOGW(STRA2US_TAG, "GET %s read failed, retrying on new socket", uri);
+        if (_s2_ensure_connected(host, port) >= 0 && _s2_send_all(req, req_len))
+            status = _s2_read_response(body, sizeof(body));
+    }
     if (status != 200) {
         ESP_LOGW(STRA2US_TAG, "GET %s -> %d", uri, status);
         return false;
     }
 
     // Decode the msgpack response.
-    // Values written with text/plain are stored as msgpack strings:
+    // Strings (text/plain-encoded values):
     //   fixstr  0xa0..0xbf : 1-byte header, len in low 5 bits
-    //   str8    0xd9       : 2-byte header, len in next byte
-    //   str16   0xda       : 3-byte header, len in next 2 bytes (big-endian)
+    //   str8    0xd9       : 2-byte header
+    //   str16   0xda       : 3-byte header
+    // Integers (values stored as numeric types by some clients):
+    //   positive fixint 0x00..0x7f : value is the byte
+    //   uint8   0xcc, uint16 0xcd, uint32 0xce
+    //   int8    0xd0, int16  0xd1, int32  0xd2
+    //   negative fixint 0xe0..0xff
     // Anything else (e.g. fixmap 0x81 = {"status":"not_found"}) is a miss.
     uint8_t* b = (uint8_t*)body;
     const char* str_data = nullptr;
     int str_len = 0;
+    long long ival = 0;
+    bool is_int = false;
 
-    if ((b[0] & 0xe0) == 0xa0) {           // fixstr
+    if ((b[0] & 0xe0) == 0xa0) {        // fixstr
         str_len  = b[0] & 0x1f;
         str_data = body + 1;
-    } else if (b[0] == 0xd9) {             // str8
+    } else if (b[0] == 0xd9) {          // str8
         str_len  = b[1];
         str_data = body + 2;
-    } else if (b[0] == 0xda) {             // str16
+    } else if (b[0] == 0xda) {          // str16
         str_len  = ((uint16_t)b[1] << 8) | b[2];
         str_data = body + 3;
+    } else if (b[0] <= 0x7f) {          // positive fixint
+        ival = b[0]; is_int = true;
+    } else if (b[0] == 0xcc) {          // uint8
+        ival = b[1]; is_int = true;
+    } else if (b[0] == 0xcd) {          // uint16
+        ival = ((uint16_t)b[1] << 8) | b[2]; is_int = true;
+    } else if (b[0] == 0xce) {          // uint32
+        ival = ((uint32_t)b[1] << 24) | ((uint32_t)b[2] << 16)
+             | ((uint32_t)b[3] << 8)  |  b[4]; is_int = true;
+    } else if ((b[0] & 0xe0) == 0xe0) { // negative fixint
+        ival = (int8_t)b[0]; is_int = true;
+    } else if (b[0] == 0xd0) {          // int8
+        ival = (int8_t)b[1]; is_int = true;
+    } else if (b[0] == 0xd1) {          // int16
+        ival = (int16_t)(((uint16_t)b[1] << 8) | b[2]); is_int = true;
+    } else if (b[0] == 0xd2) {          // int32
+        ival = (int32_t)(((uint32_t)b[1] << 24) | ((uint32_t)b[2] << 16)
+                       | ((uint32_t)b[3] << 8)  |  b[4]); is_int = true;
     } else {
-        // Not a string — treat as not-found (catches the {"status":"not_found"} map)
+        // Not a string or integer — genuine not_found or unknown type.
         ESP_LOGI(STRA2US_TAG, "GET %s -> not_found", uri);
         return false;
+    }
+
+    if (is_int) {
+        snprintf(val_out, val_out_len, "%lld", ival);
+        ESP_LOGI(STRA2US_TAG, "GET %s -> \"%s\"", uri, val_out);
+        return true;
     }
 
     int copy = (str_len < (int)val_out_len - 1) ? str_len : (int)val_out_len - 1;
@@ -338,3 +399,4 @@ static bool stra2us_kv_get(const char* host, int port,
     ESP_LOGI(STRA2US_TAG, "GET %s -> \"%s\"", uri, val_out);
     return true;
 }
+

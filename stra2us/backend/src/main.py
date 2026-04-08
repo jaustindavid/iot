@@ -59,26 +59,32 @@ async def activity_log_middleware(request: Request, call_next):
         raise e
     finally:
         path = request.url.path
-        # Only log device data APIs, not admin dashboard or static files
-        if path.startswith("/q/") or path.startswith("/kv/"):
-            client_id = request.headers.get("X-Client-ID", "unknown")
-            method = request.method
-            action = f"{method} {path}"
-            
-            log_status = f"Success ({status})" if 200 <= status < 300 else f"Error ({status})"
-            
+        # Log device data APIs and firmware downloads
+        if path.startswith("/q/") or path.startswith("/kv/") or path.startswith("/firmware/"):
+            if path.startswith("/firmware/"):
+                client_id = request.client.host if request.client else "unknown"
+                log_status = (
+                    "Hit (200)"          if status == 200 else
+                    "Not Modified (304)" if status == 304 else
+                    f"Miss ({status})"
+                )
+            else:
+                client_id = request.headers.get("X-Client-ID", "unknown")
+                log_status = f"Success ({status})" if 200 <= status < 300 else f"Error ({status})"
+
             log_entry = {
                 "timestamp": int(time.time()),
                 "client_id": client_id,
-                "action": action,
-                "status": log_status
+                "action":    f"{request.method} {path}",
+                "status":    log_status,
             }
-            
+
             redis = get_redis_client()
             await redis.lpush("system:activity_log", msgpack.packb(log_entry))
             await redis.ltrim("system:activity_log", 0, 999)
-            
+
     return response
+
 
 # Allow CORS for development convenience
 app.add_middleware(

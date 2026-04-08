@@ -279,9 +279,11 @@ public:
           int nx = curr.x + dx, ny = curr.y + dy;
           if (nx < 0 || nx >= 32 || ny < 0 || ny >= 8) continue;
 
-          bool is_obstacle = current_board[nx][ny];
-          if (nx == dest.x && ny == dest.y) is_obstacle = false;
-          if (is_obstacle) continue;
+          // Lit pixels are passable but expensive — cost 50 ensures unlit
+          // paths are always preferred, while guaranteeing an escape route
+          // exists when an agent is surrounded by placed pixels.
+          float pixel_cost = (current_board[nx][ny] &&
+                              !(nx == dest.x && ny == dest.y)) ? 50.0f : 0.0f;
 
           float penalty = 0.0f;
           for (size_t j = 0; j < agents.size(); j++) {
@@ -292,7 +294,7 @@ public:
           }
 
           float step = (dx == 0 || dy == 0) ? 1.0f : 1.414f;
-          float nc = pf_cost[curr.x][curr.y] + step + penalty;
+          float nc = pf_cost[curr.x][curr.y] + step + penalty + pixel_cost;
           if (nc < pf_cost[nx][ny]) {
             pf_cost[nx][ny] = nc;
             pf_parent[nx][ny] = curr;
@@ -384,6 +386,22 @@ public:
                                     for (size_t j = 0; j < agents.size(); j++) {
                                         if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) clash = true;
                                     }
+                                    if (!clash) valid_escape.push_back({nx, ny});
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: if every clear neighbour is agent-blocked, allow
+                    // stepping onto a lit pixel to break the deadlock.
+                    if (valid_escape.empty()) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            for (int dy = -1; dy <= 1; dy++) {
+                                if (dx == 0 && dy == 0) continue;
+                                int nx = a.pos.x + dx, ny = a.pos.y + dy;
+                                if (nx >= 0 && nx < 32 && ny >= 0 && ny < 8) {
+                                    bool clash = false;
+                                    for (size_t j = 0; j < agents.size(); j++)
+                                        if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) clash = true;
                                     if (!clash) valid_escape.push_back({nx, ny});
                                 }
                             }
@@ -641,6 +659,21 @@ public:
                                 for (size_t j = 0; j < agents.size(); j++) {
                                     if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) collision = true;
                                 }
+                                if (!collision) valid_escape.push_back({nx, ny});
+                            }
+                        }
+                    }
+                }
+                // Fallback: allow stepping onto a lit pixel if entirely cornered.
+                if (valid_escape.empty()) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dy = -1; dy <= 1; dy++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = a.pos.x + dx, ny = a.pos.y + dy;
+                            if (nx >= 0 && nx < 32 && ny >= 0 && ny < 8) {
+                                bool collision = false;
+                                for (size_t j = 0; j < agents.size(); j++)
+                                    if (i != j && agents[j].pos.x == nx && agents[j].pos.y == ny) collision = true;
                                 if (!collision) valid_escape.push_back({nx, ny});
                             }
                         }
