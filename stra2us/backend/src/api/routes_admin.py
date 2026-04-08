@@ -12,7 +12,13 @@ router = APIRouter()
 
 class ClientCreate(BaseModel):
     client_id: str
-    acl_read_write: str = "*"
+
+class AclPermission(BaseModel):
+    prefix: str
+    access: str  # "r" or "rw"
+
+class AclUpdate(BaseModel):
+    permissions: List[AclPermission]
 
 class ClientBackupEntry(BaseModel):
     client_id: str
@@ -44,17 +50,25 @@ async def list_keys():
 async def create_client(client: ClientCreate):
     redis = get_redis_client()
     secret = generate_secret()
-    # Save secret
     await redis.set(f"client:{client.client_id}:secret", secret)
-    # Save ACL
-    acl = {"read_write": client.acl_read_write}
+    # New clients start with no permissions (deny-all); edit ACL separately.
+    acl = {"permissions": []}
     await redis.set(f"client:{client.client_id}:acl", json.dumps(acl))
-    
     return {
         "client_id": client.client_id,
         "secret": secret,
         "acl": acl
     }
+
+@router.put("/keys/{client_id}/acl")
+async def update_acl(client_id: str, acl_update: AclUpdate):
+    redis = get_redis_client()
+    existing = await redis.get(f"client:{client_id}:secret")
+    if not existing:
+        raise HTTPException(status_code=404, detail="Client not found")
+    acl = {"permissions": [p.dict() for p in acl_update.permissions]}
+    await redis.set(f"client:{client_id}:acl", json.dumps(acl))
+    return {"status": "ok", "client_id": client_id, "acl": acl}
 
 @router.delete("/keys/{client_id}")
 async def revoke_client(client_id: str):

@@ -46,15 +46,24 @@ async def verify_device_request(
         "acl": acl
     }
 
-async def check_acl(client_context: dict, requested_resource: str, mode: str = "read_write"):
-    # Simple ACL check: if mode is "read_only" and trying to write, reject.
-    # Pattern matching can be added if ACLs get complex.
+async def check_acl(client_context: dict, requested_resource: str, mode: str = "read"):
     acl = client_context["acl"]
-    if acl.get("read_write") == "*":
-        return True
-    
-    # Future: parse read_write or read_only fields
-    if "read_only" in acl and mode == "write":
-        raise HTTPException(status_code=403, detail="Forbidden: Write access denied")
-        
-    return True
+
+    # New ACL schema: {"permissions": [{"prefix": "...", "access": "r|rw"}, ...]}
+    # Strip the resource-type segment (q/ or kv/) — permissions are namespace-only.
+    resource_path = requested_resource
+    for type_prefix in ("q/", "kv/"):
+        if resource_path.startswith(type_prefix):
+            resource_path = resource_path[len(type_prefix):]
+            break
+
+    for perm in acl.get("permissions", []):
+        prefix = perm.get("prefix", "")
+        access = perm.get("access", "r")
+        # Match wildcard, exact, or prefix + "/" hierarchy
+        if prefix == "*" or resource_path == prefix or resource_path.startswith(prefix + "/"):
+            if mode == "write" and access != "rw":
+                raise HTTPException(status_code=403, detail="Forbidden: Write access denied")
+            return True
+
+    raise HTTPException(status_code=403, detail=f"Forbidden: No permission for '{requested_resource}'")

@@ -72,15 +72,10 @@
                 
                 <div class="card glass-panel form-card">
                     <h3>Register New Client</h3>
+                    <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:16px;">New clients start with no permissions. Set up access rules after registration.</p>
                     <form id="keyForm">
                         <div class="input-group">
-                            <input type="text" id="newClientId" placeholder="Device or Client ID (e.g. ESP32-Weather-01)" required>
-                        </div>
-                        <div class="input-group">
-                            <select id="aclSelect">
-                                <option value="*">Full Access (Read/Write)</option>
-                                <option value="read_only">Read-Only</option>
-                            </select>
+                            <input type="text" id="newClientId" placeholder="Device or Client ID (e.g. bb32)" required>
                         </div>
                         <button type="submit" class="primary-btn pulse-glow">Generate Secret Key</button>
                     </form>
@@ -104,6 +99,31 @@
                     </table>
                 </div>
             </section>
+
+            <!-- ACL Editor Modal -->
+            <div id="aclModal" class="modal">
+                <div class="modal-content glass-panel acl-modal-content">
+                    <span class="close-btn" id="aclModalClose">&times;</span>
+                    <h3>Permissions &mdash; <span id="aclClientName" style="color:var(--accent-blue);"></span></h3>
+                    <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:20px;">
+                        Default is <strong>deny-all</strong>. Rules are checked in order; first matching prefix wins.
+                        Prefix <code>coaticlock</code> covers both <code>q/coaticlock</code> and <code>kv/coaticlock/...</code>.
+                    </p>
+
+                    <div id="aclPermissionsList" class="acl-permissions-list"></div>
+
+                    <div class="acl-add-row">
+                        <input type="text" id="aclNewPrefix" placeholder="Prefix (e.g. coaticlock)" style="flex:1;">
+                        <button class="acl-access-toggle access-rw" id="aclNewAccessToggle" onclick="toggleNewAccess()">rw</button>
+                        <button class="btn-sm" onclick="aclAddRule()">+ Add Rule</button>
+                    </div>
+
+                    <div style="margin-top:24px; display:flex; gap:12px; justify-content:flex-end;">
+                        <button class="btn-sm" onclick="closeAclModal()">Cancel</button>
+                        <button class="primary-btn" onclick="saveAcl()">Save Permissions</button>
+                    </div>
+                </div>
+            </div>
 
             <!-- Topic Monitor View -->
             <section id="monitor" class="view">

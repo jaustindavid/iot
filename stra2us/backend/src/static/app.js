@@ -129,14 +129,33 @@ document.querySelector('.close-btn').addEventListener('click', () => {
 });
 
 // 2. Key Management
+let allClientsData = {};
+
+function formatAclSummary(acl) {
+    const perms = acl.permissions || [];
+    if (perms.length === 0)
+        return '<span class="badge" style="background:var(--accent-danger);color:#fff;">No Access</span>';
+    return perms.map(p =>
+        `<span class="badge" style="background:${p.access==='rw' ? 'rgba(0,240,255,0.15)' : 'rgba(138,43,226,0.15)'};
+               color:${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
+               border:1px solid ${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
+               font-size:0.75rem; margin-right:4px;">
+            ${p.prefix}&thinsp;:&thinsp;${p.access}</span>`
+    ).join('');
+}
+
 async function fetchKeys() {
     const clients = await fetchAPI('/keys');
+    allClientsData = {};
+    clients.forEach(c => allClientsData[c.client_id] = c);
+
     const tbody = document.getElementById('clientsTableBody');
     tbody.innerHTML = clients.map(c => `
         <tr>
             <td><strong>${c.client_id}</strong></td>
-            <td><span class="badge">${c.acl.read_write === '*' ? 'Full Access' : c.acl.read_write}</span></td>
-            <td>
+            <td>${formatAclSummary(c.acl)}</td>
+            <td style="white-space:nowrap;">
+                <button class="btn-sm" onclick="openAclModal('${c.client_id}')">Edit ACL</button>
                 <button class="btn-sm danger" onclick="revokeClient('${c.client_id}')">Revoke</button>
             </td>
         </tr>
@@ -145,18 +164,16 @@ async function fetchKeys() {
 
 document.getElementById('keyForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const clientId = document.getElementById('newClientId').value;
-    const acl = document.getElementById('aclSelect').value;
-    
-    const res = await fetchAPI('/keys', 'POST', { client_id: clientId, acl_read_write: acl });
-    
+    const clientId = document.getElementById('newClientId').value.trim();
+    const res = await fetchAPI('/keys', 'POST', { client_id: clientId });
+
     const display = document.getElementById('newSecretDisplay');
     display.innerHTML = `<strong>Success!</strong> Secret key generated.<br><br>
                          Client ID: <code>${res.client_id}</code><br>
                          Key (Hex): <code>${res.secret}</code><br><br>
-                         <small style="color:var(--accent-danger);">Warning: This key will not be displayed again.</small>`;
+                         <small style="color:var(--accent-danger);">Warning: This key will not be displayed again.</small><br><br>
+                         <small style="color:var(--text-muted);">Client has <strong>no access</strong> by default. Click Edit ACL to add permissions.</small>`;
     display.classList.remove('hidden');
-    
     document.getElementById('newClientId').value = '';
     fetchKeys();
 });
@@ -166,6 +183,93 @@ async function revokeClient(id) {
     await fetchAPI(`/keys/${id}`, 'DELETE');
     fetchKeys();
 }
+
+// --- ACL Editor ---
+let aclEditingClientId = null;
+let aclCurrentPermissions = [];
+let aclNewAccess = 'rw';
+
+function openAclModal(clientId) {
+    const client = allClientsData[clientId];
+    aclEditingClientId = clientId;
+    aclCurrentPermissions = ((client.acl || {}).permissions || []).map(p => ({...p}));
+    aclNewAccess = 'rw';
+
+    document.getElementById('aclClientName').textContent = clientId;
+    document.getElementById('aclNewPrefix').value = '';
+    const toggle = document.getElementById('aclNewAccessToggle');
+    toggle.textContent = 'rw';
+    toggle.className = 'acl-access-toggle access-rw';
+
+    renderAclPermissions();
+    document.getElementById('aclModal').style.display = 'block';
+}
+
+function closeAclModal() {
+    document.getElementById('aclModal').style.display = 'none';
+    aclEditingClientId = null;
+    aclCurrentPermissions = [];
+}
+
+function renderAclPermissions() {
+    const list = document.getElementById('aclPermissionsList');
+    if (aclCurrentPermissions.length === 0) {
+        list.innerHTML = '<div class="text-muted acl-empty">No rules &mdash; client has no access to anything.</div>';
+        return;
+    }
+    list.innerHTML = aclCurrentPermissions.map((p, i) => `
+        <div class="acl-rule-row">
+            <span class="acl-prefix-label">${p.prefix}</span>
+            <button class="acl-access-toggle ${p.access === 'rw' ? 'access-rw' : 'access-r'}"
+                    onclick="aclToggleAccess(${i})">${p.access}</button>
+            <button class="btn-sm danger" onclick="aclRemoveRule(${i})">&#x2715;</button>
+        </div>
+    `).join('');
+}
+
+function aclToggleAccess(index) {
+    aclCurrentPermissions[index].access =
+        aclCurrentPermissions[index].access === 'rw' ? 'r' : 'rw';
+    renderAclPermissions();
+}
+
+function aclRemoveRule(index) {
+    aclCurrentPermissions.splice(index, 1);
+    renderAclPermissions();
+}
+
+function toggleNewAccess() {
+    aclNewAccess = aclNewAccess === 'rw' ? 'r' : 'rw';
+    const btn = document.getElementById('aclNewAccessToggle');
+    btn.textContent = aclNewAccess;
+    btn.className = `acl-access-toggle ${aclNewAccess === 'rw' ? 'access-rw' : 'access-r'}`;
+}
+
+function aclAddRule() {
+    const prefix = document.getElementById('aclNewPrefix').value.trim();
+    if (!prefix) { document.getElementById('aclNewPrefix').focus(); return; }
+    // Prevent duplicates
+    if (aclCurrentPermissions.some(p => p.prefix === prefix)) {
+        document.getElementById('aclNewPrefix').select();
+        return;
+    }
+    aclCurrentPermissions.push({ prefix, access: aclNewAccess });
+    document.getElementById('aclNewPrefix').value = '';
+    renderAclPermissions();
+}
+
+async function saveAcl() {
+    await fetchAPI(`/keys/${aclEditingClientId}/acl`, 'PUT', {
+        permissions: aclCurrentPermissions
+    });
+    closeAclModal();
+    fetchKeys();
+}
+
+document.getElementById('aclModalClose').addEventListener('click', closeAclModal);
+document.getElementById('aclNewPrefix').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); aclAddRule(); }
+});
 
 // 3. Activity Logs
 async function fetchLogs() {
