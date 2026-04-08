@@ -57,6 +57,7 @@ struct CoatiAgent {
   int wash_ticks = 0;  // > 0: currently dunking at pool (counts down each tick)
   bool washed = false; // true: this carry has been washed, ready to place
   int pause_ticks = 0; // > 0: frozen after pickup/placement (counts down each tick)
+  int stuck_ticks = 0; // watchdog: increments when agent makes no progress
 
   CoatiAgent(Point p, Point lp, bool c, std::vector<Point> path, Point target, int w, int b)
       : pos(p), last_pos(lp), carrying(c) , current_path(path), claimed_target(target), wait_ticks(w), bored_ticks(b) {}
@@ -332,6 +333,32 @@ public:
   }
 
   void tick() {
+    // Periodic status summary — one line every ~30 s (600 ticks at 20 Hz).
+    // Tells you exactly where each agent is and what it is doing without
+    // producing noise during normal operation.
+    static int tick_count = 0;
+    if (++tick_count >= 600) {
+        tick_count = 0;
+        int extras = 0, missing = 0;
+        for (int x = 0; x < 32; x++) for (int y = 0; y < 8; y++) {
+            if (current_board[x][y] && !target_board[x][y]) extras++;
+            if (!current_board[x][y] && target_board[x][y]) missing++;
+        }
+        for (size_t i = 0; i < agents.size(); i++) {
+            auto& a = agents[i];
+            const char* phase = "idle";
+            if (a.carrying && !a.washed)  phase = "washing";
+            else if (a.carrying)           phase = "placing";
+            else if (!a.current_path.empty()) phase = "moving";
+            else if (a.pause_ticks > 0)    phase = "paused";
+            ESP_LOGI("coati", "[%d] (%d,%d) %s carry=%d washed=%d path=%d wait=%d stuck=%d | ext=%d mis=%d pool=%d",
+                (int)i, a.pos.x, a.pos.y, phase,
+                (int)a.carrying, (int)a.washed,
+                (int)a.current_path.size(), a.wait_ticks, a.stuck_ticks,
+                extras, missing, pool_user);
+        }
+    }
+
     tk_extras.clear();
     tk_missing.clear();
     
@@ -349,6 +376,18 @@ public:
           tk_missing.push_back({x, y});
         }
       }
+    }
+
+    // Pool-user watchdog: if the pool owner is no longer at the pool and has
+    // no wash ticks active, the lock is permanently stale — release it.
+    if (pool_user != -1) {
+        CoatiAgent& owner = agents[pool_user];
+        bool at_pool = false;
+        for (auto& p : pool) if (owner.pos == p) at_pool = true;
+        if (!at_pool && owner.wash_ticks == 0) {
+            ESP_LOGW("coati", "POOL WATCHDOG: releasing stale pool_user=%d", pool_user);
+            pool_user = -1;
+        }
     }
 
     // Process agents sequentially
@@ -409,7 +448,13 @@ public:
                     }
                     if (!valid_escape.empty()) {
                         int r = std::rand() % valid_escape.size();
-                        a.current_path.push_back(valid_escape[r]);
+                        Point esc = valid_escape[r];
+                        a.current_path.push_back(esc);
+                        ESP_LOGW("coati", "DEADLOCK RETREAT [%d] (%d,%d)->(%d,%d) carry=%d",
+                            (int)i, a.pos.x, a.pos.y, esc.x, esc.y, (int)a.carrying);
+                    } else {
+                        ESP_LOGW("coati", "DEADLOCK RETREAT [%d] (%d,%d) CORNERED, no escape",
+                            (int)i, a.pos.x, a.pos.y);
                     }
                     
                     a.claimed_target = {-1, -1};
@@ -422,6 +467,7 @@ public:
             a.pos = next_step;
             a.current_path.erase(a.current_path.begin());
             a.wait_ticks = 0;
+            a.stuck_ticks = 0;  // made progress
             continue; // We made our physical step, allow next agent to move
         }
     }
@@ -466,7 +512,7 @@ public:
                         a.washed = true;
                         if (pool_user == (int)i) pool_user = -1;
                         a.claimed_target = {-1, -1};
-                        ESP_LOGD("coati", "WASHED [%d] done", (int)i);
+                        ESP_LOGI("coati", "WASHED [%d] done at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                     } else {
                         // Queue next bob step: emerge (y-1) or dunk (pool.y)
                         Point spot = pool[i % pool.size()];
@@ -486,7 +532,7 @@ public:
                         a.wash_ticks = 5;  // 2.5 bobs (5 half-steps)
                         Point spot = pool[i % pool.size()];
                         a.current_path = {{spot.x, spot.y - 1}};  // first emerge
-                        ESP_LOGD("coati", "WASHING [%d] starting", (int)i);
+                        ESP_LOGI("coati", "WASHING [%d] starting at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                     }
                     // else pool busy — wait in place this tick
                     continue;
@@ -504,8 +550,8 @@ public:
                     continue;  // has a path, no need for escape logic
                 } else {
                     // Pool is busy: wander nearby rather than crowding the approach.
-                    // Do NOT continue here — fall through to panic escape logic below
-                    // so two agents waiting for the pool can break a mutual deadlock.
+                    // Clear stale claimed_target so the panic escape check below can fire.
+                    a.claimed_target = {-1, -1};
                     a.bored_ticks++;
                     if (a.bored_ticks >= 8) {
                         a.bored_ticks = 0;
@@ -549,7 +595,7 @@ public:
                 a.washed = false;
                 a.claimed_target = {-1, -1};
                 a.pause_ticks = 4;  // Pause to "place" daintily
-                ESP_LOGD("coati", "PLACE [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
+                ESP_LOGI("coati", "PLACE [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                 continue;
             } else if (standing_on_pool) {
                 // No reachable missing slots — dispose
@@ -559,7 +605,7 @@ public:
                     a.carrying = false;
                     a.washed = false;
                     a.claimed_target = {-1, -1};
-                    ESP_LOGD("coati", "DISPOSE [%d] at pool", (int)i);
+                    ESP_LOGI("coati", "DISPOSE [%d] at pool (%d,%d)", (int)i, a.pos.x, a.pos.y);
                     continue;
                 }
             }
@@ -600,13 +646,13 @@ public:
                 a.carrying = true;
                 a.claimed_target = {-1, -1};
                 a.pause_ticks = 4;  // Pause to "pick up" daintily
-                ESP_LOGD("coati", "PICKUP [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
+                ESP_LOGI("coati", "PICKUP [%d] pixel at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                 continue;
             } else if (standing_on_dumpster && !tk_avail_m.empty()) {
                 a.carrying = true;
                 a.claimed_target = {-1, -1};
                 a.pause_ticks = 4;  // Pause to "fetch" daintily
-                ESP_LOGD("coati", "FETCH [%d] from dumpster", (int)i);
+                ESP_LOGI("coati", "FETCH [%d] from dumpster at (%d,%d)", (int)i, a.pos.x, a.pos.y);
                 continue;
             }
             
@@ -681,9 +727,49 @@ public:
                 }
                 if (!valid_escape.empty()) {
                     int r = std::rand() % valid_escape.size();
-                    a.current_path.push_back(valid_escape[r]); // Take one blind random step
+                    Point esc = valid_escape[r];
+                    a.current_path.push_back(esc);
+                    ESP_LOGW("coati", "PANIC ESCAPE [%d] (%d,%d)->(%d,%d) carry=%d wait was %d",
+                        (int)i, a.pos.x, a.pos.y, esc.x, esc.y, (int)a.carrying, a.wait_ticks);
+                } else {
+                    ESP_LOGW("coati", "PANIC ESCAPE [%d] (%d,%d) CORNERED, no escape carry=%d",
+                        (int)i, a.pos.x, a.pos.y, (int)a.carrying);
                 }
             }
+        }
+
+        // --- Stuck Watchdog ---
+        // If an agent reaches the end of Phase 2 without having taken a step
+        // or queued a path this tick, increment stuck_ticks. After ~10 seconds
+        // (200 ticks at 20 Hz) of this, perform a full state reset on the agent
+        // as a last resort to break any unforeseen deadlock.
+        if (a.current_path.empty() && a.pos == a.last_pos) {
+            a.stuck_ticks++;
+            // Early warning at ~2.5 s — lets you see something is wrong well
+            // before the 10 s hard reset fires.
+            if (a.stuck_ticks == 50) {
+                const char* phase = "idle";
+                if (a.carrying && !a.washed)  phase = "washing";
+                else if (a.carrying)           phase = "placing";
+                ESP_LOGW("coati", "STUCK EARLY [%d] (%d,%d) %s carry=%d washed=%d claimed=(%d,%d) pool=%d",
+                    (int)i, a.pos.x, a.pos.y, phase,
+                    (int)a.carrying, (int)a.washed,
+                    a.claimed_target.x, a.claimed_target.y, pool_user);
+            }
+            if (a.stuck_ticks > 200) {
+                ESP_LOGW("coati", "STUCK WATCHDOG [%d]: hard reset after %d ticks", (int)i, a.stuck_ticks);
+                a.stuck_ticks = 0;
+                a.claimed_target = {-1, -1};
+                a.wait_ticks = 0;
+                a.bored_ticks = 0;
+                a.wash_ticks = 0;
+                a.washed = false;
+                a.pause_ticks = 0;
+                a.carrying = false;
+                if (pool_user == (int)i) pool_user = -1;
+            }
+        } else {
+            a.stuck_ticks = 0;
         }
 
         // --- "Floor is Lava" Escape ---
@@ -703,6 +789,10 @@ public:
                 Point closest = find_closest(a.pos, tk_wander);
                 a.current_path = find_path(a.pos, closest, i);
                 path_calculated_this_tick = true;
+                ESP_LOGI("coati", "LAVA ESCAPE [%d] (%d,%d)->(%d,%d)",
+                    (int)i, a.pos.x, a.pos.y, closest.x, closest.y);
+            } else {
+                ESP_LOGW("coati", "LAVA ESCAPE [%d] (%d,%d) TRAPPED, no safe cell", (int)i, a.pos.x, a.pos.y);
             }
             continue;
         }

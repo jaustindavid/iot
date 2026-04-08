@@ -303,10 +303,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            float target = x / 500.0f;
+            // Sqrt curve: compensates for eye log-scale response and pushes
+            // more brightness into the mid-lux range (a "kinda bright" room
+            // at 250 lux now targets ~71% instead of the previous 50%).
+            float target = sqrtf(x / 500.0f);
             target = clamp(target, 0.2f, 1.0f);
-            // Simple low-pass filter: 20% new value, 80% old value
-            id(global_brightness) = (target * 0.2f) + (id(global_brightness) * 0.8f);
+            // Low-pass filter: 30% new / 70% old (~60s to 90% of a step change,
+            // down from ~100s with the previous 20/80 split).
+            id(global_brightness) = (target * 0.3f) + (id(global_brightness) * 0.7f);
 
 light:
   - platform: esp32_rmt_led_strip
@@ -435,6 +439,10 @@ display:
         }
       }
 
-# Ensure logger is present
+# Logging — baud_rate: 0 disables UART (nothing to read over USB anyway).
+# Logs still stream over the native API: `esphome logs bb32.yaml`
+# Level INFO keeps coati state transitions visible without the LOGD flood
+# from ESPHome's own internal components.
 logger:
-  level: DEBUG
+  baud_rate: 0
+  level: INFO
