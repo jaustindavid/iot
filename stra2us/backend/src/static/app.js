@@ -77,7 +77,8 @@ async function fetchStats() {
     document.getElementById('kvCount').innerText = data.kvs.length;
 
     const qList = document.getElementById('queueList');
-    qList.innerHTML = data.queues.map(q => `
+    const sortedQueues = [...data.queues].sort((a, b) => a.topic.localeCompare(b.topic));
+    qList.innerHTML = sortedQueues.map(q => `
         <div class="data-item">
             <div><strong>${q.topic}</strong> (Msg Count: ${q.count})</div>
             <div>
@@ -89,7 +90,8 @@ async function fetchStats() {
     `).join('') || '<div class="text-muted">No active queues</div>';
 
     const kvList = document.getElementById('kvList');
-    kvList.innerHTML = data.kvs.map(k => `
+    const sortedKvs = [...data.kvs].sort((a, b) => a.key.localeCompare(b.key));
+    kvList.innerHTML = sortedKvs.map(k => `
         <div class="data-item">
             <div><strong>${k.key}</strong></div>
             <div>
@@ -147,7 +149,8 @@ async function fetchKeys() {
     clients.forEach(c => allClientsData[c.client_id] = c);
 
     const tbody = document.getElementById('clientsTableBody');
-    tbody.innerHTML = clients.map(c => `
+    const sortedClients = [...clients].sort((a, b) => a.client_id.localeCompare(b.client_id));
+    tbody.innerHTML = sortedClients.map(c => `
         <tr>
             <td><strong>${c.client_id}</strong></td>
             <td>${formatAclSummary(c.acl)}</td>

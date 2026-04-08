@@ -66,7 +66,7 @@ update:
     id: firmware_update
     name: "bb32 Firmware"
     source: "${firmware_url}/bb32_manifest.json"
-    update_interval: 300s
+    update_interval: 12h
     on_update_available:
       - lambda: |-
           // Never auto-update a dev build — it would immediately revert to the
@@ -211,7 +211,7 @@ interval:
             }
           }
 
-  - interval: 30s
+  - interval: 300s
     then:
       - lambda: |-
           // --- Uptime report ---
@@ -272,33 +272,26 @@ interval:
           // Heartbeat publish — opens (or reuses) the persistent socket.
           stra2us_publish(h, p, cid, sec, "${stratus_app}", report);
 
-          // --- Stra2us config poll (every 5 heartbeats = ~5 minutes) ---
+          // --- Stra2us config poll ---
           // Runs immediately after the publish so the socket is already open.
           // Cascade: device-specific key checked first, app-wide default second.
-          static uint8_t kv_countdown = 0;
-          if (kv_countdown == 0) {
-            kv_countdown = 4;  // next poll in 5 cycles
-            char val[32];
+          char val[32];
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_min_seconds", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_min_seconds",         val, sizeof(val)))
-              id(wobble_min_seconds) = atoi(val);
+          if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_min_seconds", val, sizeof(val))
+           || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_min_seconds",         val, sizeof(val)))
+            id(wobble_min_seconds) = atoi(val);
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_max_seconds", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_max_seconds",         val, sizeof(val)))
-              id(wobble_max_seconds) = atoi(val);
+          if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_max_seconds", val, sizeof(val))
+           || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_max_seconds",         val, sizeof(val)))
+            id(wobble_max_seconds) = atoi(val);
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_fast_rate", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_fast_rate",         val, sizeof(val)))
-              id(wobble_fast_rate) = atof(val);
+          if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_fast_rate", val, sizeof(val))
+           || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_fast_rate",         val, sizeof(val)))
+            id(wobble_fast_rate) = atof(val);
 
-            if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_slow_rate", val, sizeof(val))
-             || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_slow_rate",         val, sizeof(val)))
-              id(wobble_slow_rate) = atof(val);
-
-          } else {
-            kv_countdown--;
-          }
+          if (stra2us_kv_get(h, p, cid, sec, "${stratus_app}/${name}/wobble_slow_rate", val, sizeof(val))
+           || stra2us_kv_get(h, p, cid, sec, "${stratus_app}/wobble_slow_rate",         val, sizeof(val)))
+            id(wobble_slow_rate) = atof(val);
 
 # 2. Define the Light Sensor and Auto-Dimming logic
 sensor:
