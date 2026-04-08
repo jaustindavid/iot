@@ -50,6 +50,21 @@ a { text-decoration: none; color: inherit; }
     margin-bottom: 20px;
 }
 
+.sidebar-logo {
+    width: 48px;
+    height: 48px;
+    object-fit: contain;
+    flex-shrink: 0;
+}
+
+.sidebar-header h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: 0.01em;
+}
+
+
 .system-status {
     background: rgba(0, 0, 0, 0.3);
     padding: 10px 15px;
