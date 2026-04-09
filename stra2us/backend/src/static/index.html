@@ -44,7 +44,7 @@
                         <div class="card-content" id="queueList"></div>
                     </div>
                     <div class="stat-card kv-card">
-                        <h3>Persistent KV Pairs <span id="kvCount" class="badge">0</span></h3>
+                        <h3>Persistent KV Pairs <span id="kvCount" class="badge">0</span> <button class="btn-sm" style="float:right; margin-top:-4px;" onclick="openKvModal()">+ Add</button></h3>
                         <div class="card-content" id="kvList"></div>
                     </div>
                 </div>
@@ -56,6 +56,26 @@
                         <h3 id="peekTitle">Peek Data</h3>
                         <div class="code-block-wrapper">
                             <pre><code id="peekDataContent"></code></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- KV Editor Modal -->
+                <div id="kvModal" class="modal">
+                    <div class="modal-content glass-panel" style="max-width: 500px;">
+                        <span class="close-btn" onclick="closeKvModal()">&times;</span>
+                        <h3 id="kvModalTitle">Add KV Pair</h3>
+                        <div class="input-group" style="margin-top: 16px;">
+                            <label style="color:var(--text-muted); font-size:0.85rem; margin-bottom:4px; display:block;">Key Path</label>
+                            <input type="text" id="kvKeyInput" placeholder="e.g. coaticlock/min_brightness">
+                        </div>
+                        <div class="input-group" style="margin-top: 12px;">
+                            <label style="color:var(--text-muted); font-size:0.85rem; margin-bottom:4px; display:block;">Value (Number, Float, or String)</label>
+                            <input type="text" id="kvValueInput" placeholder="e.g. 0.1">
+                        </div>
+                        <div style="margin-top:24px; display:flex; justify-content:flex-end; gap:12px;">
+                            <button class="btn-sm" onclick="closeKvModal()">Cancel</button>
+                            <button class="primary-btn" onclick="saveKv()">Save</button>
                         </div>
                     </div>
                 </div>

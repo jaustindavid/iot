@@ -13,6 +13,9 @@ router = APIRouter()
 class ClientCreate(BaseModel):
     client_id: str
 
+class KVPayload(BaseModel):
+    value: str
+
 class AclPermission(BaseModel):
     prefix: str
     access: str  # "r" or "rw"
@@ -127,6 +130,17 @@ async def peek_kv(key: str):
         return {"status": "ok", "message": decoded, "hex": msg.hex()}
     except Exception:
         return {"status": "ok", "message": "unparseable_msgpack", "hex": msg.hex()}
+
+@router.post("/kv/{key:path}")
+async def set_kv(key: str, payload: KVPayload):
+    redis = get_redis_client()
+    try:
+        data = json.loads(payload.value)
+    except ValueError:
+        data = payload.value
+    packed = msgpack.packb(data)
+    await redis.set(f"kv:{key}", packed)
+    return {"status": "ok"}
 
 @router.delete("/kv/{key:path}")
 async def delete_kv(key: str):

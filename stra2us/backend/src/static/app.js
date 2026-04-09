@@ -95,6 +95,7 @@ async function fetchStats() {
         <div class="data-item">
             <div><strong>${k.key}</strong></div>
             <div>
+                <button class="btn-sm" onclick="editData('kv', '${k.key}')">Edit</button>
                 <button class="btn-sm" onclick="peekData('kv', '${k.key}')">Read</button>
                 <button class="btn-sm danger" onclick="deleteData('kv', '${k.key}')">Delete</button>
             </div>
@@ -123,9 +124,53 @@ async function deleteData(type, keyId) {
 }
 
 // Close Modal
-document.querySelector('.close-btn').addEventListener('click', () => {
-    document.getElementById('peekModal').style.display = 'none';
+document.querySelectorAll('.close-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        const modal = e.target.closest('.modal');
+        if (modal) modal.style.display = 'none';
+        if (modal.id === 'aclModal') closeAclModal();
+    });
 });
+
+// KV Management
+function openKvModal(key = '', val = '') {
+    document.getElementById('kvKeyInput').value = key;
+    document.getElementById('kvValueInput').value = val;
+    document.getElementById('kvModalTitle').innerText = key ? 'Edit KV Pair' : 'Add KV Pair';
+    document.getElementById('kvKeyInput').disabled = !!key; // Disable modifying the key if editing
+    document.getElementById('kvKeyInput').style.opacity = key ? '0.6' : '1';
+    document.getElementById('kvModal').style.display = 'block';
+}
+
+function closeKvModal() {
+    document.getElementById('kvModal').style.display = 'none';
+}
+
+async function editData(type, keyId) {
+    if (type !== 'kv') return;
+    const { data } = await fetchAPI(`/peek/kv/${keyId}`);
+    if (data.status === 'ok') {
+        const val = typeof data.message === 'object' ? JSON.stringify(data.message) : String(data.message);
+        openKvModal(keyId, val);
+    }
+}
+
+async function saveKv() {
+    const key = document.getElementById('kvKeyInput').value.trim();
+    const val = document.getElementById('kvValueInput').value.trim();
+    if (!key || val === '') {
+        alert("Both Key and Value are required.");
+        return;
+    }
+    const { ok, status } = await fetchAPI(`/kv/${key}`, 'POST', { value: val });
+    if (!ok) {
+        alert(`Failed to save KV pair (HTTP ${status})`);
+        return;
+    }
+    closeKvModal();
+    fetchStats();
+}
+
 
 // 2. Key Management
 let allClientsData = {};
