@@ -355,10 +355,22 @@ void CoatiEngine::tick() {
                 a.claimed_target = dest;
                 path_calculated = true;
             } else {
+                bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
+                bool standing_on_pool = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == GRID_WIDTH - 2 || a.pos.x == GRID_WIDTH - 1));
                 bool floor_is_lava = current_board[a.pos.x][a.pos.y] && (a.pos.y != GRID_HEIGHT - 1);
-                if (floor_is_lava) {
-                    Log.info("Agent %d: Floor is Lava! Escaping to ground.", (int)i);
-                    Point dest = { a.pos.x, GRID_HEIGHT - 1 };
+                
+                if (floor_is_lava || standing_on_dumpster || standing_on_pool) {
+                    Point dest;
+                    if (standing_on_dumpster) {
+                        dest = {2, GRID_HEIGHT - 1};
+                    } else if (standing_on_pool) {
+                        dest = {GRID_WIDTH - 3, GRID_HEIGHT - 1};
+                    } else {
+                        dest = { a.pos.x, GRID_HEIGHT - 1 };
+                        // Only divert the landing spot if it happens to fall exactly on the endpoints
+                        if (dest.x == 0 || dest.x == 1) dest.x = 2;
+                        if (dest.x == GRID_WIDTH - 2 || dest.x == GRID_WIDTH - 1) dest.x = GRID_WIDTH - 3;
+                    }
                     a.current_path = find_path(a.pos, dest, (int)i);
                     path_calculated = true;
                 } else {
@@ -367,7 +379,10 @@ void CoatiEngine::tick() {
                         if (rand() % 2 == 0) {
                             int nx = a.pos.x + (rand() % 3 - 1);
                             if (nx >= 0 && nx < GRID_WIDTH && a.pos.y == GRID_HEIGHT - 1) {
-                                a.current_path = {{nx, GRID_HEIGHT - 1}};
+                                bool is_dumpster_or_pool = (nx == 0 || nx == 1 || nx == GRID_WIDTH - 2 || nx == GRID_WIDTH - 1);
+                                if (!is_dumpster_or_pool) {
+                                    a.current_path = {{nx, GRID_HEIGHT - 1}};
+                                }
                             }
                         }
                         a.bored_ticks = 0;
