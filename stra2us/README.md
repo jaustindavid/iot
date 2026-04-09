@@ -72,6 +72,7 @@ Full API documentation is in [`docs/api.md`](docs/api.md).
 | `GET /kv/{key}` | HMAC | Read a persistent KV value |
 | `GET /api/admin/keys/backup` | Admin | Download all client credentials as JSON |
 | `POST /api/admin/keys/restore` | Admin | Restore credentials from a backup file |
+| `POST /api/admin/kv/{key}` | Admin | Create or modify a persistent KV value (Frontend Endpoint) |
 
 Both `/q/` and `/kv/` accept `Content-Type: application/x-msgpack` (default) or `Content-Type: text/plain` (server wraps the string in MessagePack automatically).
 
