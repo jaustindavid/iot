@@ -6,6 +6,8 @@ DEVICES := $(basename $(filter-out device_name.h, $(wildcard *.h)))
 
 .PHONY: all flash clean $(DEVICES)
 
+default: elk_cheetah
+
 all: $(DEVICES)
 
 $(DEVICES):
