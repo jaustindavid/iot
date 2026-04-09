@@ -34,6 +34,7 @@ The Coati Clock features a multi-agent physics engine where pixels act as autono
    - Copy `device_name.h` to `rachel_raccoon.h` (or your chosen name).
    - Update `STRA2US_CLIENT_ID` and `STRA2US_SECRET_HEX`.
 3. **Build**:
+   - **Attention**: Before flashing, update the `#define APP_VERSION` macro at the very top of `src/coaticlock.cpp` using the `.HHMM` datecode standard (e.g., `"2026.04.09.0245"`). (We cannot use `project.properties` for this because the Particle Cloud compiler enforces Strict SemVer, silently mangling datecodes like `2026.04` into `1.0.0`).
    - Use the included `Makefile`:
      ```bash
      make flash DEVICE=rachel_raccoon

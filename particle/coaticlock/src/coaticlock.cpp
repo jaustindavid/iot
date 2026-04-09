@@ -5,6 +5,9 @@
 #include "Stra2usClient.h"
 #include "creds.h"
 
+// Application Firmware Revision
+#define APP_VERSION "2026.04.09.0245"
+
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
 #define PIXEL_COUNT 256
@@ -66,7 +69,7 @@ void update_telemetry() {
     Log.info("Telemetry: Formatting report...");
     int rlen = snprintf(report, sizeof(report), 
              "up=%lu rssi=%d mem=%lu rst=%d fw=%s",
-             uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), PROJECT_VERSION);
+             uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), APP_VERSION);
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
     
     Log.info("Telemetry: Publishing to topic %s...", STRATUS_APP);
