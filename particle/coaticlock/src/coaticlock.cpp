@@ -190,11 +190,12 @@ void loop() {
             }
 
             engine.apply_pending_target();
-            engine.tick();
         } else {
             static bool time_warned = false;
             if (!time_warned) { Log.info("Waiting for cloud time sync..."); time_warned = true; }
         }
+        
+        engine.tick();
     }
 
     // 3. Render Tick (30Hz / 33ms)
@@ -238,6 +239,26 @@ void loop() {
             int idx = map_pixel(x, y);
             if (idx >= 0 && idx < PIXEL_COUNT) strip.setPixelColor(idx, color);
         };
+
+        if (!Time.isValid()) {
+            int cx = GRID_WIDTH / 2;
+            int cy = GRID_HEIGHT / 2 - 1;
+            int phase = (now / 150) % 8;
+            int dx = 0, dy = 0;
+            switch (phase) {
+                case 0: dx = 0; dy = -1; break;
+                case 1: dx = 1; dy = -1; break;
+                case 2: dx = 1; dy = 0; break;
+                case 3: dx = 1; dy = 1; break;
+                case 4: dx = 0; dy = 1; break;
+                case 5: dx = -1; dy = 1; break;
+                case 6: dx = -1; dy = 0; break;
+                case 7: dx = -1; dy = -1; break;
+            }
+            uint32_t spinner_color = get_pixel_color(0, 32, 64, bri);
+            set_safe_pixel(cx + dx, cy + dy, spinner_color);
+            set_safe_pixel(cx, cy, get_pixel_color(0, 16, 32, bri));
+        }
 
         set_safe_pixel(0, GRID_HEIGHT - 1, red);
         set_safe_pixel(1, GRID_HEIGHT - 1, red);

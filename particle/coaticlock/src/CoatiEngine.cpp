@@ -66,11 +66,10 @@ void CoatiEngine::update_target(time_t virtual_now) {
         draw_digit(8, 8, m_str[1]);
     } else {
         // Wide layout (e.g. 32x8)
-        draw_digit(2, 1, h_str[0]);
-        draw_digit(8, 1, h_str[1]);
-        draw_digit(14, 1, ':');
-        draw_digit(18, 1, m_str[0]);
-        draw_digit(24, 1, m_str[1]);
+        draw_digit(4, 1, h_str[0]);
+        draw_digit(10, 1, h_str[1]);
+        draw_digit(17, 1, m_str[0]);
+        draw_digit(23, 1, m_str[1]);
     }
     
     pending_time = virtual_now;
@@ -191,8 +190,6 @@ void CoatiEngine::tick() {
     static std::vector<Point> tk_extras, tk_missing, tk_avail_e, tk_avail_m, tk_wander;
     tk_extras.clear(); tk_missing.clear();
     
-    if (active_target == 0) return;
-    
     for (int x = 0; x < GRID_WIDTH; x++) {
         for (int y = 0; y < GRID_HEIGHT; y++) {
             bool is_dumpster = (y == GRID_HEIGHT - 1 && (x == 0 || x == 1));
@@ -203,15 +200,7 @@ void CoatiEngine::tick() {
         }
     }
 
-    for (int x = 0; x < GRID_WIDTH; x++) {
-        for (int y = 0; y < GRID_HEIGHT; y++) {
-            bool is_dumpster = (y == GRID_HEIGHT - 1 && (x == 0 || x == 1));
-            bool is_pool = (y == GRID_HEIGHT - 1 && (x == GRID_WIDTH - 2 || x == GRID_WIDTH - 1));
-            if (is_dumpster || is_pool) continue;
-            if (current_board[x][y] && !target_board[x][y]) tk_extras.push_back({x, y});
-            if (!current_board[x][y] && target_board[x][y]) tk_missing.push_back({x, y});
-        }
-    }
+
     for (size_t i = 0; i < agents.size(); i++) {
         CoatiAgent& a = agents[i];
         a.last_pos = a.pos;
