@@ -28,6 +28,10 @@ This document tracks the technical challenges ("gotchas") and architectural deci
 - **Issue**: Initial port included redundant `WIFI_SSID` defines in the headers.
 - **Solution**: Purged these in favor of Particle's native out-of-band credential management. This prevents accidental credential leak if headers are checked into source control.
 
+### 6. Animation Interpolation
+- **Issue**: Standardizing the frame timings limited matrix drawing speeds to 20Hz synchronously coupled with `CoatiEngine.cpp`, leading to jerky physical rendering on the display structure.
+- **Solution**: The physics simulation was explicitly uncoupled (clocking at 10Hz/100ms) from the hardware rendering system (60Hz/16ms). The pixel rendering sequence now interpolates Cartesian coordinate gradients internally, yielding seamlessly smooth $6\times$ oversampled LED animations as the firmware dynamically shades floating sub-pixel coordinates mathematically onto the physical hardware arrays.
+
 ## Architectural Notes
-- **Memory Management**: Pre-allocated pixel boards and agent structures to prevent heap fragmentation during the 20Hz physics loop.
-- **Timing**: Decoupled the physics tick (50ms) from the render tick (33ms) to ensure smooth motion interpolation while maintaining deterministic simulation.
+- **Memory Management**: Pre-allocated pixel boards and agent structures to prevent heap fragmentation during rapid physics looping.
+- **Timing Constraint**: Matrix dimensioning heavily dictates processing limits. Dynamic target generation is carefully scaled into multiple internal geometry mapping rules via mathematical bounding box abstraction for scaling.

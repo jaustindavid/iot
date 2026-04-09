@@ -10,8 +10,8 @@ The Coati Clock features a multi-agent physics engine where pixels act as autono
 
 ### 1. Physics Engine (`CoatiEngine`)
 - **A* Pathfinding**: Agents calculate paths to target digits, endpoints, or random "bored" walk targets. Pathfinding node limit expanded from 40 to 256 for thorough matrix traversal.
-- **State Machine**: Manages transitions between walking, carrying, washing, and waiting. Agents aggressively escape if trapped under a digit ("Floor is Lava") and fetch excess pixels to the dumpster.
-- **Manual Font Rendering**: Implements 5x6 numeric glyphs parsed from `megafont.bdf`. Render buffer is shifted downwards on the Y-axis to prevent agent stalemates.
+- **State Machine**: Manages transitions between walking, carrying, washing, and waiting. Agents dynamically evaluate geometric endpoints using matrix inversion bounding rules to aggressively escape "lava" and randomly wander based on grid constraints. Agent aura collision repels idle coatis cleanly from textual data via spatial logic mapping.
+- **Manual Font Rendering**: Implements 5x6 numeric glyphs parsed from `megafont.bdf`. Render buffer shifts downward/inward dynamically based on the grid geometry configuration to prevent layout stalemates.
 
 ### 2. Time & Drift (`WobblyTime`)
 - Maintains a "virtual epoch" that drifts relative to the real wall-clock time.
@@ -35,11 +35,11 @@ The Coati Clock features a multi-agent physics engine where pixels act as autono
    - Update `STRA2US_CLIENT_ID` and `STRA2US_SECRET_HEX`.
 3. **Build**:
    - **Attention**: Before flashing, update the `#define APP_VERSION` macro at the very top of `src/coaticlock.cpp` using the `.HHMM` datecode standard (e.g., `"2026.04.09.0245"`). (We cannot use `project.properties` for this because the Particle Cloud compiler enforces Strict SemVer, silently mangling datecodes like `2026.04` into `1.0.0`).
-   - Use the included `Makefile`:
+   - Use the included `Makefile` to instantly flash all configured devices simultaneously across your network:
      ```bash
-     make flash DEVICE=rachel_raccoon
+     make all
      ```
-   - This automatically copies your config to `src/creds.h` and flashes the device.
+   - *Note: You can safely add unlimited geometric layouts (e.g., `square_clock.h`) into the application root block. So long as it doesn't conflict with `device_name.h`, the dynamic bash parsing logic automatically iterates and injects the header directly into the build and deploy sequence!*
 
 ## Dependencies
 

@@ -1,7 +1,19 @@
 PARTICLE = /Users/austin/bin/particle
-DEVICE = ricky_raccoon
+DEVICE ?= ricky_raccoon
 
-.PHONY: flash clean
+# Automatically gather all config header files dynamically into targets
+DEVICES := $(basename $(filter-out device_name.h, $(wildcard *.h)))
+
+.PHONY: all flash clean $(DEVICES)
+
+all: $(DEVICES)
+
+$(DEVICES):
+	@echo "\n=============================================="
+	@echo " Flashing firmware for device: $@"
+	@echo "=============================================="
+	cp $@.h src/creds.h
+	$(PARTICLE) flash $@ .
 
 flash:
 	cp $(DEVICE).h src/creds.h
