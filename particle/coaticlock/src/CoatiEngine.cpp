@@ -22,8 +22,8 @@ struct CompareNode {
 };
 
 CoatiEngine::CoatiEngine() {
-    agents.push_back(CoatiAgent{{8, 4}});
-    agents.push_back(CoatiAgent{{24, 4}});
+    agents.push_back(CoatiAgent{{GRID_WIDTH / 4, 4}});
+    agents.push_back(CoatiAgent{{(GRID_WIDTH * 3) / 4, 4}});
 }
 
 void CoatiEngine::draw_digit(int x, int y_offset, char char_val) {
