@@ -47,11 +47,13 @@ void CoatiEngine::draw_digit(int x, char char_val) {
 }
 
 void CoatiEngine::update_target(time_t virtual_now) {
-    struct tm* timeinfo = localtime(&virtual_now);
-    if (!timeinfo) return;
+    if (!Time.isValid()) return;
+    int h = Time.hour(virtual_now);
+    int m = Time.minute(virtual_now);
+    
     char h_str[3], m_str[3];
-    strftime(h_str, sizeof(h_str), "%H", timeinfo);
-    strftime(m_str, sizeof(m_str), "%M", timeinfo);
+    snprintf(h_str, sizeof(h_str), "%02d", h);
+    snprintf(m_str, sizeof(m_str), "%02d", m);
 
     memset(pending_target, 0, sizeof(pending_target));
     

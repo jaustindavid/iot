@@ -98,6 +98,12 @@ void update_telemetry() {
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/wobble_slow_rate", val, sizeof(val))) {
         wobbly.slow_rate = atof(val);
     }
+    
+    // timezone_offset
+    snprintf(key, sizeof(key), "%s/%s/timezone_offset", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/timezone_offset", val, sizeof(val))) {
+        Time.zone(atof(val));
+    }
 }
 
 uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
@@ -112,7 +118,8 @@ void loop() {
     if (now - last_light_read >= 200) {
         last_light_read = now;
         int raw = analogRead(A1);
-        float normalized = (4095.0f - (float)raw) / 4095.0f; // 0=dark, 1=bright
+        float normalized = (4040.0f - (float)raw) / 4040.0f; 
+        if (normalized < 0.0f) normalized = 0.0f;
         float lux_equiv = normalized * 500.0f; 
         float target = sqrtf(lux_equiv / 375.0f);
         target = constrain(target, 0.1f, 1.0f);
@@ -135,13 +142,11 @@ void loop() {
             time_t real_now = Time.now();
             time_t virtual_now = wobbly.advance(real_now);
             
-            struct tm* vtm = localtime(&virtual_now);
-            if (vtm != nullptr) {
-                if (vtm->tm_min != last_display_minute) {
-                    last_display_minute = vtm->tm_min;
-                    Log.info("Minute change detected: %d. Updating engine target.", vtm->tm_min);
-                    engine.update_target(virtual_now);
-                }
+            int v_min = Time.minute(virtual_now);
+            if (v_min != last_display_minute) {
+                last_display_minute = v_min;
+                Log.info("Minute change detected: %d. Updating engine target.", v_min);
+                engine.update_target(virtual_now);
             }
 
             engine.apply_pending_target();

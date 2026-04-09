@@ -234,7 +234,9 @@ bool Stra2usClient::kv_get(const char* key, char* val_out, size_t val_out_len) {
     const char* str_data = nullptr;
     int str_len = 0;
     long long ival = 0;
+    double fval = 0.0;
     bool is_int = false;
+    bool is_float = false;
 
     if ((b[0] & 0xe0) == 0xa0) { str_len = b[0] & 0x1f; str_data = body + 1; }
     else if (b[0] == 0xd9) { str_len = b[1]; str_data = body + 2; }
@@ -247,10 +249,16 @@ bool Stra2usClient::kv_get(const char* key, char* val_out, size_t val_out_len) {
     else if (b[0] == 0xd0) { ival = (int8_t)b[1]; is_int = true; }
     else if (b[0] == 0xd1) { ival = (int16_t)(((uint16_t)b[1] << 8) | b[2]); is_int = true; }
     else if (b[0] == 0xd2) { ival = (int32_t)(((uint32_t)b[1] << 24) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 8) | b[4]); is_int = true; }
+    else if (b[0] == 0xca) { uint32_t v = ((uint32_t)b[1] << 24) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 8) | b[4]; float f; memcpy(&f, &v, 4); fval = f; is_float = true; }
+    else if (b[0] == 0xcb) { uint64_t v = ((uint64_t)b[1] << 56) | ((uint64_t)b[2] << 48) | ((uint64_t)b[3] << 40) | ((uint64_t)b[4] << 32) | ((uint64_t)b[5] << 24) | ((uint64_t)b[6] << 16) | ((uint64_t)b[7] << 8) | b[8]; double d; memcpy(&d, &v, 8); fval = d; is_float = true; }
     else return false;
 
     if (is_int) {
         snprintf(val_out, val_out_len, "%lld", ival);
+        return true;
+    }
+    if (is_float) {
+        snprintf(val_out, val_out_len, "%.2f", fval);
         return true;
     }
 

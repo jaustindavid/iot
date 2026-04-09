@@ -55,7 +55,7 @@ public:
     void tick();
 
     // Pathfinding
-    std::vector<Point> find_path(Point start, Point dest, int self_index, int max_nodes = 40);
+    std::vector<Point> find_path(Point start, Point dest, int self_index, int max_nodes = 256);
 
 private:
     // Pathfinding scratch space (member vars to avoid stack overflow)
