@@ -304,9 +304,10 @@ sensor:
       then:
         - lambda: |-
             // Sqrt curve: compensates for eye log-scale response and pushes
-            // more brightness into the mid-lux range (a "kinda bright" room
-            // at 250 lux now targets ~71% instead of the previous 50%).
-            float target = sqrtf(x / 500.0f);
+            // more brightness into the mid-lux range. Divisor 375 means
+            // 100% LED output is reached at 375 lux (~75% of a bright room),
+            // clamping there for anything brighter.
+            float target = sqrtf(x / 375.0f);
             target = clamp(target, 0.2f, 1.0f);
             // Low-pass filter: 30% new / 70% old (~60s to 90% of a step change,
             // down from ~100s with the previous 20/80 split).
