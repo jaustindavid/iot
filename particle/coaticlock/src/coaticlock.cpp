@@ -173,8 +173,8 @@ void loop() {
         }
     }
 
-    // 2. Physics Tick (20Hz / 50ms)
-    if (now - last_physics_tick >= 50) {
+    // 2. Physics Tick (10Hz / 100ms)
+    if (now - last_physics_tick >= 100) {
         last_physics_tick = now;
         
         if (Time.isValid()) {
@@ -198,11 +198,11 @@ void loop() {
         engine.tick();
     }
 
-    // 3. Render Tick (30Hz / 33ms)
-    if (now - last_render_tick >= 33) {
+    // 3. Render Tick (60Hz / 16ms)
+    if (now - last_render_tick >= 16) {
         last_render_tick = now;
         
-        float blend = (float)(now - last_physics_tick) / 50.0f;
+        float blend = (float)(now - last_physics_tick) / 100.0f;
         if (blend > 1.0f) blend = 1.0f;
 
         strip.clear();
