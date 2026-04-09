@@ -1,7 +1,13 @@
 #pragma once
 
-// --- Project Configuration ---
-#define PROJECT_VERSION "1.0.1"
+// --- Hardware Geometry ---
+#define GRID_WIDTH  32
+#define GRID_HEIGHT 8
+#define GRID_ROTATION 0
+
+// --- Hardware Configuration ---
+// If your older devices wire matrix data to a GPIO pin instead of Hardware SPI DMA:
+// #define MATRIX_PIN D0
 
 // --- Stra2us Telemetry Configuration ---
 // These are available from your Stra2us dashboard

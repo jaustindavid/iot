@@ -13,7 +13,11 @@
 #define PIXEL_COUNT (GRID_WIDTH * GRID_HEIGHT)
 #define PIXEL_TYPE WS2812B
 
-Adafruit_NeoPixel strip(PIXEL_COUNT, SPI, PIXEL_TYPE);
+#ifndef MATRIX_PIN
+#define MATRIX_PIN SPI
+#endif
+
+Adafruit_NeoPixel strip(PIXEL_COUNT, MATRIX_PIN, PIXEL_TYPE);
 
 // Engine and Time logic
 CoatiEngine engine;

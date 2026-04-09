@@ -1,6 +1,7 @@
 # Device-specific credentials
 src/creds.h
 *_raccoon.h
+elk_cheetah.h
 *.h_template
 
 # Build artifacts
