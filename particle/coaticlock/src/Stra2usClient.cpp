@@ -141,6 +141,18 @@ int Stra2usClient::read_response(char* body_out, size_t body_out_len) {
         delay(1);
     }
     
+    // Flush any leftover unread chunked-encoding fragments to prevent socket poisoning on keep-alive
+    int empty_loops = 0;
+    while (empty_loops < 5) {
+        if (_client.available()) { 
+            _client.read(); 
+            empty_loops = 0; 
+        } else { 
+            delay(10); 
+            empty_loops++; 
+        }
+    }
+
     if (body_out && body_out_len > 0) body_out[body_filled] = '\0';
     return status;
 }

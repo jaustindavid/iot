@@ -6,7 +6,7 @@
 #include "creds.h"
 
 // Application Firmware Revision
-#define APP_VERSION "2026.04.09.0245"
+#define APP_VERSION __DATE__ " " __TIME__
 
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
@@ -24,6 +24,9 @@ Stra2usClient client(STRA2US_HOST, STRA2US_PORT, STRA2US_CLIENT_ID, STRA2US_SECR
 float global_brightness = 0.7f;
 float param_min_brightness = 0.1f;
 float param_max_brightness = 1.0f;
+float global_lux = 0.0f;
+int param_heartbeep = 300;
+
 unsigned long last_physics_tick = 0;
 unsigned long last_render_tick = 0;
 unsigned long last_telemetry_tick = 0;
@@ -46,15 +49,15 @@ void setup() {
     Time.zone(-5); // Default to EST, can be updated via telemetry
     Particle.syncTime();
     
-    // Defer first telemetry for 15 seconds to allow network stack to stabilize
-    last_telemetry_tick = millis() - 300000 + 15000; 
+    // Defer first telemetry for 15s to allow network stack to stabilize
+    last_telemetry_tick = millis() - (param_heartbeep * 1000) + 15000; 
 
-    Log.info("Coaticlock Initialized. Version: " PROJECT_VERSION);
+    Log.info("Coaticlock Initialized. Version: " APP_VERSION);
 }
 
-void update_telemetry() {
+void send_telemetry() {
     if (!Time.isValid()) return;
-    Log.info("Telemetry: Starting sync...");
+    Log.info("Telemetry: Sending Heartbeat...");
     
     // 1. Send Heartbeat
     char report[256];
@@ -68,15 +71,20 @@ void update_telemetry() {
     
     Log.info("Telemetry: Formatting report...");
     int rlen = snprintf(report, sizeof(report), 
-             "up=%lu rssi=%d mem=%lu rst=%d fw=%s",
-             uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), APP_VERSION);
+             "up=%lu rssi=%d mem=%lu rst=%d fw=%s lux=%.1f bri=%.2f p_minbri=%.2f p_maxbri=%.2f p_hb=%d",
+             uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), APP_VERSION,
+             global_lux, global_brightness, param_min_brightness, param_max_brightness, param_heartbeep);
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
     
     Log.info("Telemetry: Publishing to topic %s...", STRATUS_APP);
     int status = client.publish(STRATUS_APP, report);
     Log.info("Telemetry: Publish status = %d", status);
+}
 
-    // 2. Poll KV Config
+void poll_config() {
+    if (!WiFi.ready()) return;
+    Log.info("Telemetry: Polling Config KV...");
+    
     char val[32];
     char key[128];
     
@@ -121,6 +129,13 @@ void update_telemetry() {
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/max_brightness", val, sizeof(val))) {
         param_max_brightness = atof(val);
     }
+
+    // heartbeep
+    snprintf(key, sizeof(key), "%s/%s/heartbeep", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/heartbeep", val, sizeof(val))) {
+        param_heartbeep = atoi(val);
+        if (param_heartbeep < 10) param_heartbeep = 10; // Floor at 10 seconds to prevent DDoS
+    }
 }
 
 uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
@@ -137,20 +152,24 @@ void loop() {
         int raw = analogRead(A1);
         float normalized = (4040.0f - (float)raw) / 4040.0f; 
         if (normalized < 0.0f) normalized = 0.0f;
-        float lux_equiv = normalized * 500.0f; 
-        float target = sqrtf(lux_equiv / 375.0f);
+        // Cascaded EMA low-pass filters to dampen ADC noise hunting
+        float current_lux = normalized * 500.0f;
+        global_lux = (current_lux * 0.05f) + (global_lux * 0.95f); 
+        float target = sqrtf(global_lux / 375.0f);
         
         // Safety bounds
         if (param_max_brightness < 0.05f) param_max_brightness = 0.05f;
         if (param_min_brightness < 0.0f) param_min_brightness = 0.0f;
         target = constrain(target, param_min_brightness, param_max_brightness);
-        global_brightness = (target * 0.3f) + (global_brightness * 0.7f);
+        
+        // Massive 50-tick (10 second) rolling window to prevent visible LED micro-oscillations
+        global_brightness = (target * 0.02f) + (global_brightness * 0.98f);
         
         static unsigned long last_light_log = 0;
         if (now - last_light_log >= 2000) {
             last_light_log = now;
             Log.info("Light Sensor: Raw=%d (%.2f), Lux=%.1f, TargetBri=%.2f, GlobalBri=%.2f", 
-                     raw, normalized, lux_equiv, target, global_brightness);
+                     raw, normalized, global_lux, target, global_brightness);
         }
     }
 
@@ -189,8 +208,8 @@ void loop() {
         float bri = global_brightness;
 
         // Draw static endpoints (Dumpster & Pool)
-        uint32_t red = get_pixel_color(255, 0, 0, bri);
-        uint32_t blue = get_pixel_color(0, 0, 255, bri);
+        uint32_t red = get_pixel_color(64, 0, 0, bri);
+        uint32_t blue = get_pixel_color(0, 0, 64, bri);
         
         auto map_pixel = [](int x, int y) {
             if (x < 0 || x >= 32 || y < 0 || y >= 8) return 999; // Return invalid index
@@ -213,15 +232,15 @@ void loop() {
             for (int y = 0; y < 8; y++) {
                 if (engine.current_board[x][y]) {
                     if (y == 7 && (x <= 1 || x >= 30)) continue;
-                    set_safe_pixel(x, y, get_pixel_color(0, 255, 0, engine.fade_board[x][y] * bri));
+                    set_safe_pixel(x, y, get_pixel_color(0, 64, 0, engine.fade_board[x][y] * bri));
                 }
             }
         }
 
         // Draw Agents
-        uint32_t white = get_pixel_color(255, 255, 255, bri);
-        uint32_t cyan = get_pixel_color(0, 255, 255, bri);
-        uint32_t shimmer_red = get_pixel_color(255, 100, 100, bri);
+        uint32_t white = get_pixel_color(64, 64, 64, bri);
+        uint32_t cyan = get_pixel_color(0, 64, 64, bri);
+        uint32_t shimmer_red = get_pixel_color(64, 25, 25, bri);
 
         for (size_t i = 0; i < engine.agents.size(); i++) {
             auto& a = engine.agents[i];
@@ -229,7 +248,7 @@ void loop() {
 
             if (a.carrying) {
                 float pulse = 0.7f + 0.3f * sin(now / 150.0f);
-                agent_color = get_pixel_color(255, 255, 0, pulse * bri);
+                agent_color = get_pixel_color(64, 64, 0, pulse * bri);
             } else {
                 agent_color = (i == 0) ? white : cyan;
             }
@@ -254,10 +273,11 @@ void loop() {
 
         strip.show();
     }
-
-    // 4. Telemetry Cycle (300s)
-    if (WiFi.ready() && (now - last_telemetry_tick >= 300000)) {
+    // 4. Telemetry Cycle 
+    if (WiFi.ready() && (now - last_telemetry_tick >= ((unsigned long)param_heartbeep * 1000))) {
         last_telemetry_tick = now;
-        update_telemetry();
+        send_telemetry();
+        poll_config(); // Execute back-to-back using the same keep-alive HTTP underlying connection
     }
 }
+
