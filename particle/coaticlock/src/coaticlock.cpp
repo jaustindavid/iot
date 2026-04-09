@@ -8,6 +8,10 @@
 // Application Firmware Revision
 #define APP_VERSION __DATE__ " " __TIME__
 
+SYSTEM_THREAD(ENABLED);
+void telemetry_worker();
+Thread* telemetryThread = nullptr;
+
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
 #define PIXEL_COUNT (GRID_WIDTH * GRID_HEIGHT)
@@ -56,6 +60,7 @@ void setup() {
     // Defer first telemetry for 15s to allow network stack to stabilize
     last_telemetry_tick = millis() - (param_heartbeep * 1000) + 15000; 
 
+    telemetryThread = new Thread("IoT", telemetry_worker, OS_THREAD_PRIORITY_DEFAULT, 10240);
     Log.info("Coaticlock Initialized. Version: " APP_VERSION);
 }
 
@@ -139,6 +144,17 @@ void poll_config() {
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/heartbeep", val, sizeof(val))) {
         param_heartbeep = atoi(val);
         if (param_heartbeep < 10) param_heartbeep = 10; // Floor at 10 seconds to prevent DDoS
+    }
+}
+void telemetry_worker() {
+    while(true) {
+        unsigned long now = millis();
+        if (WiFi.ready() && (now - last_telemetry_tick >= ((unsigned long)param_heartbeep * 1000))) {
+            last_telemetry_tick = now;
+            send_telemetry();
+            poll_config();
+        }
+        delay(100);
     }
 }
 
@@ -317,12 +333,6 @@ void loop() {
         }
 
         strip.show();
-    }
-    // 4. Telemetry Cycle 
-    if (WiFi.ready() && (now - last_telemetry_tick >= ((unsigned long)param_heartbeep * 1000))) {
-        last_telemetry_tick = now;
-        send_telemetry();
-        poll_config(); // Execute back-to-back using the same keep-alive HTTP underlying connection
     }
 }
 
