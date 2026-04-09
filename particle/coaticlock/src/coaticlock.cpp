@@ -1,0 +1,237 @@
+#include "Particle.h"
+#include "neopixel.h"
+#include "CoatiEngine.h"
+#include "WobblyTime.h"
+#include "Stra2usClient.h"
+#include "creds.h"
+
+// Hardware settings
+#define PIXEL_PIN D2        // SPI MOSI
+#define PIXEL_COUNT 256
+#define PIXEL_TYPE WS2812B
+
+Adafruit_NeoPixel strip(PIXEL_COUNT, SPI, PIXEL_TYPE);
+
+// Engine and Time logic
+CoatiEngine engine;
+WobblyTime wobbly(120, 300, 1.3f, 0.7f);
+Stra2usClient client(STRA2US_HOST, STRA2US_PORT, STRA2US_CLIENT_ID, STRA2US_SECRET_HEX);
+
+// Global state
+float global_brightness = 0.7f;
+unsigned long last_physics_tick = 0;
+unsigned long last_render_tick = 0;
+unsigned long last_telemetry_tick = 0;
+int last_display_minute = -1;
+
+// Logging
+SerialLogHandler logHandler(LOG_LEVEL_INFO);
+
+void setup() {
+    // Hardware setup
+    pinMode(A0, OUTPUT);
+    digitalWrite(A0, HIGH); // Power CDS divider
+    pinMode(A2, OUTPUT);
+    digitalWrite(A2, LOW);  // Ground CDS divider
+    
+    strip.begin();
+    strip.show();
+
+    // Time setup
+    Time.zone(-5); // Default to EST, can be updated via telemetry
+    Particle.syncTime();
+    
+    // Defer first telemetry for 15 seconds to allow network stack to stabilize
+    last_telemetry_tick = millis() - 300000 + 15000; 
+
+    Log.info("Coaticlock Initialized. Version: " PROJECT_VERSION);
+}
+
+void update_telemetry() {
+    if (!Time.isValid()) return;
+    Log.info("Telemetry: Starting sync...");
+    
+    // 1. Send Heartbeat
+    char report[256];
+    uint32_t uptime = System.uptime();
+    Log.info("Telemetry: Getting RSSI...");
+    int rssi = -127;
+    if (WiFi.ready()) {
+        WiFiSignal sig = WiFi.RSSI();
+        rssi = sig.getStrength();
+    }
+    
+    Log.info("Telemetry: Formatting report...");
+    int rlen = snprintf(report, sizeof(report), 
+             "up=%lu rssi=%d mem=%lu rst=%d fw=%s",
+             uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), PROJECT_VERSION);
+    if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
+    
+    Log.info("Telemetry: Publishing to topic %s...", STRATUS_APP);
+    int status = client.publish(STRATUS_APP, report);
+    Log.info("Telemetry: Publish status = %d", status);
+
+    // 2. Poll KV Config
+    char val[32];
+    char key[128];
+    
+    // wobble_min_seconds
+    snprintf(key, sizeof(key), "%s/%s/wobble_min_seconds", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/wobble_min_seconds", val, sizeof(val))) {
+        wobbly.wobble_min_seconds = atoi(val);
+    }
+    
+    // wobble_max_seconds
+    snprintf(key, sizeof(key), "%s/%s/wobble_max_seconds", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/wobble_max_seconds", val, sizeof(val))) {
+        wobbly.wobble_max_seconds = atoi(val);
+    }
+    
+    // wobble_fast_rate
+    snprintf(key, sizeof(key), "%s/%s/wobble_fast_rate", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/wobble_fast_rate", val, sizeof(val))) {
+        wobbly.fast_rate = atof(val);
+    }
+
+    // wobble_slow_rate
+    snprintf(key, sizeof(key), "%s/%s/wobble_slow_rate", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/wobble_slow_rate", val, sizeof(val))) {
+        wobbly.slow_rate = atof(val);
+    }
+}
+
+uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
+    return strip.Color((uint8_t)(r * bri), (uint8_t)(g * bri), (uint8_t)(b * bri));
+}
+
+void loop() {
+    unsigned long now = millis();
+
+    // 1. Ambient Light Sensing (200ms)
+    static unsigned long last_light_read = 0;
+    if (now - last_light_read >= 200) {
+        last_light_read = now;
+        int raw = analogRead(A1);
+        float normalized = (4095.0f - (float)raw) / 4095.0f; // 0=dark, 1=bright
+        float lux_equiv = normalized * 500.0f; 
+        float target = sqrtf(lux_equiv / 375.0f);
+        target = constrain(target, 0.1f, 1.0f);
+        global_brightness = (target * 0.3f) + (global_brightness * 0.7f);
+        
+        static unsigned long last_light_log = 0;
+        if (now - last_light_log >= 2000) {
+            last_light_log = now;
+            Log.info("Light Sensor: Raw=%d (%.2f), Lux=%.1f, TargetBri=%.2f, GlobalBri=%.2f", 
+                     raw, normalized, lux_equiv, target, global_brightness);
+        }
+    }
+
+    // 2. Physics Tick (20Hz / 50ms)
+    if (now - last_physics_tick >= 50) {
+        last_physics_tick = now;
+        
+        if (Time.isValid()) {
+            // Sync time with WobblyTime
+            time_t real_now = Time.now();
+            time_t virtual_now = wobbly.advance(real_now);
+            
+            struct tm* vtm = localtime(&virtual_now);
+            if (vtm != nullptr) {
+                if (vtm->tm_min != last_display_minute) {
+                    last_display_minute = vtm->tm_min;
+                    Log.info("Minute change detected: %d. Updating engine target.", vtm->tm_min);
+                    engine.update_target(virtual_now);
+                }
+            }
+
+            engine.apply_pending_target();
+            engine.tick();
+        } else {
+            static bool time_warned = false;
+            if (!time_warned) { Log.info("Waiting for cloud time sync..."); time_warned = true; }
+        }
+    }
+
+    // 3. Render Tick (30Hz / 33ms)
+    if (now - last_render_tick >= 33) {
+        last_render_tick = now;
+        
+        float blend = (float)(now - last_physics_tick) / 50.0f;
+        if (blend > 1.0f) blend = 1.0f;
+
+        strip.clear();
+        float bri = global_brightness;
+
+        // Draw static endpoints (Dumpster & Pool)
+        uint32_t red = get_pixel_color(255, 0, 0, bri);
+        uint32_t blue = get_pixel_color(0, 0, 255, bri);
+        
+        auto map_pixel = [](int x, int y) {
+            if (x < 0 || x >= 32 || y < 0 || y >= 8) return 999; // Return invalid index
+            if (x % 2 == 0) return (x * 8) + y;
+            return (x * 8) + (7 - y);
+        };
+        
+        auto set_safe_pixel = [&](int x, int y, uint32_t color) {
+            int idx = map_pixel(x, y);
+            if (idx < 256) strip.setPixelColor(idx, color);
+        };
+
+        set_safe_pixel(0, 7, red);
+        set_safe_pixel(1, 7, red);
+        set_safe_pixel(30, 7, blue);
+        set_safe_pixel(31, 7, blue);
+
+        // Draw physical pixels
+        for (int x = 0; x < 32; x++) {
+            for (int y = 0; y < 8; y++) {
+                if (engine.current_board[x][y]) {
+                    if (y == 7 && (x <= 1 || x >= 30)) continue;
+                    set_safe_pixel(x, y, get_pixel_color(0, 255, 0, engine.fade_board[x][y] * bri));
+                }
+            }
+        }
+
+        // Draw Agents
+        uint32_t white = get_pixel_color(255, 255, 255, bri);
+        uint32_t cyan = get_pixel_color(0, 255, 255, bri);
+        uint32_t shimmer_red = get_pixel_color(255, 100, 100, bri);
+
+        for (size_t i = 0; i < engine.agents.size(); i++) {
+            auto& a = engine.agents[i];
+            uint32_t agent_color;
+
+            if (a.carrying) {
+                float pulse = 0.7f + 0.3f * sin(now / 150.0f);
+                agent_color = get_pixel_color(255, 255, 0, pulse * bri);
+            } else {
+                agent_color = (i == 0) ? white : cyan;
+            }
+
+            if (a.wait_ticks > 1) {
+                if ((sin(now / 30.0f) > 0)) agent_color = shimmer_red;
+            }
+
+            if (a.pos == a.last_pos) {
+                set_safe_pixel(a.pos.x, a.pos.y, agent_color);
+            } else {
+                // Motion Blur
+                uint32_t c1 = agent_color;
+                uint8_t r = (c1 >> 16) & 0xFF;
+                uint8_t g = (c1 >> 8) & 0xFF;
+                uint8_t b = c1 & 0xFF;
+                
+                set_safe_pixel(a.last_pos.x, a.last_pos.y, get_pixel_color(r, g, b, (1.0f - blend) * bri));
+                set_safe_pixel(a.pos.x, a.pos.y, get_pixel_color(r, g, b, blend * bri));
+            }
+        }
+
+        strip.show();
+    }
+
+    // 4. Telemetry Cycle (300s)
+    if (WiFi.ready() && (now - last_telemetry_tick >= 300000)) {
+        last_telemetry_tick = now;
+        update_telemetry();
+    }
+}

@@ -1,0 +1,16 @@
+# Device-specific credentials
+src/creds.h
+rachel_raccoon.h
+*.h_template
+device_name.h
+
+# Build artifacts
+bin/
+target/
+lib/
+obj/
+
+# Particle Workbench files
+.DS_Store
+.vscode/
+.history/
