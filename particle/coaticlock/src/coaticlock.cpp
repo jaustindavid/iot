@@ -19,6 +19,8 @@ Stra2usClient client(STRA2US_HOST, STRA2US_PORT, STRA2US_CLIENT_ID, STRA2US_SECR
 
 // Global state
 float global_brightness = 0.7f;
+float param_min_brightness = 0.1f;
+float param_max_brightness = 1.0f;
 unsigned long last_physics_tick = 0;
 unsigned long last_render_tick = 0;
 unsigned long last_telemetry_tick = 0;
@@ -104,6 +106,18 @@ void update_telemetry() {
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/timezone_offset", val, sizeof(val))) {
         Time.zone(atof(val));
     }
+
+    // min_brightness
+    snprintf(key, sizeof(key), "%s/%s/min_brightness", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/min_brightness", val, sizeof(val))) {
+        param_min_brightness = atof(val);
+    }
+
+    // max_brightness
+    snprintf(key, sizeof(key), "%s/%s/max_brightness", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/max_brightness", val, sizeof(val))) {
+        param_max_brightness = atof(val);
+    }
 }
 
 uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
@@ -122,7 +136,11 @@ void loop() {
         if (normalized < 0.0f) normalized = 0.0f;
         float lux_equiv = normalized * 500.0f; 
         float target = sqrtf(lux_equiv / 375.0f);
-        target = constrain(target, 0.1f, 1.0f);
+        
+        // Safety bounds
+        if (param_max_brightness < 0.05f) param_max_brightness = 0.05f;
+        if (param_min_brightness < 0.0f) param_min_brightness = 0.0f;
+        target = constrain(target, param_min_brightness, param_max_brightness);
         global_brightness = (target * 0.3f) + (global_brightness * 0.7f);
         
         static unsigned long last_light_log = 0;
