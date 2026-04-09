@@ -1,5 +1,5 @@
 PARTICLE = /Users/austin/bin/particle
-DEVICE = rachel_raccoon
+DEVICE = ricky_raccoon
 
 .PHONY: flash clean
 

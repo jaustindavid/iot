@@ -1,8 +1,8 @@
 # Device-specific credentials
 src/creds.h
 rachel_raccoon.h
+ricky_raccoon.h
 *.h_template
-device_name.h
 
 # Build artifacts
 bin/

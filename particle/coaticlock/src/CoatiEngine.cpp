@@ -26,7 +26,7 @@ CoatiEngine::CoatiEngine() {
     agents.push_back(CoatiAgent{{24, 4}});
 }
 
-void CoatiEngine::draw_digit(int x, char char_val) {
+void CoatiEngine::draw_digit(int x, int y_offset, char char_val) {
     int idx = -1;
     if (char_val >= '0' && char_val <= '9') idx = char_val - '0';
     else if (char_val == ':') idx = 10;
@@ -37,8 +37,8 @@ void CoatiEngine::draw_digit(int x, char char_val) {
         for (int col = 0; col < 5; col++) {
             if (bits & (0x80 >> col)) {
                 int px = x + col;
-                int py = row + 1; // Shift down by 1 to allow pathing above text
-                if (px >= 0 && px < 32 && py >= 0 && py < 8) {
+                int py = row + y_offset; // Allow custom vertical placement
+                if (px >= 0 && px < GRID_WIDTH && py >= 0 && py < GRID_HEIGHT) {
                     pending_target[px][py] = true;
                 }
             }
@@ -57,13 +57,21 @@ void CoatiEngine::update_target(time_t virtual_now) {
 
     memset(pending_target, 0, sizeof(pending_target));
     
-    // Draw Hours
-    draw_digit(3, h_str[0]);
-    draw_digit(9, h_str[1]);
-    
-    // Draw Minutes
-    draw_digit(17, m_str[0]);
-    draw_digit(23, m_str[1]);
+    if (GRID_HEIGHT >= 16) {
+        // Square layout (16x16)
+        draw_digit(2, 1, h_str[0]);    // Top row
+        draw_digit(8, 1, h_str[1]);
+        
+        draw_digit(2, 8, m_str[0]); // Bottom row
+        draw_digit(8, 8, m_str[1]);
+    } else {
+        // Wide layout (e.g. 32x8)
+        draw_digit(2, 1, h_str[0]);
+        draw_digit(8, 1, h_str[1]);
+        draw_digit(14, 1, ':');
+        draw_digit(18, 1, m_str[0]);
+        draw_digit(24, 1, m_str[1]);
+    }
     
     pending_time = virtual_now;
     target_pending = true;
@@ -74,8 +82,8 @@ void CoatiEngine::apply_pending_target() {
     target_pending = false;
     active_target = pending_time;
     int target_count = 0;
-    for (int x = 0; x < 32; x++) {
-        for (int y = 0; y < 8; y++) {
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
             target_board[x][y] = pending_target[x][y];
             if (target_board[x][y]) target_count++;
         }
@@ -98,8 +106,8 @@ void CoatiEngine::apply_pending_target() {
 std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_index, int max_nodes) {
     memset(pf_visited, 0, sizeof(pf_visited));
     memset(pf_parent, 0, sizeof(pf_parent));
-    for (int x = 0; x < 32; x++)
-        for (int y = 0; y < 8; y++)
+    for (int x = 0; x < GRID_WIDTH; x++)
+        for (int y = 0; y < GRID_HEIGHT; y++)
             pf_cost[x][y] = 1e9f;
 
     std::priority_queue<
@@ -130,7 +138,7 @@ std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_inde
             for (int dy = -1; dy <= 1; dy++) {
                 if (dx == 0 && dy == 0) continue;
                 int nx = curr.x + dx, ny = curr.y + dy;
-                if (nx < 0 || nx >= 32 || ny < 0 || ny >= 8) continue;
+                if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
 
                 float pixel_cost = (current_board[nx][ny] && !(nx == dest.x && ny == dest.y)) ? 50.0f : 0.0f;
                 float penalty = 0.0f;
@@ -185,20 +193,20 @@ void CoatiEngine::tick() {
     
     if (active_target == 0) return;
     
-    for (int x = 0; x < 32; x++) {
-        for (int y = 0; y < 8; y++) {
-            bool is_dumpster = (y == 7 && (x == 0 || x == 1));
-            bool is_pool = (y == 7 && (x == 30 || x == 31));
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
+            bool is_dumpster = (y == GRID_HEIGHT - 1 && (x == 0 || x == 1));
+            bool is_pool = (y == GRID_HEIGHT - 1 && (x == GRID_WIDTH - 2 || x == GRID_WIDTH - 1));
             if (is_dumpster || is_pool) continue;
             if (current_board[x][y] && !target_board[x][y]) tk_extras.push_back({x, y});
             if (!current_board[x][y] && target_board[x][y]) tk_missing.push_back({x, y});
         }
     }
 
-    for (int x = 0; x < 32; x++) {
-        for (int y = 0; y < 8; y++) {
-            bool is_dumpster = (y == 7 && (x == 0 || x == 1));
-            bool is_pool = (y == 7 && (x == 30 || x == 31));
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
+            bool is_dumpster = (y == GRID_HEIGHT - 1 && (x == 0 || x == 1));
+            bool is_pool = (y == GRID_HEIGHT - 1 && (x == GRID_WIDTH - 2 || x == GRID_WIDTH - 1));
             if (is_dumpster || is_pool) continue;
             if (current_board[x][y] && !target_board[x][y]) tk_extras.push_back({x, y});
             if (!current_board[x][y] && target_board[x][y]) tk_missing.push_back({x, y});
@@ -290,7 +298,7 @@ void CoatiEngine::tick() {
                 // Placing logic
                 bool standing_on_m = false;
                 for (auto m : tk_missing) if (a.pos.x == m.x && a.pos.y == m.y) standing_on_m = true;
-                bool standing_on_dumpster_dump = (a.pos.y == 7 && (a.pos.x == 0 || a.pos.x == 1));
+                bool standing_on_dumpster_dump = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
 
                 if (standing_on_dumpster_dump && tk_missing.empty()) {
                     Log.info("Agent %d: Dumped excess pixel at Dumpster", (int)i);
@@ -322,7 +330,7 @@ void CoatiEngine::tick() {
             // Not carrying
             bool standing_on_e = false;
             for (auto e : tk_extras) if (a.pos.x == e.x && a.pos.y == e.y) standing_on_e = true;
-            bool standing_on_dumpster = (a.pos.y == 7 && (a.pos.x == 0 || a.pos.x == 1));
+            bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
 
             if ((standing_on_e && current_board[a.pos.x][a.pos.y]) || (standing_on_dumpster && !tk_missing.empty())) {
                 Log.info("Agent %d: Picked up pixel at {%d,%d} (Target: %s)", (int)i, a.pos.x, a.pos.y, standing_on_dumpster ? "Dumpster" : "Board");
@@ -347,10 +355,10 @@ void CoatiEngine::tick() {
                 a.claimed_target = dest;
                 path_calculated = true;
             } else {
-                bool floor_is_lava = current_board[a.pos.x][a.pos.y] && (a.pos.y != 7);
+                bool floor_is_lava = current_board[a.pos.x][a.pos.y] && (a.pos.y != GRID_HEIGHT - 1);
                 if (floor_is_lava) {
                     Log.info("Agent %d: Floor is Lava! Escaping to ground.", (int)i);
-                    Point dest = { a.pos.x, 7 };
+                    Point dest = { a.pos.x, GRID_HEIGHT - 1 };
                     a.current_path = find_path(a.pos, dest, (int)i);
                     path_calculated = true;
                 } else {
@@ -358,8 +366,8 @@ void CoatiEngine::tick() {
                     if (a.bored_ticks > 30) {
                         if (rand() % 2 == 0) {
                             int nx = a.pos.x + (rand() % 3 - 1);
-                            if (nx >= 0 && nx < 32 && a.pos.y == 7) {
-                                a.current_path = {{nx, 7}};
+                            if (nx >= 0 && nx < GRID_WIDTH && a.pos.y == GRID_HEIGHT - 1) {
+                                a.current_path = {{nx, GRID_HEIGHT - 1}};
                             }
                         }
                         a.bored_ticks = 0;
@@ -370,8 +378,8 @@ void CoatiEngine::tick() {
     }
 
     // Fade updates
-    for (int x = 0; x < 32; x++) {
-        for (int y = 0; y < 8; y++) {
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
             if (current_board[x][y] && fade_board[x][y] < 1.0f) {
                 fade_board[x][y] += 0.032f;
                 if (fade_board[x][y] > 1.0f) fade_board[x][y] = 1.0f;

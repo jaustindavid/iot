@@ -10,7 +10,7 @@
 
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
-#define PIXEL_COUNT 256
+#define PIXEL_COUNT (GRID_WIDTH * GRID_HEIGHT)
 #define PIXEL_TYPE WS2812B
 
 Adafruit_NeoPixel strip(PIXEL_COUNT, SPI, PIXEL_TYPE);
@@ -212,26 +212,43 @@ void loop() {
         uint32_t blue = get_pixel_color(0, 0, 64, bri);
         
         auto map_pixel = [](int x, int y) {
-            if (x < 0 || x >= 32 || y < 0 || y >= 8) return 999; // Return invalid index
-            if (x % 2 == 0) return (x * 8) + y;
-            return (x * 8) + (7 - y);
+            if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return 999; // Return invalid index
+            int rx = x, ry = y;
+            int max_x = GRID_WIDTH - 1;
+            int max_y = GRID_HEIGHT - 1;
+            
+            if (GRID_ROTATION == 90) {
+                rx = max_y - y;
+                ry = x;
+            } else if (GRID_ROTATION == 180) {
+                rx = max_x - x;
+                ry = max_y - y;
+            } else if (GRID_ROTATION == 270) {
+                rx = y;
+                ry = max_x - x;
+            }
+
+            int phys_h = (GRID_ROTATION == 90 || GRID_ROTATION == 270) ? GRID_WIDTH : GRID_HEIGHT;
+            
+            if (rx % 2 == 0) return (rx * phys_h) + ry;
+            return (rx * phys_h) + ((phys_h - 1) - ry);
         };
         
         auto set_safe_pixel = [&](int x, int y, uint32_t color) {
             int idx = map_pixel(x, y);
-            if (idx < 256) strip.setPixelColor(idx, color);
+            if (idx >= 0 && idx < PIXEL_COUNT) strip.setPixelColor(idx, color);
         };
 
-        set_safe_pixel(0, 7, red);
-        set_safe_pixel(1, 7, red);
-        set_safe_pixel(30, 7, blue);
-        set_safe_pixel(31, 7, blue);
+        set_safe_pixel(0, GRID_HEIGHT - 1, red);
+        set_safe_pixel(1, GRID_HEIGHT - 1, red);
+        set_safe_pixel(GRID_WIDTH - 2, GRID_HEIGHT - 1, blue);
+        set_safe_pixel(GRID_WIDTH - 1, GRID_HEIGHT - 1, blue);
 
         // Draw physical pixels
-        for (int x = 0; x < 32; x++) {
-            for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < GRID_WIDTH; x++) {
+            for (int y = 0; y < GRID_HEIGHT; y++) {
                 if (engine.current_board[x][y]) {
-                    if (y == 7 && (x <= 1 || x >= 30)) continue;
+                    if (y == GRID_HEIGHT - 1 && (x <= 1 || x >= GRID_WIDTH - 2)) continue;
                     set_safe_pixel(x, y, get_pixel_color(0, 64, 0, engine.fade_board[x][y] * bri));
                 }
             }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Particle.h"
+#include "creds.h" // Injects device-specific GRID_WIDTH, GRID_HEIGHT, GRID_ROTATION
 #include <vector>
 #include <queue>
 #include <cmath>
@@ -31,12 +32,12 @@ struct CoatiAgent {
 
 class CoatiEngine {
 public:
-    bool current_board[32][8] = {false};
-    bool target_board[32][8] = {false};
-    float fade_board[32][8] = {0.0f};
+    bool current_board[GRID_WIDTH][GRID_HEIGHT] = {false};
+    bool target_board[GRID_WIDTH][GRID_HEIGHT] = {false};
+    float fade_board[GRID_WIDTH][GRID_HEIGHT] = {0.0f};
 
     // Staging buffer for target updates (font rendering)
-    bool pending_target[32][8] = {false};
+    bool pending_target[GRID_WIDTH][GRID_HEIGHT] = {false};
     volatile bool target_pending = false;
 
     std::vector<CoatiAgent> agents;
@@ -45,8 +46,8 @@ public:
     time_t pending_time = 0;
 
     // Const locations
-    Point dumpster[2] = {{0, 7}, {1, 7}};
-    Point pool[2] = {{30, 7}, {31, 7}};
+    Point dumpster[2] = {{0, GRID_HEIGHT - 1}, {1, GRID_HEIGHT - 1}};
+    Point pool[2] = {{GRID_WIDTH - 2, GRID_HEIGHT - 1}, {GRID_WIDTH - 1, GRID_HEIGHT - 1}};
 
     CoatiEngine();
 
@@ -59,14 +60,14 @@ public:
 
 private:
     // Pathfinding scratch space (member vars to avoid stack overflow)
-    bool pf_visited[32][8];
-    Point pf_parent[32][8];
-    float pf_cost[32][8];
+    bool pf_visited[GRID_WIDTH][GRID_HEIGHT];
+    Point pf_parent[GRID_WIDTH][GRID_HEIGHT];
+    float pf_cost[GRID_WIDTH][GRID_HEIGHT];
 
     Point find_closest(Point start, const std::vector<Point>& candidates);
     float dist(Point a, Point b) {
         return std::sqrt((a.x - b.x)*(a.x - b.x) + (a.y - b.y)*(a.y - b.y));
     }
 
-    void draw_digit(int x, char c);
+    void draw_digit(int x, int y_offset, char c);
 };
