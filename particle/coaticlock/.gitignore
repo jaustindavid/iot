@@ -1,7 +1,6 @@
 # Device-specific credentials
 src/creds.h
-rachel_raccoon.h
-ricky_raccoon.h
+*_raccoon.h
 *.h_template
 
 # Build artifacts

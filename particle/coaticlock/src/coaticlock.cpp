@@ -281,14 +281,17 @@ void loop() {
         uint32_t shimmer_red = get_pixel_color(64, 25, 25, bri);
 
         for (size_t i = 0; i < engine.agents.size(); i++) {
-            auto& a = engine.agents[i];
-            uint32_t agent_color;
-
+            CoatiAgent& a = engine.agents[i];
+            uint32_t agent_color = 0;
             if (a.carrying) {
                 float pulse = 0.7f + 0.3f * sin(now / 150.0f);
                 agent_color = get_pixel_color(64, 64, 0, pulse * bri);
             } else {
                 agent_color = (i == 0) ? white : cyan;
+            }
+
+            if (a.is_bored) {
+                agent_color = (i == 0) ? get_pixel_color(32, 32, 32, bri) : get_pixel_color(0, 32, 32, bri);
             }
 
             if (a.wait_ticks > 1) {

@@ -21,6 +21,7 @@ struct CoatiAgent {
     Point claimed_target = {-1, -1};
     int wait_ticks = 0;
     int bored_ticks = 0;
+    bool is_bored = false;
     int wash_ticks = 0;  // > 0: currently dunking at pool
     bool washed = false; // true: this carry has been washed, ready to place
     int pause_ticks = 0; // > 0: frozen after pickup/placement (counts down each tick)

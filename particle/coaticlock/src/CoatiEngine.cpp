@@ -60,10 +60,10 @@ void CoatiEngine::update_target(time_t virtual_now) {
     if (GRID_HEIGHT >= 16) {
         // Square layout (16x16)
         draw_digit(2, 1, h_str[0]);    // Top row
-        draw_digit(8, 1, h_str[1]);
+        draw_digit(9, 1, h_str[1]);
         
         draw_digit(2, 8, m_str[0]); // Bottom row
-        draw_digit(8, 8, m_str[1]);
+        draw_digit(9, 8, m_str[1]);
     } else {
         // Wide layout (e.g. 32x8)
         draw_digit(4, 1, h_str[0]);
@@ -344,37 +344,43 @@ void CoatiEngine::tick() {
                 a.claimed_target = dest;
                 path_calculated = true;
             } else {
-                bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
-                bool standing_on_pool = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == GRID_WIDTH - 2 || a.pos.x == GRID_WIDTH - 1));
-                bool floor_is_lava = current_board[a.pos.x][a.pos.y] && (a.pos.y != GRID_HEIGHT - 1);
-                
-                if (floor_is_lava || standing_on_dumpster || standing_on_pool) {
-                    Point dest;
-                    if (standing_on_dumpster) {
-                        dest = {2, GRID_HEIGHT - 1};
-                    } else if (standing_on_pool) {
-                        dest = {GRID_WIDTH - 3, GRID_HEIGHT - 1};
-                    } else {
-                        dest = { a.pos.x, GRID_HEIGHT - 1 };
-                        // Only divert the landing spot if it happens to fall exactly on the endpoints
-                        if (dest.x == 0 || dest.x == 1) dest.x = 2;
-                        if (dest.x == GRID_WIDTH - 2 || dest.x == GRID_WIDTH - 1) dest.x = GRID_WIDTH - 3;
-                    }
-                    a.current_path = find_path(a.pos, dest, (int)i);
-                    path_calculated = true;
-                } else {
-                    a.bored_ticks++;
-                    if (a.bored_ticks > 30) {
-                        if (rand() % 2 == 0) {
-                            int nx = a.pos.x + (rand() % 3 - 1);
-                            if (nx >= 0 && nx < GRID_WIDTH && a.pos.y == GRID_HEIGHT - 1) {
-                                bool is_dumpster_or_pool = (nx == 0 || nx == 1 || nx == GRID_WIDTH - 2 || nx == GRID_WIDTH - 1);
-                                if (!is_dumpster_or_pool) {
-                                    a.current_path = {{nx, GRID_HEIGHT - 1}};
-                                }
-                            }
+                a.is_bored = true;
+                bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x <= 1));
+                bool standing_on_pool = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x >= GRID_WIDTH - 2));
+
+                if (current_board[a.pos.x][a.pos.y] || standing_on_dumpster || standing_on_pool) {
+                    a.bored_ticks = 100; // Force immediate step away
+                }
+
+                a.bored_ticks++;
+                if (a.bored_ticks > 4) { // Evaluation speed for pacing
+                    a.bored_ticks = 0;
+
+                    std::vector<Point> safe_moves;
+                    bool near_lit = false;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dy = -1; dy <= 1; dy++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = a.pos.x + dx;
+                            int ny = a.pos.y + dy;
+                            if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
+                            if (current_board[nx][ny]) { near_lit = true; continue; }
+                            if (ny == GRID_HEIGHT - 1 && (nx <= 1 || nx >= GRID_WIDTH - 2)) continue;
+                            
+                            safe_moves.push_back({nx, ny});
                         }
-                        a.bored_ticks = 0;
+                    }
+
+                    if (current_board[a.pos.x][a.pos.y] || standing_on_dumpster || standing_on_pool) {
+                        near_lit = true; 
+                    }
+
+                    if (near_lit && !safe_moves.empty()) {
+                        Point choice = safe_moves[rand() % safe_moves.size()];
+                        a.current_path = {choice};
+                    } else if (!near_lit && (rand() % 100 < 25) && !safe_moves.empty()) {
+                        Point choice = safe_moves[rand() % safe_moves.size()];
+                        a.current_path = {choice};
                     }
                 }
             }
