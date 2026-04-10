@@ -3,6 +3,7 @@
 #include "CoatiEngine.h"
 #include "WobblyTime.h"
 #include "Stra2usClient.h"
+#include "LightSensor.h"
 #include "creds.h"
 
 // Application Firmware Revision
@@ -29,11 +30,11 @@ WobblyTime wobbly(120, 300, 1.3f, 0.7f);
 Stra2usClient client(STRA2US_HOST, STRA2US_PORT, STRA2US_CLIENT_ID, STRA2US_SECRET_HEX);
 
 // Global state
-float global_brightness = 0.7f;
-float param_min_brightness = 0.1f;
-float param_max_brightness = 1.0f;
-float global_lux = 0.0f;
-int param_heartbeep = 300;
+volatile float global_brightness = 0.7f;
+volatile float param_min_brightness = 0.1f;
+volatile float param_max_brightness = 1.0f;
+volatile float global_lux = 0.0f;
+volatile int param_heartbeep = 300;
 
 unsigned long last_physics_tick = 0;
 unsigned long last_render_tick = 0;
@@ -131,6 +132,7 @@ void poll_config() {
     snprintf(key, sizeof(key), "%s/%s/min_brightness", STRATUS_APP, STRA2US_CLIENT_ID);
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/min_brightness", val, sizeof(val))) {
         param_min_brightness = atof(val);
+        Log.info("updating min brightness: %s => %f", val, param_min_brightness);
     }
 
     // max_brightness
@@ -151,45 +153,41 @@ void telemetry_worker() {
         unsigned long now = millis();
         if (WiFi.ready() && (now - last_telemetry_tick >= ((unsigned long)param_heartbeep * 1000))) {
             last_telemetry_tick = now;
+            client.connect();      // fresh connect, always
             send_telemetry();
             poll_config();
+            client.close();        // hard close, always
         }
         delay(100);
     }
 }
 
 uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
-    return strip.Color((uint8_t)(r * bri), (uint8_t)(g * bri), (uint8_t)(b * bri));
+    if (bri == 0) return 0;
+    return strip.Color((uint8_t)(r?max(r*bri,1):0), 
+                       (uint8_t)(g?max(g*bri,1):0),
+                       (uint8_t)(b?max(b*bri,1):0));
 }
 
 void loop() {
     unsigned long now = millis();
+    static LightSensor light_sensor;
 
     // 1. Ambient Light Sensing (200ms)
     static unsigned long last_light_read = 0;
     if (now - last_light_read >= 200) {
         last_light_read = now;
         int raw = analogRead(A1);
-        float normalized = (4040.0f - (float)raw) / 4040.0f; 
-        if (normalized < 0.0f) normalized = 0.0f;
-        // Cascaded EMA low-pass filters to dampen ADC noise hunting
-        float current_lux = normalized * 500.0f;
-        global_lux = (current_lux * 0.05f) + (global_lux * 0.95f); 
-        float target = sqrtf(global_lux / 375.0f);
-        
-        // Safety bounds
-        if (param_max_brightness < 0.05f) param_max_brightness = 0.05f;
-        if (param_min_brightness < 0.0f) param_min_brightness = 0.0f;
+        float target = light_sensor.update(raw);
         target = constrain(target, param_min_brightness, param_max_brightness);
-        
-        // Massive 50-tick (10 second) rolling window to prevent visible LED micro-oscillations
         global_brightness = (target * 0.02f) + (global_brightness * 0.98f);
+
         
         static unsigned long last_light_log = 0;
         if (now - last_light_log >= 2000) {
             last_light_log = now;
-            Log.info("Light Sensor: Raw=%d (%.2f), Lux=%.1f, TargetBri=%.2f, GlobalBri=%.2f", 
-                     raw, normalized, global_lux, target, global_brightness);
+            Log.info("Light Sensor: Raw=%d TargetBri=%.2f, GlobalBri=%.2f", 
+                     raw, target, global_brightness);
         }
     }
 

@@ -43,6 +43,11 @@ void Stra2usClient::sign(const char* uri, const char* body, size_t body_len, uin
     out_hex[64] = '\0';
 }
 
+bool Stra2usClient::connect() {
+    if (_client.connected()) _client.stop();
+    return _client.connect(_host, _port);
+}
+
 void Stra2usClient::close() {
     if (_client.connected()) {
         _client.stop();
@@ -52,10 +57,7 @@ void Stra2usClient::close() {
 bool Stra2usClient::ensure_connected() {
     if (_client.connected()) return true;
     
-    if (_client.connect(_host, _port)) {
-        return true;
-    }
-    return false;
+    return _client.connect(_host, _port); 
 }
 
 bool Stra2usClient::send_all(const char* data, int len) {

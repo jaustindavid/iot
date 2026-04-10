@@ -22,6 +22,7 @@ public:
     // returns true if key was found
     bool kv_get(const char* key, char* val_out, size_t val_out_len);
 
+    bool connect();
     void close();
 
 private:
