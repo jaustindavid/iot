@@ -402,8 +402,25 @@ public:
             
             // Check for real-time collision with another agent
             bool collision = false;
+            int blocker = -1;
             for (size_t j = 0; j < agents.size(); j++) {
-                if (i != j && agents[j].pos == next_step) collision = true;
+                if (i != j && agents[j].pos == next_step) { collision = true; blocker = j; }
+            }
+
+            // Head-on swap: if both agents want each other's cell, let them
+            // pass through each other atomically instead of deadlocking.
+            if (collision && blocker != -1 && !agents[blocker].current_path.empty() &&
+                agents[blocker].current_path.front() == a.pos) {
+                agents[blocker].pos = a.pos;
+                agents[blocker].current_path.erase(agents[blocker].current_path.begin());
+                agents[blocker].wait_ticks = 0;
+                agents[blocker].stuck_ticks = 0;
+                a.pos = next_step;
+                a.current_path.erase(a.current_path.begin());
+                a.wait_ticks = 0;
+                a.stuck_ticks = 0;
+                ESP_LOGI("coati", "SWAP [%d]<->[%d]", (int)i, blocker);
+                continue;
             }
 
             if (collision) {
