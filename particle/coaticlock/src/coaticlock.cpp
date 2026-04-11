@@ -29,11 +29,14 @@ CoatiEngine engine;
 WobblyTime wobbly(120, 300, 1.3f, 0.7f);
 Stra2usClient client(STRA2US_HOST, STRA2US_PORT, STRA2US_CLIENT_ID, STRA2US_SECRET_HEX);
 
+// Light Sensor class
+LightSensor light_sensor;
+
 // Global state
 volatile float global_brightness = 0.7f;
 volatile float param_min_brightness = 0.1f;
 volatile float param_max_brightness = 1.0f;
-volatile float global_lux = 0.0f;
+volatile int global_cds = 0;
 volatile int param_heartbeep = 300;
 
 unsigned long last_physics_tick = 0;
@@ -45,45 +48,47 @@ int last_display_minute = -1;
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 void setup() {
-    // Hardware setup
-    pinMode(A0, OUTPUT);
-    digitalWrite(A0, HIGH); // Power CDS divider
-    pinMode(A2, OUTPUT);
-    digitalWrite(A2, LOW);  // Ground CDS divider
-    
-    strip.begin();
-    strip.show();
+	// Hardware setup
+	pinMode(A0, OUTPUT);
+	digitalWrite(A0, HIGH); // Power CDS divider
+	pinMode(A2, OUTPUT);
+	digitalWrite(A2, LOW);  // Ground CDS divider
 
-    // Time setup
-    Time.zone(-5); // Default to EST, can be updated via telemetry
-    Particle.syncTime();
-    
-    // Defer first telemetry for 15s to allow network stack to stabilize
-    last_telemetry_tick = millis() - (param_heartbeep * 1000) + 15000; 
+	strip.begin();
+	strip.show();
 
-    telemetryThread = new Thread("IoT", telemetry_worker, OS_THREAD_PRIORITY_DEFAULT, 10240);
-    Log.info("Coaticlock Initialized. Version: " APP_VERSION);
+	// Time setup
+	Time.zone(-5); // Default to EST, can be updated via telemetry
+	Particle.syncTime();
+
+	// Defer first telemetry for 15s to allow network stack to stabilize
+	last_telemetry_tick = millis() - (param_heartbeep * 1000) + 15000; 
+
+	telemetryThread = new Thread("IoT", telemetry_worker, OS_THREAD_PRIORITY_DEFAULT, 10240);
+	Log.info("Coaticlock Initialized. Version: " APP_VERSION);
 }
 
 void send_telemetry() {
-    if (!Time.isValid()) return;
-    Log.info("Telemetry: Sending Heartbeat...");
-    
-    // 1. Send Heartbeat
-    char report[256];
-    uint32_t uptime = System.uptime();
-    Log.info("Telemetry: Getting RSSI...");
-    int rssi = -127;
-    if (WiFi.ready()) {
-        WiFiSignal sig = WiFi.RSSI();
-        rssi = sig.getStrength();
-    }
-    
-    Log.info("Telemetry: Formatting report...");
-    int rlen = snprintf(report, sizeof(report), 
-             "up=%lu rssi=%d mem=%lu rst=%d fw=%s lux=%.1f bri=%.2f p_minbri=%.2f p_maxbri=%.2f p_hb=%d",
+	if (!Time.isValid()) return;
+	Log.info("Telemetry: Sending Heartbeat...");
+
+	// 1. Send Heartbeat
+	char report[256];
+	uint32_t uptime = System.uptime();
+	Log.info("Telemetry: Getting RSSI...");
+	int rssi = -127;
+	if (WiFi.ready()) {
+		WiFiSignal sig = WiFi.RSSI();
+		rssi = sig.getStrength();
+	}
+
+	Log.info("Telemetry: Formatting report...");
+	int rlen = snprintf(report, sizeof(report), 
+			"up=%lu rssi=%d mem=%lu rst=%d fw=%s lux(%d, %d, %d)->bri=(%.2f < %.2f < %.2f) p_hb=%ds",
              uptime, rssi, (unsigned long)System.freeMemory(), (int)System.resetReason(), APP_VERSION,
-             global_lux, global_brightness, param_min_brightness, param_max_brightness, param_heartbeep);
+             global_cds, light_sensor.cal_dark, light_sensor.cal_bright, 
+             param_min_brightness, global_brightness, param_max_brightness,
+             param_heartbeep);
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
     
     Log.info("Telemetry: Publishing to topic %s...", STRATUS_APP);
@@ -141,6 +146,11 @@ void poll_config() {
         param_max_brightness = atof(val);
     }
 
+    // lux_exponent
+    snprintf(key, sizeof(key), "%s/%s/lux_exponent", STRATUS_APP, STRA2US_CLIENT_ID);
+    if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/lux_exponent", val, sizeof(val))) {
+        light_sensor.set_exponent(atof(val));
+    }
     // heartbeep
     snprintf(key, sizeof(key), "%s/%s/heartbeep", STRATUS_APP, STRA2US_CLIENT_ID);
     if (client.kv_get(key, val, sizeof(val)) || client.kv_get(STRATUS_APP "/heartbeep", val, sizeof(val))) {
@@ -171,13 +181,13 @@ uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
 
 void loop() {
     unsigned long now = millis();
-    static LightSensor light_sensor;
 
     // 1. Ambient Light Sensing (200ms)
     static unsigned long last_light_read = 0;
     if (now - last_light_read >= 200) {
         last_light_read = now;
         int raw = analogRead(A1);
+	global_cds = raw;
         float target = light_sensor.update(raw);
         target = constrain(target, param_min_brightness, param_max_brightness);
         global_brightness = (target * 0.02f) + (global_brightness * 0.98f);
