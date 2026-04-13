@@ -1,5 +1,14 @@
 const API_BASE = '/api/admin';
 
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // Navigation Logic
 document.querySelectorAll('.nav-links a').forEach(link => {
     link.addEventListener('click', (e) => {
@@ -78,29 +87,33 @@ async function fetchStats() {
 
     const qList = document.getElementById('queueList');
     const sortedQueues = [...data.queues].sort((a, b) => a.topic.localeCompare(b.topic));
-    qList.innerHTML = sortedQueues.map(q => `
+    qList.innerHTML = sortedQueues.map(q => {
+        const t = escapeHtml(q.topic);
+        return `
         <div class="data-item">
-            <div><strong>${q.topic}</strong> (Msg Count: ${q.count})</div>
+            <div><strong>${t}</strong> (Msg Count: ${q.count})</div>
             <div>
-                <button class="btn-sm" onclick="peekData('q', '${q.topic}')">Peek</button>
-                <button class="btn-sm" onclick="openMonitor('${q.topic}')">Monitor</button>
-                <button class="btn-sm danger" onclick="deleteData('q', '${q.topic}')">Delete</button>
+                <button class="btn-sm" onclick="peekData('q', '${t}')">Peek</button>
+                <button class="btn-sm" onclick="openMonitor('${t}')">Monitor</button>
+                <button class="btn-sm danger" onclick="deleteData('q', '${t}')">Delete</button>
             </div>
         </div>
-    `).join('') || '<div class="text-muted">No active queues</div>';
+    `}).join('') || '<div class="text-muted">No active queues</div>';
 
     const kvList = document.getElementById('kvList');
     const sortedKvs = [...data.kvs].sort((a, b) => a.key.localeCompare(b.key));
-    kvList.innerHTML = sortedKvs.map(k => `
+    kvList.innerHTML = sortedKvs.map(k => {
+        const key = escapeHtml(k.key);
+        return `
         <div class="data-item">
-            <div><strong>${k.key}</strong></div>
+            <div><strong>${key}</strong></div>
             <div>
-                <button class="btn-sm" onclick="editData('kv', '${k.key}')">Edit</button>
-                <button class="btn-sm" onclick="peekData('kv', '${k.key}')">Read</button>
-                <button class="btn-sm danger" onclick="deleteData('kv', '${k.key}')">Delete</button>
+                <button class="btn-sm" onclick="editData('kv', '${key}')">Edit</button>
+                <button class="btn-sm" onclick="peekData('kv', '${key}')">Read</button>
+                <button class="btn-sm danger" onclick="deleteData('kv', '${key}')">Delete</button>
             </div>
         </div>
-    `).join('') || '<div class="text-muted">No active KV pairs</div>';
+    `}).join('') || '<div class="text-muted">No active KV pairs</div>';
 }
 
 async function peekData(type, keyId) {
@@ -127,8 +140,12 @@ async function deleteData(type, keyId) {
 document.querySelectorAll('.close-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
         const modal = e.target.closest('.modal');
-        if (modal) modal.style.display = 'none';
-        if (modal.id === 'aclModal') closeAclModal();
+        if (!modal) return;
+        if (modal.id === 'aclModal') {
+            closeAclModal();
+        } else {
+            modal.style.display = 'none';
+        }
     });
 });
 
@@ -184,7 +201,7 @@ function formatAclSummary(acl) {
                color:${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
                border:1px solid ${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
                font-size:0.75rem; margin-right:4px;">
-            ${p.prefix}&thinsp;:&thinsp;${p.access}</span>`
+            ${escapeHtml(p.prefix)}&thinsp;:&thinsp;${escapeHtml(p.access)}</span>`
     ).join('');
 }
 
@@ -195,16 +212,18 @@ async function fetchKeys() {
 
     const tbody = document.getElementById('clientsTableBody');
     const sortedClients = [...clients].sort((a, b) => a.client_id.localeCompare(b.client_id));
-    tbody.innerHTML = sortedClients.map(c => `
+    tbody.innerHTML = sortedClients.map(c => {
+        const id = escapeHtml(c.client_id);
+        return `
         <tr>
-            <td><strong>${c.client_id}</strong></td>
+            <td><strong>${id}</strong></td>
             <td>${formatAclSummary(c.acl)}</td>
             <td style="white-space:nowrap;">
-                <button class="btn-sm" onclick="openAclModal('${c.client_id}')">Edit ACL</button>
-                <button class="btn-sm danger" onclick="revokeClient('${c.client_id}')">Revoke</button>
+                <button class="btn-sm" onclick="openAclModal('${id}')">Edit ACL</button>
+                <button class="btn-sm danger" onclick="revokeClient('${id}')">Revoke</button>
             </td>
         </tr>
-    `).join('');
+    `}).join('');
 }
 
 document.getElementById('keyForm').addEventListener('submit', async (e) => {
@@ -269,9 +288,9 @@ function renderAclPermissions() {
     }
     list.innerHTML = aclCurrentPermissions.map((p, i) => `
         <div class="acl-rule-row">
-            <span class="acl-prefix-label">${p.prefix}</span>
+            <span class="acl-prefix-label">${escapeHtml(p.prefix)}</span>
             <button class="acl-access-toggle ${p.access === 'rw' ? 'access-rw' : 'access-r'}"
-                    onclick="aclToggleAccess(${i})">${p.access}</button>
+                    onclick="aclToggleAccess(${i})">${escapeHtml(p.access)}</button>
             <button class="btn-sm danger" onclick="aclRemoveRule(${i})">&#x2715;</button>
         </div>
     `).join('');
@@ -332,9 +351,9 @@ async function fetchLogs() {
     tbody.innerHTML = logs.map(l => `
         <tr>
             <td style="color:var(--text-muted);">${formatTime(l.timestamp)}</td>
-            <td style="color:var(--accent-blue);">${l.client_id}</td>
-            <td>${l.action}</td>
-            <td style="color:${l.status.startsWith('Success') ? 'var(--accent-success)' : 'var(--accent-danger)'}">${l.status}</td>
+            <td style="color:var(--accent-blue);">${escapeHtml(l.client_id)}</td>
+            <td>${escapeHtml(l.action)}</td>
+            <td style="color:${l.status.startsWith('Success') ? 'var(--accent-success)' : 'var(--accent-danger)'}">${escapeHtml(l.status)}</td>
         </tr>
     `).join('');
 }
@@ -419,8 +438,8 @@ function monitorClientColor(clientId) {
 
 function monitorFormatData(data) {
     if (data === null || data === undefined) return '<em>null</em>';
-    if (typeof data === 'object') return JSON.stringify(data);
-    return String(data);
+    if (typeof data === 'object') return escapeHtml(JSON.stringify(data));
+    return escapeHtml(String(data));
 }
 
 async function monitorPoll() {
@@ -450,7 +469,7 @@ async function monitorPoll() {
         row.className = 'monitor-row monitor-row-new';
         row.innerHTML = `
             <span class="monitor-ts">${ts}</span>
-            <span class="monitor-badge" style="background:${color}22; color:${color}; border-color:${color}44;">${msg.client_id}</span>
+            <span class="monitor-badge" style="background:${color}22; color:${color}; border-color:${color}44;">${escapeHtml(msg.client_id)}</span>
             <span class="monitor-data">${dataStr}</span>
         `;
         // Prepend so newest is at top
