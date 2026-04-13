@@ -11,7 +11,6 @@ from api.routes_admin import router as admin_router
 app = FastAPI(title="IoT Telemetry Service")
 
 import time
-import msgpack
 import base64
 from fastapi import Request, Response
 from core.redis_client import get_redis_client
@@ -80,8 +79,15 @@ async def activity_log_middleware(request: Request, call_next):
             }
 
             redis = get_redis_client()
-            await redis.lpush("system:activity_log", msgpack.packb(log_entry))
-            await redis.ltrim("system:activity_log", 0, 999)
+            await redis.xadd("system:activity_log", {
+                "timestamp": str(log_entry["timestamp"]),
+                "client_id": log_entry["client_id"],
+                "action":    log_entry["action"],
+                "status":    log_entry["status"],
+            }, maxlen=150000, approximate=True)
+            # Trim entries older than 24 hours
+            min_id = str((int(time.time()) - 86400) * 1000)
+            await redis.xtrim("system:activity_log", minid=min_id)
 
     return response
 

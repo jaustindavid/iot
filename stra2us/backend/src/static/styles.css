@@ -476,6 +476,27 @@ input:focus, select:focus { border-color: var(--accent-blue); }
 
 .accent-blue { color: var(--accent-blue); }
 
+/* Log filter chips */
+.filter-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+.filter-chip {
+    padding: 5px 14px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid var(--border-light);
+    background: rgba(255,255,255,0.03);
+    color: var(--text-muted);
+    transition: all 0.2s;
+    font-family: 'Inter', sans-serif;
+}
+.filter-chip:hover { border-color: var(--accent-blue); color: var(--text-primary); }
+.filter-chip.active {
+    background: rgba(0, 240, 255, 0.15);
+    color: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
 .btn-header-action { float: right; margin-top: -4px; }
 .btn-danger-gradient { margin-top: 16px; background: linear-gradient(90deg, #cc0044, #d44060); }
 .file-input { padding: 10px; }

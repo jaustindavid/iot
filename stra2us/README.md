@@ -175,3 +175,42 @@ curl -u admin:password -X POST "http://localhost:8000/api/admin/keys/restore?for
 ```
 
 > ⚠️ Backup files contain raw HMAC secrets. Treat them like a password manager export — never commit to version control.
+
+---
+
+## Changelog
+
+### 2026-04-13 — Admin UI cleanup + Activity Log overhaul
+
+**UI hardening & cleanup**
+
+- Fixed missing CSS `@keyframes pulse` — the Topic Monitor "Live" indicator now animates as intended.
+- Added missing `.text-muted` CSS class — empty-state messages ("No active queues", etc.) now render in muted gray instead of bright white.
+- Removed unused `.logo` CSS rule (dead code; sidebar uses `.sidebar-logo`).
+- Extracted ~25 inline `style=` attributes from `index.html` into named CSS classes (`form-label`, `form-hint`, `modal-actions`, `monitor-controls`, `card-toolbar`, `btn-ghost`, `filter-chip`, etc.) for maintainability.
+- Added `escapeHtml()` sanitization to all dynamic content injected via JS template literals — topic names, client IDs, KV keys, log fields, and monitor data. Prevents XSS if any of these values contain HTML special characters.
+- Fixed null-guard bug in the modal close-button handler (`app.js`) that could throw a TypeError if `.closest('.modal')` returned null.
+
+**Activity Log: storage + retention**
+
+- Migrated `system:activity_log` from a Redis LIST (capped at 1,000 entries with no time awareness) to a Redis STREAM with dual-constraint retention:
+  - **Time-based:** entries older than 24 hours are trimmed via `XTRIM MINID`.
+  - **Count-based safety cap:** `MAXLEN ~ 150000` (~11 MB) prevents unbounded growth from unusually chatty clients.
+- Rationale: the previous 1,000-entry cap provided only minutes of history at moderate traffic. The new policy retains a full 24 hours for normal workloads while bounding worst-case storage.
+- **Migration note:** `system:activity_log` changed from LIST to STREAM type. Before deploying, delete the old key: `docker exec stra2us-iot redis-cli DEL system:activity_log`. Client credentials and queue data are not affected.
+
+**Activity Log: per-client filtering**
+
+- Added `client_id` query parameter to `GET /api/admin/logs` — accepts one or more client IDs for server-side filtering. Default (omitted) returns all clients.
+- Default limit increased from 50 to 200 to take advantage of deeper retention.
+- Admin UI now shows toggle-able filter chips above the log table, one per registered client. Default is "show all"; clicking a chip filters to that client. Multiple chips can be active simultaneously.
+- Client chip list refreshes each time the Activity Logs tab is opened (picks up newly registered clients).
+
+**Validation performed:**
+
+- Pulse animation confirmed working on Topic Monitor live indicator.
+- All modals (Peek, KV Editor, ACL Editor) open and close correctly after close-button handler fix.
+- Dashboard, Key Management, ACL editing, Topic Monitor, Backup/Restore all verified functional after CSS refactor — no visual regressions.
+- Log filter chips render for all registered clients; toggling filters correctly; deselecting all returns to full view; 5-second auto-refresh respects active filter.
+- Peek, Delete, Edit operations on queues and KV pairs confirmed working after `routes_admin.py` edits.
+- Backup download confirmed producing valid JSON after file edits.

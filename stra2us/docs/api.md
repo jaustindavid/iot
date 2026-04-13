@@ -264,13 +264,26 @@ Delete a KV entry.
 
 ### `GET /api/admin/logs`
 
-Returns the last N activity log entries.
+Returns the most recent activity log entries, newest first. Logs are stored in a Redis Stream with dual retention: entries older than 24 hours are trimmed, with a safety cap of 150,000 entries (~11 MB) to bound storage from unusually chatty clients.
 
 **Query Parameters:**
 
 | Parameter | Default | Description |
 |---|---|---|
-| `limit` | 50 | Max number of log entries to return |
+| `limit` | 200 | Max number of log entries to return |
+| `client_id` | *(none)* | Filter by one or more client IDs. Repeat the parameter to select multiple clients (e.g. `?client_id=bb32&client_id=coaticlock`). When omitted, all clients are returned. |
+
+**Response `200 OK`:**
+```json
+[
+  {
+    "timestamp": 1712345678,
+    "client_id": "bb32",
+    "action": "POST /q/coaticlock",
+    "status": "Success (200)"
+  }
+]
+```
 
 ---
 
@@ -283,4 +296,4 @@ Returns the last N activity log entries.
 | `q:{topic}` | Stream | Message queue |
 | `kv:{key}` | String | Persistent KV value (raw msgpack) |
 | `cursor:{client_id}:q:{topic}` | String | Per-client read cursor for a queue |
-| `system:activity_log` | List | Rolling 1000-entry activity log |
+| `system:activity_log` | Stream | Activity log — 24h retention with 150K entry safety cap |

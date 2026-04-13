@@ -26,7 +26,7 @@ document.querySelectorAll('.nav-links a').forEach(link => {
         // Fetch specifics immediately on tab switch
         if (targetId === 'dashboard') fetchStats();
         if (targetId === 'keys') fetchKeys();
-        if (targetId === 'logs') fetchLogs();
+        if (targetId === 'logs') { logClientsLoaded = false; fetchLogs(); }
     });
 });
 
@@ -345,8 +345,47 @@ document.getElementById('aclNewPrefix').addEventListener('keydown', e => {
 });
 
 // 3. Activity Logs
+let logFilterClients = new Set();
+let logKnownClients = [];
+let logClientsLoaded = false;
+
+async function loadLogClients() {
+    if (logClientsLoaded) return;
+    const { data: clients } = await fetchAPI('/keys');
+    logKnownClients = clients.map(c => c.client_id).sort();
+    logClientsLoaded = true;
+    renderLogChips();
+}
+
+function renderLogChips() {
+    const container = document.getElementById('logFilterChips');
+    container.innerHTML = logKnownClients.map(id => {
+        const eid = escapeHtml(id);
+        const active = logFilterClients.has(id) ? ' active' : '';
+        return `<button class="filter-chip${active}" data-client="${eid}">${eid}</button>`;
+    }).join('');
+
+    container.querySelectorAll('.filter-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const clientId = chip.dataset.client;
+            if (logFilterClients.has(clientId)) {
+                logFilterClients.delete(clientId);
+            } else {
+                logFilterClients.add(clientId);
+            }
+            renderLogChips();
+            fetchLogs();
+        });
+    });
+}
+
 async function fetchLogs() {
-    const { data: logs } = await fetchAPI('/logs?limit=50');
+    await loadLogClients();
+    let endpoint = '/logs?limit=200';
+    for (const id of logFilterClients) {
+        endpoint += `&client_id=${encodeURIComponent(id)}`;
+    }
+    const { data: logs } = await fetchAPI(endpoint);
     const tbody = document.getElementById('logsTableBody');
     tbody.innerHTML = logs.map(l => `
         <tr>

@@ -155,15 +155,32 @@ async def delete_queue(topic: str):
     return {"status": "ok"}
 
 @router.get("/logs")
-async def get_logs(limit: int = 50):
+async def get_logs(limit: int = 200, client_id: Optional[List[str]] = Query(None)):
     redis = get_redis_client()
-    logs_raw = await redis.lrange("system:activity_log", 0, limit - 1)
+    # Fetch extra entries when filtering so we can fill the page
+    fetch_count = limit if not client_id else min(limit * 10, 5000)
+    records = await redis.xrevrange("system:activity_log", max="+", min="-", count=fetch_count)
+
     logs = []
-    for l in logs_raw:
-        try:
-            logs.append(msgpack.unpackb(l))
-        except Exception:
-            pass
+    for msg_id, fields in records:
+        cid = fields.get(b"client_id", b"unknown")
+        if isinstance(cid, bytes):
+            cid = cid.decode("utf-8")
+
+        if client_id and cid not in client_id:
+            continue
+
+        action = fields.get(b"action", b"")
+        status = fields.get(b"status", b"")
+        logs.append({
+            "timestamp": int(fields.get(b"timestamp", b"0")),
+            "client_id": cid,
+            "action":    action.decode("utf-8") if isinstance(action, bytes) else action,
+            "status":    status.decode("utf-8") if isinstance(status, bytes) else status,
+        })
+        if len(logs) >= limit:
+            break
+
     return logs
 
 
