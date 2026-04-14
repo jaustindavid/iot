@@ -202,21 +202,52 @@ def _parse_terms(text: str) -> list[TermIR]:
 
 # ── Agents ──────────────────────────────────────────────────────
 
+def _coerce_prop_value(raw: str, ptype: str):
+    raw = raw.strip()
+    if ptype == "bool":
+        return raw.lower() not in ("false", "0", "off")
+    if ptype == "int":
+        return int(raw)
+    if ptype == "float":
+        return float(raw)
+    return raw
+
+
+def _parse_kv_tail(s: str) -> list[tuple[str, str]]:
+    """Parse ', k = v, k2 = v2' tail into list of (name, raw_value) pairs.
+    Values are taken as comma-separated tokens; doesn't support coords/tuples
+    in overrides (properties are scalars by construction)."""
+    out: list[tuple[str, str]] = []
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(r"(\w+)\s*=\s*(.+)$", chunk)
+        if not m:
+            raise ParseError(f"expected 'name = value' in override: {chunk!r}")
+        out.append((m.group(1), m.group(2).strip()))
+    return out
+
+
 def _parse_agents(text: str) -> AgentsIR:
     lines = _strip_comments(text)
     type_name = "agent"
     count = 1
-    starts: list[tuple[int, int]] = []
+    starts_by_index: dict[int, tuple[int, int]] = {}
     properties: list[PropertyIR] = []
     pool_mode = False
     spawn_point = None
+    # Raw overrides: slot → list of (prop_name, raw_value). Coerced once all
+    # properties are declared, so declaration order doesn't matter.
+    raw_overrides: dict[int, list[tuple[str, str]]] = {}
 
     in_properties = False
     for line in lines:
-        stripped = line.strip().lower()
+        stripped = line.strip()
+        low = stripped.lower()
 
         # "up to 12 ant agents"
-        m = re.match(r"up\s+to\s+(\d+)\s+(\w+)\s+agents?", stripped)
+        m = re.match(r"up\s+to\s+(\d+)\s+(\w+)\s+agents?", low)
         if m:
             count = int(m.group(1))
             type_name = m.group(2)
@@ -224,25 +255,39 @@ def _parse_agents(text: str) -> AgentsIR:
             continue
 
         # "2 coati agents"
-        m = re.match(r"(\d+)\s+(\w+)\s+agents?", stripped)
+        m = re.match(r"(\d+)\s+(\w+)\s+agents?", low)
         if m:
             count = int(m.group(1))
             type_name = m.group(2)
             continue
 
         # "spawn at (0, 7)"
-        m = re.match(r"spawn\s+at\s+(.+)", stripped)
+        m = re.match(r"spawn\s+at\s+(.+)", low)
         if m:
             spawn_point = _parse_coord(m.group(1))
             continue
 
-        # "coati 0 starts at (8, 4)"
-        m = re.match(r"\w+\s+(\d+)\s+starts?\s+at\s+(.+)", stripped)
+        # "aphid 0 starts at (8, 4)[, role = 1, ...]"
+        m = re.match(r"\w+\s+(\d+)\s+starts?\s+at\s+(\([^)]+\))\s*(?:,\s*(.+))?$", stripped)
         if m:
-            starts.append(_parse_coord(m.group(2)))
+            idx = int(m.group(1))
+            starts_by_index[idx] = _parse_coord(m.group(2))
+            tail = m.group(3)
+            if tail:
+                raw_overrides.setdefault(idx, []).extend(_parse_kv_tail(tail))
             continue
 
-        if stripped == "properties:":
+        # "aphid 0: role = 1, pause_counter = 30"   (property-only form)
+        # Guard: only match when not inside the properties block and when
+        # the token before the colon is <type_name> <int>.
+        if not in_properties:
+            m = re.match(r"(\w+)\s+(\d+)\s*:\s*(.+)$", stripped)
+            if m and (m.group(1).lower() == type_name or type_name == "agent"):
+                idx = int(m.group(2))
+                raw_overrides.setdefault(idx, []).extend(_parse_kv_tail(m.group(3)))
+                continue
+
+        if low == "properties:":
             in_properties = True
             continue
 
@@ -251,19 +296,44 @@ def _parse_agents(text: str) -> AgentsIR:
             m = re.match(r"(\w+)\s*:\s*(\w+)\s*=\s*(.+)", stripped)
             if m:
                 pname = m.group(1)
-                ptype = m.group(2)
-                raw = m.group(3).strip()
-                if ptype == "bool":
-                    default = raw not in ("false", "0", "off")
-                elif ptype == "int":
-                    default = int(raw)
-                elif ptype == "float":
-                    default = float(raw)
-                else:
-                    default = raw
+                ptype = m.group(2).lower()
+                default = _coerce_prop_value(m.group(3), ptype)
                 properties.append(PropertyIR(pname, ptype, default))
 
-    return AgentsIR(type_name, count, starts, properties, pool_mode, spawn_point)
+    # Coerce raw overrides now that properties are known.
+    prop_types = {p.name: p.type for p in properties}
+    overrides: dict[int, dict[str, object]] = {}
+    for idx, kvs in raw_overrides.items():
+        if idx >= count or idx < 0:
+            raise ParseError(
+                f"{type_name} {idx}: index out of range (count is {count})"
+            )
+        slot: dict[str, object] = {}
+        for name, raw in kvs:
+            if name not in prop_types:
+                raise ParseError(
+                    f"{type_name} {idx}: unknown property {name!r} "
+                    f"(declared: {list(prop_types) or 'none'})"
+                )
+            slot[name] = _coerce_prop_value(raw, prop_types[name])
+        overrides[idx] = slot
+
+    # Validate explicit start indices too.
+    for idx in starts_by_index:
+        if idx >= count or idx < 0:
+            raise ParseError(
+                f"{type_name} {idx}: index out of range (count is {count})"
+            )
+    # In pool mode, a 'starts at' for a specific slot means "pre-place that
+    # slot active at init"; the rest follow the usual spawn logic.
+
+    # Backward-compatible flat `starts` list, ordered by index ascending.
+    starts = [starts_by_index[i] for i in sorted(starts_by_index)]
+
+    return AgentsIR(
+        type_name, count, starts, properties, pool_mode, spawn_point,
+        overrides=overrides, starts_by_index=dict(starts_by_index),
+    )
 
 
 # ── Pathfinding ─────────────────────────────────────────────────
@@ -338,10 +408,19 @@ def _parse_condition(text: str) -> ConditionNode:
     if m:
         return ConditionNode(op="gte", prop=m.group(1), value=_try_numeric(m.group(2)))
 
-    # "<prop> is <value>"
+    # "<prop> is <value>" / "<prop> == <value>"
     m = re.match(r"(\w+)\s+is\s+(\d+|true|false)$", text)
     if m:
         return ConditionNode(op="eq", prop=m.group(1), value=_try_numeric(m.group(2)))
+    m = re.match(r"(\w+)\s*==\s*(\d+|true|false)$", text)
+    if m:
+        return ConditionNode(op="eq", prop=m.group(1), value=_try_numeric(m.group(2)))
+    m = re.match(r"(\w+)\s*<\s*([\d.]+)$", text)
+    if m:
+        return ConditionNode(op="lt", prop=m.group(1), value=_try_numeric(m.group(2)))
+    m = re.match(r"(\w+)\s*<=\s*([\d.]+)$", text)
+    if m:
+        return ConditionNode(op="lte", prop=m.group(1), value=_try_numeric(m.group(2)))
 
     # "at claimed"
     if text == "at claimed":
@@ -495,6 +574,11 @@ def _parse_action(text: str) -> ActionNode | None:
     if m:
         return ActionNode(action="seek_nearest", term=m.group(1))
 
+    # "seek nearest <landmark>" — pick closest cell of landmark
+    m = re.match(r"seek\s+nearest\s+(\w+)$", text)
+    if m:
+        return ActionNode(action="seek_nearest_landmark", landmark=m.group(1))
+
     # "seek <landmark>"
     m = re.match(r"seek\s+(\w+)$", text)
     if m:
@@ -516,6 +600,12 @@ def _parse_action(text: str) -> ActionNode | None:
     # "despawn"
     if text == "despawn":
         return ActionNode(action="despawn")
+
+    # "despawn neighbors where <term>"  (hunter action: despawn any other
+    # active agent in an adjacent cell whose pos is in <term>'s cells)
+    m = re.match(r"despawn\s+neighbors\s+where\s+(\w+)$", text)
+    if m:
+        return ActionNode(action="despawn_neighbors", term=m.group(1))
 
     # "become bored"
     if text == "become bored":
@@ -818,13 +908,54 @@ def _parse_spawning(text: str) -> SpawningIR:
 
 # ── Main Entry Point ────────────────────────────────────────────
 
-def parse(text: str) -> CoatiIR:
-    """Parse a .coati script string into a CoatiIR."""
+_MAX_XY_RE = re.compile(r"\b(max_x|max_y)(?:\s*([+-])\s*(\d+))?")
+
+def _substitute_max_xy(text: str, max_x: int, max_y: int) -> str:
+    """Replace max_x / max_y (with optional +/- N) in text by their integer values."""
+    def repl(m: re.Match) -> str:
+        base = max_x if m.group(1) == "max_x" else max_y
+        op = m.group(2)
+        if op == "-":
+            base -= int(m.group(3))
+        elif op == "+":
+            base += int(m.group(3))
+        return str(base)
+    return _MAX_XY_RE.sub(repl, text)
+
+
+def parse(text: str, grid_width: int | None = None, grid_height: int | None = None) -> CoatiIR:
+    """Parse a .coati script string into a CoatiIR.
+
+    `grid_width`/`GRID_HEIGHT` (if given) override the grid dimensions declared in the
+    script. `max_x` / `max_y` tokens in coordinate expressions resolve to
+    (width-1) / (height-1) after the override is applied.
+    """
     sections = _split_sections(text)
     ir = CoatiIR()
 
     if "grid" in sections:
         ir.grid = _parse_grid(sections["grid"])
+    if grid_width is not None:
+        ir.grid.width = grid_width
+    if grid_height is not None:
+        ir.grid.height = grid_height
+
+    # Only two layouts are supported today: 32x8 (wide) and 16x16 (square).
+    _valid = {(32, 8), (16, 16)}
+    if (ir.grid.width, ir.grid.height) not in _valid:
+        raise ParseError(
+            f"unsupported grid dimensions {ir.grid.width}x{ir.grid.height}; "
+            f"only 32x8 and 16x16 are supported"
+        )
+
+    # Resolve max_x / max_y across remaining sections now that grid is fixed.
+    max_x = ir.grid.width - 1
+    max_y = ir.grid.height - 1
+    for name in list(sections.keys()):
+        if name == "grid":
+            continue
+        sections[name] = _substitute_max_xy(sections[name], max_x, max_y)
+
     if "layers" in sections:
         ir.layers = _parse_layers(sections["layers"])
     if "landmarks" in sections:
@@ -849,7 +980,7 @@ def parse(text: str) -> CoatiIR:
     return ir
 
 
-def parse_file(path: str) -> CoatiIR:
+def parse_file(path: str, grid_width: int | None = None, grid_height: int | None = None) -> CoatiIR:
     """Parse a .coati file by path."""
     with open(path) as f:
-        return parse(f.read())
+        return parse(f.read(), grid_width=grid_width, grid_height=grid_height)

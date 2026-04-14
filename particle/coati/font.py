@@ -44,17 +44,22 @@ def render_time(hour: int, minute: int, grid_w: int, grid_h: int,
     m_str = f"{minute:02d}"
     pixels: set[tuple[int, int]] = set()
 
+    # On square 16x16 panels there's no room for a horizontal HH:MM — stack
+    # HH over MM regardless of the script's declared layout.
+    if grid_w == 16 and grid_h == 16:
+        layout = "stacked"
+
     if layout == "horizontal":
         # Wide layout (32x8): digits at x=4,10,17,23 with y_offset=1
         pixels |= render_glyph(h_str[0], 4, 1, grid_w, grid_h)
         pixels |= render_glyph(h_str[1], 10, 1, grid_w, grid_h)
         pixels |= render_glyph(m_str[0], 17, 1, grid_w, grid_h)
         pixels |= render_glyph(m_str[1], 23, 1, grid_w, grid_h)
-    elif layout == "grid":
-        # Square layout (16x16): 2x2 grid
+    elif layout in ("grid", "stacked"):
+        # Square layout (16x16): HH on top half, MM on bottom half.
         pixels |= render_glyph(h_str[0], 2, 1, grid_w, grid_h)
         pixels |= render_glyph(h_str[1], 9, 1, grid_w, grid_h)
-        pixels |= render_glyph(m_str[0], 2, 8, grid_w, grid_h)
-        pixels |= render_glyph(m_str[1], 9, 8, grid_w, grid_h)
+        pixels |= render_glyph(m_str[0], 2, 9, grid_w, grid_h)
+        pixels |= render_glyph(m_str[1], 9, 9, grid_w, grid_h)
 
     return pixels

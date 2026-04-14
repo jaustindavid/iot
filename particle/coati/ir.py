@@ -69,6 +69,12 @@ class AgentsIR:
     properties: list[PropertyIR]
     pool_mode: bool = False         # True = "up to N" (agents spawn/despawn)
     spawn_point: tuple[int, int] | None = None  # where new agents appear
+    # Per-slot property overrides applied at init (fixed mode) and on every
+    # spawn into that slot (pool mode). Indices are sparse — only slots with
+    # overrides appear here. Unlisted slots get the base defaults.
+    overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Per-slot explicit starting positions (fixed mode only). Sparse dict.
+    starts_by_index: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 # ── Spawning ────────────────────────────────────────────────────

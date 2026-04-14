@@ -43,12 +43,16 @@ def main():
                         help="Static time HH:MM (for 'fast' mode, e.g. '12:34')")
     parser.add_argument("--output-dir", type=str, default=".",
                         help="Output directory for generated files (codegen mode)")
+    parser.add_argument("--grid_width", type=int, default=None,
+                        help="Override grid width (default: script value or 32)")
+    parser.add_argument("--grid_height", type=int, default=None,
+                        help="Override grid height (default: script value or 8)")
 
     args = parser.parse_args()
 
     # Parse script
     try:
-        ir = parse_file(args.script)
+        ir = parse_file(args.script, grid_width=args.grid_width, grid_height=args.grid_height)
     except ParseError as e:
         print(f"Parse error: {e}", file=sys.stderr)
         sys.exit(1)

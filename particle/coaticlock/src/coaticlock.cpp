@@ -13,13 +13,27 @@ SYSTEM_THREAD(ENABLED);
 void telemetry_worker();
 Thread* telemetryThread = nullptr;
 
+// force definition of GRID_HEIGHT, GRID_WIDTH
+#if !defined (GRID_HEIGHT) || !defined(GRID_WIDTH)
+  #error "You must define GRID_HEIGHT and GRID_WIDTH in your machine header"
+#endif
+
+
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
-#define PIXEL_COUNT (GRID_W * GRID_H)
+#define PIXEL_COUNT (GRID_WIDTH * GRID_HEIGHT)
 #define PIXEL_TYPE WS2812B
 
 #ifndef MATRIX_PIN
 #define MATRIX_PIN SPI
+#endif
+
+#ifndef PHYSICS_TICK_MS
+#define PHYSICS_TICK_MS 100  // 10 Hz
+#endif
+
+#ifndef RENDER_TICK_MS
+#define RENDER_TICK_MS 20    // 50 Hz
 #endif
 
 Adafruit_NeoPixel strip(PIXEL_COUNT, MATRIX_PIN, PIXEL_TYPE);
@@ -194,8 +208,8 @@ void loop() {
         }
     }
 
-    // 2. Physics Tick (10Hz / 100ms)
-    if (now - last_physics_tick >= 100) {
+    // 2. Physics Tick (default 10 Hz, defined in script)
+    if (now - last_physics_tick >= PHYSICS_TICK_MS) {
         last_physics_tick = now;
         
         if (Time.isValid()) {
@@ -219,25 +233,25 @@ void loop() {
         engine.tick();
     }
 
-    // 3. Render Tick (60Hz / 16ms)
-    if (now - last_render_tick >= 16) {
+    // 3. Render Tick (default 50Hz, defined in script)
+    if (now - last_render_tick >= RENDER_TICK_MS) {
         last_render_tick = now;
 
         float blend = (float)(now - last_physics_tick) / 100.0f;
         if (blend > 1.0f) blend = 1.0f;
 
         if (!Time.isValid()) {
-            // Loading spinner — system state, not script-driven.
+            // Loading spinner — uses physical grid (GRID_WIDTH/GRID_HEIGHT from creds.h)
             strip.clear();
-            int cx = GRID_W / 2;
-            int cy = GRID_H / 2 - 1;
+            int cx = GRID_WIDTH / 2;
+            int cy = GRID_HEIGHT / 2 - 1;
             int phase = (now / 150) % 8;
             static const int DX[8] = { 0,  1, 1, 1, 0, -1, -1, -1};
             static const int DY[8] = {-1, -1, 0, 1, 1,  1,  0, -1};
             auto pix = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-                if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
+                if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return;
                 float s = global_brightness;
-                strip.setPixelColor(x * GRID_H + ((x % 2) ? (GRID_H - 1 - y) : y),
+                strip.setPixelColor(x * GRID_HEIGHT + ((x % 2) ? (GRID_HEIGHT - 1 - y) : y),
                                     strip.Color((uint8_t)(r*s), (uint8_t)(g*s), (uint8_t)(b*s)));
             };
             pix(cx + DX[phase], cy + DY[phase], 0, 32, 64);

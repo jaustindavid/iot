@@ -165,8 +165,11 @@ class Codegen:
         e('#include <cstring>')
         e('#include <cstdlib>')
         e()
-        e(f"static constexpr int GRID_W = {w};")
-        e(f"static constexpr int GRID_H = {h};")
+        e(f"#define PHYSICS_TICK_MS {int(1000/ir.rendering.physics_hz)}")
+        e(f"#define RENDER_TICK_MS {int(1000/ir.rendering.display_hz)}")
+        e()
+        e(f"static constexpr int GRID_WIDTH = {w};")
+        e(f"static constexpr int GRID_HEIGHT = {h};")
         e()
 
         # Point
@@ -197,12 +200,12 @@ class Codegen:
         # CoatiEngine class
         e("class CoatiEngine {")
         e("public:")
-        e("    bool  current_board[GRID_W][GRID_H] = {false};")
-        e("    bool  target_board[GRID_W][GRID_H]  = {false};")
-        e("    float fade_board[GRID_W][GRID_H]    = {0.0f};")
+        e("    bool  current_board[GRID_WIDTH][GRID_HEIGHT] = {false};")
+        e("    bool  target_board[GRID_WIDTH][GRID_HEIGHT]  = {false};")
+        e("    float fade_board[GRID_WIDTH][GRID_HEIGHT]    = {0.0f};")
         e()
         if ir.goal.type == "clock":
-            e("    bool          pending_target[GRID_W][GRID_H] = {false};")
+            e("    bool          pending_target[GRID_WIDTH][GRID_HEIGHT] = {false};")
             e("    volatile bool target_pending = false;")
             e("    time_t        active_target  = 0;")
             e("    time_t        pending_time   = 0;")
@@ -233,9 +236,9 @@ class Codegen:
         e("    std::vector<Point> find_path(Point start, Point dest, int self_idx);")
         e()
         e("private:")
-        e("    bool  pf_visited[GRID_W][GRID_H];")
-        e("    Point pf_parent[GRID_W][GRID_H];")
-        e("    float pf_cost[GRID_W][GRID_H];")
+        e("    bool  pf_visited[GRID_WIDTH][GRID_HEIGHT];")
+        e("    Point pf_parent[GRID_WIDTH][GRID_HEIGHT];")
+        e("    float pf_cost[GRID_WIDTH][GRID_HEIGHT];")
         e()
         e("    Point _find_closest(Point start, const std::vector<Point>& cands);")
         e("    bool  _in_vec(const std::vector<Point>& v, Point p) const;")
@@ -306,6 +309,8 @@ class Codegen:
         count = ir.agents.count
         e(f"agents.reserve({count});")
 
+        overrides = ir.agents.overrides
+        starts_by_index = ir.agents.starts_by_index
         if ir.agents.pool_mode:
             sp = ir.agents.spawn_point or (0, 0)
             e(f"for (int i = 0; i < {count}; i++) {{")
@@ -318,16 +323,39 @@ class Codegen:
             e("agents.push_back(a);")
             e.dedent()
             e("}")
+            # Pre-placed slots: explicit 'starts at' in pool mode → active at
+            # init with overrides applied.
+            for idx in sorted(starts_by_index):
+                pos = starts_by_index[idx]
+                e("{")
+                e.indent()
+                e(f"AgentState& a = agents[{idx}];")
+                e(f"a.pos = {{{pos[0]}, {pos[1]}}};")
+                e("a.last_pos = a.pos;")
+                e("a.active = true;")
+                for k, v in overrides.get(idx, {}).items():
+                    e(f"a.{k} = {_cpp_literal(v)};")
+                e.dedent()
+                e("}")
         else:
             starts = ir.agents.starts
             for idx in range(count):
-                pos = starts[idx % len(starts)] if starts else (0, 0)
+                if idx in starts_by_index:
+                    pos = starts_by_index[idx]
+                elif starts:
+                    pos = starts[idx % len(starts)]
+                else:
+                    pos = (0, 0)
                 e("{")
                 e.indent()
                 e("AgentState a;")
                 e(f"a.index = {idx};")
                 e(f"a.pos = {{{pos[0]}, {pos[1]}}};")
                 e("a.last_pos = a.pos;")
+                # Per-slot property overrides (after the struct's in-class
+                # defaults, so we don't need to re-emit the base defaults).
+                for k, v in overrides.get(idx, {}).items():
+                    e(f"a.{k} = {_cpp_literal(v)};")
                 e("agents.push_back(a);")
                 e.dedent()
                 e("}")
@@ -354,7 +382,7 @@ class Codegen:
         e("if (bits & (0x80 >> col)) {")
         e.indent()
         e("int px = x + col, py = row + y_off;")
-        e("if (px >= 0 && px < GRID_W && py >= 0 && py < GRID_H)")
+        e("if (px >= 0 && px < GRID_WIDTH && py >= 0 && py < GRID_HEIGHT)")
         e("    pending_target[px][py] = true;")
         e.dedent()
         e("}")
@@ -377,7 +405,7 @@ class Codegen:
         e("snprintf(hs, sizeof(hs),  \"%02d\", h);")
         e("snprintf(ms_, sizeof(ms_), \"%02d\", m);")
         e("memset(pending_target, 0, sizeof(pending_target));")
-        e("if (GRID_H >= 16) {")
+        e("if (GRID_HEIGHT >= 16) {")
         e.indent()
         e("_draw_digit(2,  1, hs[0]);  _draw_digit(9,  1, hs[1]);")
         e("_draw_digit(2,  8, ms_[0]); _draw_digit(9,  8, ms_[1]);")
@@ -402,8 +430,8 @@ class Codegen:
         e("if (!target_pending) return;")
         e("target_pending = false;")
         e("active_target  = pending_time;")
-        e("for (int x = 0; x < GRID_W; x++)")
-        e("    for (int y = 0; y < GRID_H; y++)")
+        e("for (int x = 0; x < GRID_WIDTH; x++)")
+        e("    for (int y = 0; y < GRID_HEIGHT; y++)")
         e("        target_board[x][y] = pending_target[x][y];")
         e("// Reset landmark locks")
         for name in self._lock_lms:
@@ -416,6 +444,17 @@ class Codegen:
         e("a.wait_counter = 0;")
         for prop in ir.agents.properties:
             e(f"a.{prop.name} = {_cpp_literal(prop.default)};")
+        # Re-apply per-slot overrides so distinguished agents survive a
+        # target change (analogous to the spawn path).
+        if ir.agents.overrides:
+            e("switch (a.index) {")
+            for idx, props in sorted(ir.agents.overrides.items()):
+                e(f"  case {idx}:")
+                for k, v in props.items():
+                    e(f"    a.{k} = {_cpp_literal(v)};")
+                e(f"    break;")
+            e("  default: break;")
+            e("}")
         e.dedent()
         e("}")
         e('Log.info("Engine: applied new target");')
@@ -436,8 +475,8 @@ class Codegen:
         e.indent()
         e("if (start == dest) return {};")
         e("memset(pf_visited, 0, sizeof(pf_visited));")
-        e("for (int x = 0; x < GRID_W; x++)")
-        e("    for (int y = 0; y < GRID_H; y++)")
+        e("for (int x = 0; x < GRID_WIDTH; x++)")
+        e("    for (int y = 0; y < GRID_HEIGHT; y++)")
         e("        pf_cost[x][y] = 1e9f;")
         e()
         e("using _PQNode = std::pair<float, Point>;")
@@ -464,7 +503,7 @@ class Codegen:
         e.indent()
         e("if (dx == 0 && dy == 0) continue;")
         e("int nx = cur.x + dx, ny = cur.y + dy;")
-        e("if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;")
+        e("if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;")
         e("bool is_dest = (nx == dest.x && ny == dest.y);")
         e(f"float lit_cost = (!is_dest && current_board[nx][ny]) ? {lit_pen:.1f}f : 0.0f;")
         e("float occ_cost = 0.0f;")
@@ -539,7 +578,7 @@ class Codegen:
         e("    for (int dy = -1; dy <= 1; dy++) {")
         e("        if (dx == 0 && dy == 0) continue;")
         e("        int nx = p.x+dx, ny = p.y+dy;")
-        e("        if (nx>=0 && nx<GRID_W && ny>=0 && ny<GRID_H && current_board[nx][ny])")
+        e("        if (nx>=0 && nx<GRID_WIDTH && ny>=0 && ny<GRID_HEIGHT && current_board[nx][ny])")
         e("            return true;")
         e("    }")
         e("return false;")
@@ -571,9 +610,9 @@ class Codegen:
             for n in term_names:
                 e(f"tk_{n}.clear();")
             e()
-            e("for (int x = 0; x < GRID_W; x++) {")
+            e("for (int x = 0; x < GRID_WIDTH; x++) {")
             e.indent()
-            e("for (int y = 0; y < GRID_H; y++) {")
+            e("for (int y = 0; y < GRID_HEIGHT; y++) {")
             e.indent()
             e("if (_is_landmark({x, y})) continue;")
             for term in ir.terms:
@@ -615,6 +654,17 @@ class Codegen:
             e("_sa.wait_counter = 0;")
             for prop in ir.agents.properties:
                 e(f"_sa.{prop.name} = {_cpp_literal(prop.default)};")
+            # Re-apply per-slot overrides on respawn, so distinguished
+            # agents (e.g. "aphid 0: role = 1") keep their identity.
+            if ir.agents.overrides:
+                e("switch (_sa.index) {")
+                for idx, props in sorted(ir.agents.overrides.items()):
+                    e(f"  case {idx}:")
+                    for k, v in props.items():
+                        e(f"    _sa.{k} = {_cpp_literal(v)};")
+                    e(f"    break;")
+                e("  default: break;")
+                e("}")
             e("break;")
             e.dedent()
             e("}")
@@ -719,8 +769,8 @@ class Codegen:
                 amount_lit = _cpp_literal(amount)
                 cap_lit    = _cpp_literal(cap)
                 e("// Fade update")
-                e("for (int x = 0; x < GRID_W; x++)")
-                e("    for (int y = 0; y < GRID_H; y++)")
+                e("for (int x = 0; x < GRID_WIDTH; x++)")
+                e("    for (int y = 0; y < GRID_HEIGHT; y++)")
                 e(f"        if (current_board[x][y] && fade_board[x][y] < {cap_lit}) {{")
                 e(f"            fade_board[x][y] += {amount_lit};")
                 e(f"            if (fade_board[x][y] > {cap_lit}) fade_board[x][y] = {cap_lit};")
@@ -775,6 +825,8 @@ class Codegen:
             return f"(a.{cond.prop} >= {_cpp_literal(cond.value)})"
         if op == "lt":
             return f"(a.{cond.prop} < {_cpp_literal(cond.value)})"
+        if op == "lte":
+            return f"(a.{cond.prop} <= {_cpp_literal(cond.value)})"
         if op == "eq":
             return f"(a.{cond.prop} == {_cpp_literal(cond.value)})"
         if op == "neq":
@@ -925,7 +977,7 @@ class Codegen:
 
         if act == "pickup":
             if action.source == "board":
-                e("if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {")
+                e("if (a.pos.x >= 0 && a.pos.x < GRID_WIDTH && a.pos.y >= 0 && a.pos.y < GRID_HEIGHT) {")
                 e.indent()
                 e("current_board[a.pos.x][a.pos.y] = false;")
                 e("fade_board[a.pos.x][a.pos.y]    = 0.0f;")
@@ -937,7 +989,7 @@ class Codegen:
             return
 
         if act == "place":
-            e("if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {")
+            e("if (a.pos.x >= 0 && a.pos.x < GRID_WIDTH && a.pos.y >= 0 && a.pos.y < GRID_HEIGHT) {")
             e.indent()
             e("current_board[a.pos.x][a.pos.y] = true;")
             e("fade_board[a.pos.x][a.pos.y]    = 0.0f;")
@@ -959,6 +1011,30 @@ class Codegen:
                 e("return;  // despawn")
             return
 
+        if act == "despawn_neighbors":
+            term = action.term
+            e(f"{{  // despawn neighbors where {term} (eat agent + pixel)")
+            e.indent()
+            e("for (auto& _o : agents) {")
+            e.indent()
+            e(f"if (!_o.active || _o.index == a.index) continue;")
+            e("int _dx = _o.pos.x - a.pos.x, _dy = _o.pos.y - a.pos.y;")
+            e("if ((_dx == 0 && _dy == 0) || _dx < -1 || _dx > 1 || _dy < -1 || _dy > 1) continue;")
+            e(f"if (!_in_vec(tk_{term}, _o.pos)) continue;")
+            e("_o.active = false;")
+            e("_o.path.clear();")
+            e("_o.claimed = {-1, -1};")
+            e("_o.wait_counter = 0;")
+            e("if (_o.pos.x >= 0 && _o.pos.x < GRID_WIDTH && _o.pos.y >= 0 && _o.pos.y < GRID_HEIGHT) {")
+            e("    current_board[_o.pos.x][_o.pos.y] = false;")
+            e("    fade_board[_o.pos.x][_o.pos.y] = 0.0f;")
+            e("}")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            return
+
         if act == "become_bored":
             e("a.bored = true;")
             return
@@ -968,6 +1044,24 @@ class Codegen:
             e(f"{{  // seek {lm}")
             e.indent()
             e(f"Point _dest = {lm}[{idx} % {lm}_count];")
+            e("a.claimed = _dest;")
+            e("if (a.pos == _dest) return;  // already here")
+            e("if (!_used_pf) {")
+            e.indent()
+            e(f"a.path = find_path(a.pos, _dest, (int){idx});")
+            e("_used_pf = true;")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            return
+
+        if act == "seek_nearest_landmark":
+            lm = action.landmark
+            e(f"{{  // seek nearest {lm}")
+            e.indent()
+            e(f"std::vector<Point> _cells({lm}, {lm} + {lm}_count);")
+            e("Point _dest = _find_closest(a.pos, _cells);")
             e("a.claimed = _dest;")
             e("if (a.pos == _dest) return;  // already here")
             e("if (!_used_pf) {")
@@ -1040,7 +1134,7 @@ class Codegen:
         e("for (int _d = 0; _d < 8; _d++) {")
         e.indent()
         e("int _nx = a.pos.x + _wdx[_d], _ny = a.pos.y + _wdy[_d];")
-        e("if (_nx < 0 || _nx >= GRID_W || _ny < 0 || _ny >= GRID_H) continue;")
+        e("if (_nx < 0 || _nx >= GRID_WIDTH || _ny < 0 || _ny >= GRID_HEIGHT) continue;")
         if "lit" in avoid:
             e("if (current_board[_nx][_ny]) { _near = true; continue; }")
         else:
@@ -1162,20 +1256,22 @@ class Codegen:
         e("void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, float blend, int rotation) {")
         e.indent()
         e("strip.clear();")
-        e("const int PIXEL_COUNT = GRID_W * GRID_H;")
+        e("// Physical pixel count from device header (GRID_WIDTH * GRID_HEIGHT)")
+        e("const int PIXEL_COUNT = GRID_WIDTH * GRID_HEIGHT;")
         e()
 
         # Zigzag pixel mapper (column-major serpentine), with rotation.
+        # Uses GRID_WIDTH/GRID_HEIGHT for physical panel dimensions.
         e("auto _map = [&](int x, int y) -> int {")
         e.indent()
-        e("if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return -1;")
+        e("if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return -1;")
         e("int rx = x, ry = y;")
-        e("int max_x = GRID_W - 1;")
-        e("int max_y = GRID_H - 1;")
+        e("int max_x = GRID_WIDTH - 1;")
+        e("int max_y = GRID_HEIGHT - 1;")
         e("if (rotation == 90)       { rx = max_y - y; ry = x; }")
         e("else if (rotation == 180) { rx = max_x - x; ry = max_y - y; }")
         e("else if (rotation == 270) { rx = y; ry = max_x - x; }")
-        e("int phys_h = (rotation == 90 || rotation == 270) ? GRID_W : GRID_H;")
+        e("int phys_h = (rotation == 90 || rotation == 270) ? GRID_WIDTH : GRID_HEIGHT;")
         e("if (rx % 2 == 0) return (rx * phys_h) + ry;")
         e("return (rx * phys_h) + ((phys_h - 1) - ry);")
         e.dedent()
@@ -1217,9 +1313,9 @@ class Codegen:
             else:
                 bri_expr = "bri"
             e("// board pixels (lit cells, excluding landmark cells)")
-            e("for (int x = 0; x < GRID_W; x++) {")
+            e("for (int x = 0; x < GRID_WIDTH; x++) {")
             e.indent()
-            e("for (int y = 0; y < GRID_H; y++) {")
+            e("for (int y = 0; y < GRID_HEIGHT; y++) {")
             e.indent()
             e("if (!current_board[x][y]) continue;")
             e("if (_is_landmark({x, y})) continue;")

@@ -1,0 +1,138 @@
+## Ants — worker aphids stream in from the nest to build the display.
+## New aphids spawn at the nest entrance when there's work to do.
+## When an aphid finishes and there's nothing left, she walks home and exits.
+
+--- grid ---
+
+32 wide, 8 tall, zigzag wiring
+
+--- layers ---
+
+current: bool, default off
+target: bool, default off
+fade: float, default 0.0
+
+--- landmarks ---
+
+nest at (0, max_y), color sand (16, 12, 0)
+
+--- terms ---
+
+extras: current is on and target is off
+missing: current is off and target is on
+
+--- agents ---
+
+up to 32 aphid agents
+aphid 0 starts at (8, 4), role = 1
+aphid 1 starts at (16, 4), role = 1
+spawn at (0, max_y)
+
+properties:
+  pause_counter: int = 0
+  role: int = 0          ## 0 = aphid (ephemeral worker), 1 = ladybug (pre-placed hunter)
+
+--- spawning ---
+
+spawn every 5 ticks when missing exist
+
+--- pathfinding ---
+
+algorithm: a*
+heuristic: euclidean
+max nodes: 64
+orthogonal cost: 1.0
+diagonal cost: 1.414
+penalty lit cell: 50
+penalty occupied cell: 20
+
+--- behavior ---
+
+unlimited pathfinds per tick
+
+## ── LADYBUG BRANCH (role == 1) ───────────────────────────────
+## Each tick: eat any squatting aphid in an adjacent extras cell,
+## then take one random step. Ladybugs patrol by wander rather
+## than A*-seek because behavior rules only evaluate when path is
+## empty — a multi-step seek path would make them unresponsive to
+## squatters appearing alongside their route.
+when role == 1:
+  despawn neighbors where extras
+  wander avoiding lit, chance 100%
+  # seek nearest extras
+  # wander avoiding landmarks, chance 100%
+  done
+
+## ── APHID BRANCH (role == 0, default) ────────────────────────
+
+when pause_counter > 0:
+  decrement pause_counter
+  done
+
+## Place a pixel if standing on a missing cell
+when standing on missing:
+  agent green (0, 255, 0)
+  place
+  pause 75
+  done
+
+## Squat on extras — don't clean up, wait to be eaten.
+when standing on extras:
+  agent darkgrey (64, 64, 64)
+  done
+
+## Prefer squatting on extras if any are available
+when available extras exist:
+  seek nearest available extras
+  agent darkgrey (64, 64, 64)
+  done
+
+## Otherwise find missing work
+when available missing exist:
+  seek nearest available missing
+  agent darkgrey (64, 64, 64)
+  done
+
+## Truly nothing to do — go home
+when not at nest:
+  agent darkestgreen (0, 64, 0)
+  seek nest
+  done
+
+when at nest:
+  despawn
+
+each tick:
+  for each lit cell in current:
+    increase fade by 0.064, cap 1.0
+
+--- rendering ---
+
+physics: 2 hz
+display: 60 hz, interpolated
+
+board pixel: green (0, 64, 0) * fade
+nest: red (64, 0, 0)
+
+## Rules evaluate top-to-bottom; first match wins.
+when role == 1: agent red (64, 0, 0) pulse 2000ms
+when standing on lit: agent green (0, 255, 0)
+when standing on missing: agent light (32, 64, 32)
+when standing on extras: agent darkgrey (64, 64, 64)
+when role == 0: agent darkestgrey (16, 16, 16) pulse 1000ms
+
+--- goal ---
+
+type: clock
+font: megafont 5x6
+layout: horizontal
+time: wobbly 120s to 300s, fast 1.3x, slow 0.7x
+
+--- collision ---
+
+on collision:
+  increment wait_counter
+  if wait_counter > 3:
+    clear path
+    clear claimed
+    reset wait_counter

@@ -136,10 +136,34 @@ Both modes support per-agent properties:
 properties:
   carrying: bool = false
   washed: bool = false
+  role: int = 0
   ...
 ```
 
 Properties are typed and initialized with defaults.
+
+**Per-slot property overrides.** Any individual slot can override the base defaults at init, using either the inline form on a `starts at` line or a standalone property-only line:
+
+```
+## inline — position + overrides together
+aphid 0 starts at (8, 4), role = 1
+
+## standalone — works in pool mode where slot has no start position
+aphid 5: role = 2, pause_counter = 30
+```
+
+Indices are sparse and uncapped (any `N < count` is valid; gaps are allowed). The parser validates that each referenced property is declared and each index is in range. Overrides are **slot-scoped and re-applied on every spawn** into that slot — so `aphid 0: role = 1` means "slot 0 is always the queen, even after despawn/respawn." This is the primary way to give a single agent a distinct identity without a separate agent-type system.
+
+**Pre-placed pool slots.** In pool mode (`up to N`), a `type N starts at (x, y)` line pre-places that slot active at init with its overrides applied, bypassing the normal spawn loop. Unspecified slots stay inactive and are filled by the `--- spawning ---` rules as usual. This lets persistent hunters/guards coexist with ephemeral workers in a single agents block:
+
+```
+up to 32 aphid agents
+aphid 0 starts at (8, 4), role = 1    ## pre-placed ladybug
+aphid 1 starts at (16, 4), role = 1   ## pre-placed ladybug
+spawn at (0, max_y)                   ## aphids spawn from the nest
+```
+
+Spawned agents always receive the **base property defaults** declared in `properties:`, not overrides from other slots — `role: int = 0` is what new ephemeral aphids get. This gives a clean way to distinguish ephemeral (spawned, defaults) from distinguished (pre-placed or override-tagged) agents without a second agents block.
 
 Built-in properties (always present, don't need declaration):
 - `position` — current grid cell
@@ -231,8 +255,9 @@ Summary of keywords:
 |---|---|
 | `carrying` | Property is truthy |
 | `not washed` | Property is falsy |
-| `wash_counter > 0` | Numeric comparison |
+| `wash_counter > 0` | Numeric comparison (`>`, `>=`, `<`, `<=` all supported) |
 | `wash_counter is 0` | Equality check |
+| `role == 1` | Equality check (C-style, equivalent to `role is 1`) |
 | `at pool` | Agent position matches any cell in the landmark |
 | `not at pool` | Agent position does NOT match any cell in the landmark |
 | `at claimed` | Agent position matches its claimed target |
@@ -257,6 +282,7 @@ Summary of keywords:
 | `place` | Turn on `current` at position, reset `fade`, set `carrying = false` |
 | `discard` | Drop carried pixel (no board change) |
 | `despawn` | Deactivate agent and return to inactive pool (pool mode only) |
+| `despawn neighbors where <term>` | Hunter action: for each other active agent in an adjacent cell whose position is in `<term>`'s cells, despawn that agent AND clear the `current`/`fade` pixel at that cell. Conceptually the hunter "eats" both the squatter and the pixel it was sitting on. |
 | `set <prop> to <value>` | Assign a property |
 | `clear claimed` | Set claimed target to none |
 | `pause <n>` | Freeze agent for N ticks |
@@ -322,6 +348,15 @@ Rendering rules map simulation state to visual output. Each rule has a selector 
 
 Selectors match by state and optionally by agent index. More specific selectors win (e.g., `agent bored index 0` overrides `agent idle index 0`). The evaluation order matches the coaticlock's C++ render logic.
 
+**Condition-based agent rules.** A render rule can also be keyed on a full `when <condition>` expression, which lets you color agents by any property (including per-slot overrides like `role`):
+
+```
+when role == 1: agent red (128, 0, 0) pulse 400ms
+when standing on extras: agent darkgrey (8, 8, 8)
+```
+
+Rules whose conditions reference undeclared properties are silently skipped at codegen time — so you don't need role-specific render rules for scripts that don't use roles.
+
 In the terminal simulator, colors are mapped to ANSI escape codes or Unicode block characters. On the device, they drive NeoPixel RGB values.
 
 #### `--- goal ---`
@@ -342,7 +377,9 @@ Defines what generates target patterns. The goal is external to the agent behavi
 - `sequence` — cycles through a list of bitmaps on a timer.
 - Future: `http`, `serial`, `random`.
 
-The goal's `font` references a bitmap font definition. `megafont 5x6` is the built-in coaticlock font (hardcoded bitmasks for digits 0-9 and colon). The `layout` controls glyph placement: `horizontal` for 32x8, `grid` for 16x16.
+The goal's `font` references a bitmap font definition. `megafont 5x6` is the built-in coaticlock font (hardcoded bitmasks for digits 0-9 and colon). The `layout` controls glyph placement: `horizontal` for 32x8, `grid` (a.k.a. `stacked`) for 16x16.
+
+**Supported grid dimensions.** Only two physical panel layouts are supported: `32x8` (default) and `16x16`. The parser rejects any other combination. On a 16×16 panel the clock renders HH stacked over MM regardless of the declared `layout:` — `horizontal` doesn't fit. Grid dimensions can be overridden at the CLI with `--grid_x` / `--grid_y`; scripts can use the `max_x` / `max_y` tokens (with optional `±N`) in any coordinate to stay portable across both layouts.
 
 #### `--- spawning ---`
 
@@ -978,6 +1015,16 @@ The spinner is **not** script-coupled. It displays system state (Time-not-valid,
 1. Does this block reference anything declared in the script (properties, landmarks, terms)? If yes → move to codegen.
 2. Does this block implement system-state behavior (network, sync, fault, boot) that no script should need to describe? If yes → leave it alone.
 3. Is this block so tangled that it does both? Split it first; migrate the script-coupled half; keep the system-coupled half. The generated `tick()` declares term vectors as `static` locals to avoid reallocating on every tick (matching the hand-written engine). This is safe because `tick()` is called from a single thread (the Particle main loop). Scratch vectors inside the behavior lambda (available-subset computation, wander choices) are non-static, since their contents depend on the per-agent context.
+
+### 7.11 Behavior Rules Only Fire on Path-Empty Ticks
+
+**What went wrong.** While building `aphids.coati`, ladybugs (role == 1) were given `seek nearest available extras` to chase squatting aphids. The ladybugs would pick a target, lay down a multi-step A\* path, and then *stop reacting* — even when an aphid materialized one cell over. They'd walk to their stale target, arrive, and only then re-evaluate behavior rules.
+
+**The cause.** The engine's behavior phase runs only when `not path and not wait`. Once `seek` plants a path, subsequent ticks just step along it; no rule — including `despawn neighbors where extras` — is re-evaluated until the path drains. For predators, this is fatal: prey changes location faster than the path completes.
+
+**The fix used.** Ladybugs switched to `wander avoiding landmarks, chance 100%`. Wander produces a single-step path, so behavior rules re-evaluate every tick and `despawn neighbors` gets a look at the latest grid state. Patrol-by-wander is strictly less efficient than patrol-by-seek, but it's *responsive*, which is what a hunter actually needs.
+
+**The deeper limit.** There is no per-tick hook that runs regardless of path state. Any rule that must fire every tick (proximity kills, triggers, reactive despawns) has to be paired with a one-step movement discipline. If scripts grow more of these, the clean fix is a `each tick:` per-agent hook that runs before the path gate, mirroring the global `each tick:` block.
 
 ---
 

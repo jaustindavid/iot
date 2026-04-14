@@ -115,21 +115,45 @@ class CoatiEngine:
         self.max_agents = ir.agents.count
         self._next_agent_id = 0
 
+        starts_by_index = ir.agents.starts_by_index
+        overrides = ir.agents.overrides
         if self.pool_mode:
-            # Pool mode: agents start inactive, spawned on demand
+            # Pool mode: slots without an explicit 'starts at' begin inactive
+            # and get filled by the spawn loop. Slots *with* an explicit
+            # start are pre-placed active at init — useful for persistent
+            # hunters/guards alongside ephemeral workers. Overrides re-apply
+            # on every spawn into a slot, so pre-placed slots keep their
+            # identity through despawn/respawn as well.
+            sp = ir.agents.spawn_point or (0, 0)
             for i in range(ir.agents.count):
-                sp = ir.agents.spawn_point or (0, 0)
-                a = Agent(index=i, pos=sp, last_pos=sp, active=False)
+                if i in starts_by_index:
+                    pos = starts_by_index[i]
+                    a = Agent(index=i, pos=pos, last_pos=pos, active=True)
+                else:
+                    a = Agent(index=i, pos=sp, last_pos=sp, active=False)
                 for prop in ir.agents.properties:
                     a.props[prop.name] = prop.default
+                if i in starts_by_index:
+                    for k, v in overrides.get(i, {}).items():
+                        a.props[k] = v
                 self.agents.append(a)
         else:
-            # Fixed mode: all agents active from the start
+            # Fixed mode: all agents active from the start. Per-slot starts
+            # override the legacy ordered list; per-slot property overrides
+            # apply after defaults.
+            flat_starts = ir.agents.starts
             for i in range(ir.agents.count):
-                start = ir.agents.starts[i] if i < len(ir.agents.starts) else (0, 0)
+                if i in starts_by_index:
+                    start = starts_by_index[i]
+                elif i < len(flat_starts):
+                    start = flat_starts[i]
+                else:
+                    start = (0, 0)
                 a = Agent(index=i, pos=start, last_pos=start, active=True)
                 for prop in ir.agents.properties:
                     a.props[prop.name] = prop.default
+                for k, v in overrides.get(i, {}).items():
+                    a.props[k] = v
                 self.agents.append(a)
 
         # Spawning
@@ -209,6 +233,12 @@ class CoatiEngine:
         if op == "gte":
             v = agent.get(cond.prop)
             return v is not None and v >= cond.value
+        if op == "lt":
+            v = agent.get(cond.prop)
+            return v is not None and v < cond.value
+        if op == "lte":
+            v = agent.get(cond.prop)
+            return v is not None and v <= cond.value
         if op == "eq":
             v = agent.get(cond.prop)
             return v == cond.value
@@ -374,6 +404,17 @@ class CoatiEngine:
                 return _PATHFIND_USED
             return None
 
+        if act == "seek_nearest_landmark":
+            lm_cells = self.landmarks.get(action.landmark, [])
+            if lm_cells:
+                dest = self._closest(agent.pos, lm_cells)
+                agent.claimed = dest
+                if agent.pos == dest:
+                    return None
+                agent.path = self._pathfind(agent, dest)
+                return _PATHFIND_USED
+            return None
+
         if act == "pickup":
             src = action.source
             if src == "board":
@@ -403,6 +444,30 @@ class CoatiEngine:
             agent.claimed = None
             agent.wait_counter = 0
             return _DONE
+
+        if act == "despawn_neighbors":
+            # Hunter action: for each other active agent in an adjacent cell
+            # whose position is in the named term's cell list, despawn that
+            # agent AND clear the board pixel at that cell (the hunter
+            # "eats" both the squatter and the pixel it was sitting on).
+            term_cells = set(self.term_cells.get(action.term, []))
+            ax, ay = agent.pos
+            cur = self.current()
+            fade = self.fade()
+            for other in self.agents:
+                if other.index == agent.index or not other.active:
+                    continue
+                ox, oy = other.pos
+                if abs(ox - ax) <= 1 and abs(oy - ay) <= 1 and (ox, oy) != (ax, ay):
+                    if other.pos in term_cells:
+                        other.active = False
+                        other.path = []
+                        other.claimed = None
+                        other.wait_counter = 0
+                        if 0 <= ox < self.grid_w and 0 <= oy < self.grid_h:
+                            cur[ox][oy] = False
+                            fade[ox][oy] = 0.0
+            return None
 
         if act == "wander":
             avoid_terms = action.avoid or []
@@ -576,6 +641,7 @@ class CoatiEngine:
 
         # Find an inactive agent slot
         sp = self.spawn_point or (0, 0)
+        overrides = self.ir.agents.overrides
         for a in self.agents:
             if not a.active:
                 a.active = True
@@ -586,6 +652,11 @@ class CoatiEngine:
                 a.wait_counter = 0
                 for prop in self.ir.agents.properties:
                     a.props[prop.name] = prop.default
+                # Re-apply slot-scoped overrides so distinguished agents
+                # (e.g. "aphid 0: role = 1") stay distinguished across
+                # despawn/respawn cycles.
+                for k, v in overrides.get(a.index, {}).items():
+                    a.props[k] = v
                 return
         # All slots full — no spawn this tick
 

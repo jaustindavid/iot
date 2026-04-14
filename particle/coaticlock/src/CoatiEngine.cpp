@@ -1,7 +1,7 @@
 #include "CoatiEngine.h"
 
 const int   CoatiEngine::nest_count = 1;
-const Point CoatiEngine::nest[] = {{0, 7}};
+const Point CoatiEngine::nest[] = {{0, 15}};
 
 // megafont 5×6 bitmaps (0–9, colon)
 static const uint8_t _megafont[][6] = {
@@ -28,14 +28,28 @@ struct _CmpNode {
 } // namespace
 
 CoatiEngine::CoatiEngine() {
-    agents.reserve(80);
-    for (int i = 0; i < 80; i++) {
+    agents.reserve(32);
+    for (int i = 0; i < 32; i++) {
         AgentState a;
         a.index = i;
-        a.pos = {0, 7};
+        a.pos = {0, 15};
         a.last_pos = a.pos;
         a.active = false;
         agents.push_back(a);
+    }
+    {
+        AgentState& a = agents[0];
+        a.pos = {8, 4};
+        a.last_pos = a.pos;
+        a.active = true;
+        a.role = 1;
+    }
+    {
+        AgentState& a = agents[1];
+        a.pos = {16, 4};
+        a.last_pos = a.pos;
+        a.active = true;
+        a.role = 1;
     }
 }
 
@@ -49,7 +63,7 @@ void CoatiEngine::_draw_digit(int x, int y_off, char c) {
         for (int col = 0; col < 5; col++) {
             if (bits & (0x80 >> col)) {
                 int px = x + col, py = row + y_off;
-                if (px >= 0 && px < GRID_W && py >= 0 && py < GRID_H)
+                if (px >= 0 && px < GRID_WIDTH && py >= 0 && py < GRID_HEIGHT)
                     pending_target[px][py] = true;
             }
         }
@@ -64,7 +78,7 @@ void CoatiEngine::update_target(time_t virtual_now) {
     snprintf(hs, sizeof(hs),  "%02d", h);
     snprintf(ms_, sizeof(ms_), "%02d", m);
     memset(pending_target, 0, sizeof(pending_target));
-    if (GRID_H >= 16) {
+    if (GRID_HEIGHT >= 16) {
         _draw_digit(2,  1, hs[0]);  _draw_digit(9,  1, hs[1]);
         _draw_digit(2,  8, ms_[0]); _draw_digit(9,  8, ms_[1]);
     } else {
@@ -79,8 +93,8 @@ void CoatiEngine::apply_pending_target() {
     if (!target_pending) return;
     target_pending = false;
     active_target  = pending_time;
-    for (int x = 0; x < GRID_W; x++)
-        for (int y = 0; y < GRID_H; y++)
+    for (int x = 0; x < GRID_WIDTH; x++)
+        for (int y = 0; y < GRID_HEIGHT; y++)
             target_board[x][y] = pending_target[x][y];
     // Reset landmark locks
     // Reset all agents
@@ -89,6 +103,16 @@ void CoatiEngine::apply_pending_target() {
         a.path.clear();
         a.wait_counter = 0;
         a.pause_counter = 0;
+        a.role = 0;
+        switch (a.index) {
+          case 0:
+            a.role = 1;
+            break;
+          case 1:
+            a.role = 1;
+            break;
+          default: break;
+        }
     }
     Log.info("Engine: applied new target");
 }
@@ -96,15 +120,15 @@ void CoatiEngine::apply_pending_target() {
 std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_idx) {
     if (start == dest) return {};
     memset(pf_visited, 0, sizeof(pf_visited));
-    for (int x = 0; x < GRID_W; x++)
-        for (int y = 0; y < GRID_H; y++)
+    for (int x = 0; x < GRID_WIDTH; x++)
+        for (int y = 0; y < GRID_HEIGHT; y++)
             pf_cost[x][y] = 1e9f;
 
     using _PQNode = std::pair<float, Point>;
     std::priority_queue<_PQNode, std::vector<_PQNode>, _CmpNode> q;
     pf_cost[start.x][start.y] = 0.0f;
     q.push({0.0f, start});
-    const int MAX_NODES = 256;
+    const int MAX_NODES = 64;
     int expanded = 0;
     Point best = {-1, -1};
     float best_h = 1e9f;
@@ -121,7 +145,7 @@ std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_idx)
             for (int dy = -1; dy <= 1; dy++) {
                 if (dx == 0 && dy == 0) continue;
                 int nx = cur.x + dx, ny = cur.y + dy;
-                if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+                if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
                 bool is_dest = (nx == dest.x && ny == dest.y);
                 float lit_cost = (!is_dest && current_board[nx][ny]) ? 50.0f : 0.0f;
                 float occ_cost = 0.0f;
@@ -172,7 +196,7 @@ bool CoatiEngine::_near_lit(Point p) const {
         for (int dy = -1; dy <= 1; dy++) {
             if (dx == 0 && dy == 0) continue;
             int nx = p.x+dx, ny = p.y+dy;
-            if (nx>=0 && nx<GRID_W && ny>=0 && ny<GRID_H && current_board[nx][ny])
+            if (nx>=0 && nx<GRID_WIDTH && ny>=0 && ny<GRID_HEIGHT && current_board[nx][ny])
                 return true;
         }
     return false;
@@ -187,8 +211,8 @@ void CoatiEngine::tick() {
     tk_extras.clear();
     tk_missing.clear();
 
-    for (int x = 0; x < GRID_W; x++) {
-        for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
             if (_is_landmark({x, y})) continue;
             if ((current_board[x][y] && !target_board[x][y])) tk_extras.push_back({x, y});
             if ((!current_board[x][y] && target_board[x][y])) tk_missing.push_back({x, y});
@@ -198,18 +222,28 @@ void CoatiEngine::tick() {
     // Spawn phase
     {
         static int _spawn_timer = 0;
-        if (++_spawn_timer >= 10) {
+        if (++_spawn_timer >= 5) {
             _spawn_timer = 0;
             if ((!tk_missing.empty())) {
                 for (auto& _sa : agents) {
                     if (!_sa.active) {
                         _sa.active    = true;
-                        _sa.pos       = {0, 7};
+                        _sa.pos       = {0, 15};
                         _sa.last_pos  = _sa.pos;
                         _sa.path.clear();
                         _sa.claimed   = {-1, -1};
                         _sa.wait_counter = 0;
                         _sa.pause_counter = 0;
+                        _sa.role = 0;
+                        switch (_sa.index) {
+                          case 0:
+                            _sa.role = 1;
+                            break;
+                          case 1:
+                            _sa.role = 1;
+                            break;
+                          default: break;
+                        }
                         break;
                     }
                 }
@@ -269,46 +303,60 @@ void CoatiEngine::tick() {
         }
 
         auto _eval = [&]() {
+            if ((a.role == 1)) {
+                {  // despawn neighbors where extras (eat agent + pixel)
+                    for (auto& _o : agents) {
+                        if (!_o.active || _o.index == a.index) continue;
+                        int _dx = _o.pos.x - a.pos.x, _dy = _o.pos.y - a.pos.y;
+                        if ((_dx == 0 && _dy == 0) || _dx < -1 || _dx > 1 || _dy < -1 || _dy > 1) continue;
+                        if (!_in_vec(tk_extras, _o.pos)) continue;
+                        _o.active = false;
+                        _o.path.clear();
+                        _o.claimed = {-1, -1};
+                        _o.wait_counter = 0;
+                        if (_o.pos.x >= 0 && _o.pos.x < GRID_WIDTH && _o.pos.y >= 0 && _o.pos.y < GRID_HEIGHT) {
+                            current_board[_o.pos.x][_o.pos.y] = false;
+                            fade_board[_o.pos.x][_o.pos.y] = 0.0f;
+                        }
+                    }
+                }
+                {  // wander
+                    static const int _wdx[] = { 0, 1, 0,-1, 1, 1,-1,-1};
+                    static const int _wdy[] = {-1, 0, 1, 0,-1, 1, 1,-1};
+                    std::vector<Point> _choices;
+                    bool _near = false;
+                    for (int _d = 0; _d < 8; _d++) {
+                        int _nx = a.pos.x + _wdx[_d], _ny = a.pos.y + _wdy[_d];
+                        if (_nx < 0 || _nx >= GRID_WIDTH || _ny < 0 || _ny >= GRID_HEIGHT) continue;
+                        if (current_board[_nx][_ny]) { _near = true; continue; }
+                        _choices.push_back({_nx, _ny});
+                    }
+                    if (current_board[a.pos.x][a.pos.y]) _near = true;  // standing on lit
+                    if (false || (rand() % 100 < 100)) {
+                        if (!_choices.empty())
+                            a.path = {_choices[rand() % _choices.size()]};
+                    }
+                }
+                return;  // done
+                return;  // end of when-block
+            }
             if ((a.pause_counter > 0)) {
                 a.pause_counter--;
                 return;  // done
                 return;  // end of when-block
             }
-            if ((_in_vec(tk_extras, a.pos) && current_board[a.pos.x][a.pos.y])) {
-                if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {
-                    current_board[a.pos.x][a.pos.y] = false;
-                    fade_board[a.pos.x][a.pos.y]    = 0.0f;
-                }
-                a.pause_counter = 5;
-                return;  // done
-                return;  // end of when-block
-            }
-            if (current_board[a.pos.x][a.pos.y]) {
-                // set_display_color: simulator-only — omitted on device
-                return;  // done
-                return;  // end of when-block
-            }
             if (_in_vec(tk_missing, a.pos)) {
                 // set_display_color: simulator-only — omitted on device
-                if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {
+                if (a.pos.x >= 0 && a.pos.x < GRID_WIDTH && a.pos.y >= 0 && a.pos.y < GRID_HEIGHT) {
                     current_board[a.pos.x][a.pos.y] = true;
                     fade_board[a.pos.x][a.pos.y]    = 0.0f;
                 }
+                a.pause_counter = 75;
                 return;  // done
                 return;  // end of when-block
             }
-            if ((!tk_avail_missing.empty())) {
-                {  // seek nearest available missing
-                    if (!tk_avail_missing.empty()) {
-                        Point _dest = _find_closest(a.pos, tk_avail_missing);
-                        a.claimed = _dest;
-                        if (a.pos == _dest) return;  // already here
-                        if (!_used_pf) {
-                            a.path = find_path(a.pos, _dest, (int)i);
-                            _used_pf = true;
-                        }
-                    }
-                }
+            if (_in_vec(tk_extras, a.pos)) {
+                // set_display_color: simulator-only — omitted on device
                 return;  // done
                 return;  // end of when-block
             }
@@ -324,6 +372,23 @@ void CoatiEngine::tick() {
                         }
                     }
                 }
+                // set_display_color: simulator-only — omitted on device
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((!tk_avail_missing.empty())) {
+                {  // seek nearest available missing
+                    if (!tk_avail_missing.empty()) {
+                        Point _dest = _find_closest(a.pos, tk_avail_missing);
+                        a.claimed = _dest;
+                        if (a.pos == _dest) return;  // already here
+                        if (!_used_pf) {
+                            a.path = find_path(a.pos, _dest, (int)i);
+                            _used_pf = true;
+                        }
+                    }
+                }
+                // set_display_color: simulator-only — omitted on device
                 return;  // done
                 return;  // end of when-block
             }
@@ -354,8 +419,8 @@ void CoatiEngine::tick() {
     }
 
     // Fade update
-    for (int x = 0; x < GRID_W; x++)
-        for (int y = 0; y < GRID_H; y++)
+    for (int x = 0; x < GRID_WIDTH; x++)
+        for (int y = 0; y < GRID_HEIGHT; y++)
             if (current_board[x][y] && fade_board[x][y] < 1.0f) {
                 fade_board[x][y] += 0.032f;
                 if (fade_board[x][y] > 1.0f) fade_board[x][y] = 1.0f;
@@ -364,17 +429,18 @@ void CoatiEngine::tick() {
 
 void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, float blend, int rotation) {
     strip.clear();
-    const int PIXEL_COUNT = GRID_W * GRID_H;
+    // Physical pixel count from device header (GRID_WIDTH * GRID_HEIGHT)
+    const int PIXEL_COUNT = GRID_WIDTH * GRID_HEIGHT;
 
     auto _map = [&](int x, int y) -> int {
-        if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return -1;
+        if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return -1;
         int rx = x, ry = y;
-        int max_x = GRID_W - 1;
-        int max_y = GRID_H - 1;
+        int max_x = GRID_WIDTH - 1;
+        int max_y = GRID_HEIGHT - 1;
         if (rotation == 90)       { rx = max_y - y; ry = x; }
         else if (rotation == 180) { rx = max_x - x; ry = max_y - y; }
         else if (rotation == 270) { rx = y; ry = max_x - x; }
-        int phys_h = (rotation == 90 || rotation == 270) ? GRID_W : GRID_H;
+        int phys_h = (rotation == 90 || rotation == 270) ? GRID_WIDTH : GRID_HEIGHT;
         if (rx % 2 == 0) return (rx * phys_h) + ry;
         return (rx * phys_h) + ((phys_h - 1) - ry);
     };
@@ -396,8 +462,8 @@ void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, f
     };
 
     // board pixels (lit cells, excluding landmark cells)
-    for (int x = 0; x < GRID_W; x++) {
-        for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_WIDTH; x++) {
+        for (int y = 0; y < GRID_HEIGHT; y++) {
             if (!current_board[x][y]) continue;
             if (_is_landmark({x, y})) continue;
             _set(x, y, _cc(0, 64, 0, fade_board[x][y] * bri));
@@ -417,18 +483,28 @@ void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, f
         uint32_t color = 0;
         bool matched = false;
 
+        if (!matched && ((a.role == 1))) {
+            uint32_t _c = _cc(64, 0, 0, (0.7f + 0.3f * sinf((float)now_ms / 2000.0f)) * (bri));
+            color = _c;
+            matched = true;
+        }
         if (!matched && (current_board[a.pos.x][a.pos.y])) {
             uint32_t _c = _cc(0, 255, 0, bri);
             color = _c;
             matched = true;
         }
         if (!matched && (_in_vec(tk_missing, a.pos))) {
-            uint32_t _c = _cc(0, 255, 0, bri);
+            uint32_t _c = _cc(32, 64, 32, bri);
             color = _c;
             matched = true;
         }
-        if (!matched) {
-            uint32_t _c = _cc(255, 0, 0, bri);
+        if (!matched && (_in_vec(tk_extras, a.pos))) {
+            uint32_t _c = _cc(64, 64, 64, bri);
+            color = _c;
+            matched = true;
+        }
+        if (!matched && ((a.role == 0))) {
+            uint32_t _c = _cc(16, 16, 16, (0.7f + 0.3f * sinf((float)now_ms / 1000.0f)) * (bri));
             color = _c;
             matched = true;
         }

@@ -1,0 +1,137 @@
+## Fraggle — a brick-stacker with bad navigation.
+## Red brick piles sit on the left and right sides of the board.
+## Fraggle seeks whichever pile cell is closer.  Unlike coati, A* is
+## limited to 32 nodes, so he often takes wandering, suboptimal paths.
+
+--- grid ---
+
+32 wide, 8 tall, zigzag wiring
+
+--- layers ---
+
+current: bool, default off
+target: bool, default off
+fade: float, default 0.0
+
+--- landmarks ---
+
+## Both piles belong to one landmark so `seek nearest piles`
+## can pick the closer cell regardless of side.
+piles at (0, max_y) and (1, max_y) and (max_x-1, max_y) and (max_x, max_y), color red (64, 0, 0)
+
+--- terms ---
+
+extras: current is on and target is off
+missing: current is off and target is on
+
+--- agents ---
+
+2 fraggle agents
+fraggle 0 starts at (max_y, 4)
+fraggle 0 starts at (0, 4)
+
+properties:
+  carrying: bool = false
+  pause_counter: int = 0
+
+--- pathfinding ---
+
+algorithm: a*
+heuristic: euclidean
+max nodes: 48
+orthogonal cost: 1.0
+diagonal cost: 1.414
+penalty lit cell: 50
+penalty occupied cell: 10
+
+--- behavior ---
+
+one pathfind per tick
+
+## Pause cooldown
+when pause_counter > 0:
+  decrement pause_counter
+  done
+
+## ── CARRYING ─────────────────────────────────────────────
+## If holding a brick, try to place it on a missing spot.
+## If no missing spots remain, return it to the nearer pile.
+
+when carrying:
+  if standing on missing:
+    place
+    set carrying to false
+    clear claimed
+    pause 4
+    done
+  if available missing exist:
+    seek nearest available missing
+    done
+  if at piles:
+    discard
+    set carrying to false
+    clear claimed
+    pause 4
+    done
+  seek nearest piles
+  done
+
+## ── NOT CARRYING ─────────────────────────────────────────
+## Pick up an extra pixel (lit but shouldn't be), or walk to the
+## nearer pile and grab a fresh brick if there's work to do.
+
+when not carrying:
+  if standing on extras and cell is lit:
+    pickup from board
+    set carrying to true
+    clear claimed
+    pause 4
+    done
+  if at piles and available missing exist:
+    pickup from dumpster
+    set carrying to true
+    clear claimed
+    pause 4
+    done
+  if available extras exist:
+    seek nearest available extras
+    done
+  if available missing exist:
+    seek nearest piles
+    done
+  ## Nothing to do — idle on the spot.
+
+## ── FADE ─────────────────────────────────────────────────
+
+each tick:
+  for each lit cell in current:
+    increase fade by 0.032, cap 1.0
+
+--- rendering ---
+
+physics: 10 hz
+display: 60 hz, interpolated
+
+board pixel: green (0, 64, 0) * fade
+piles: red (64, 0, 0)
+
+## Rules evaluate top-to-bottom; first match wins.
+agent waiting: orange (64, 32, 0) shimmer 30ms
+agent carrying: red (128, 0, 0) pulse 200ms
+agent idle: tan (48, 32, 16)
+
+--- goal ---
+
+type: clock
+font: megafont 5x6
+layout: horizontal
+time: wobbly 120s to 300s, fast 1.3x, slow 0.7x
+
+--- collision ---
+
+on collision:
+  increment wait_counter
+  if wait_counter > 3:
+    clear path
+    clear claimed
+    reset wait_counter
