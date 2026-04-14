@@ -1,0 +1,99 @@
+## Simple Clock — "Hello, World!" for coati.
+## One agent walks to missing pixels and lights them up. That's it.
+
+--- grid ---
+
+32 wide, 8 tall, zigzag wiring
+
+--- layers ---
+
+current: bool, default off
+target: bool, default off
+fade: float, default 0.0
+
+--- terms ---
+
+extras: current is on and target is off
+missing: current is off and target is on
+
+--- agents ---
+
+1 pixel agents
+pixel 0 starts at (16, 4)
+
+properties:
+  pause_counter: int = 0
+  lazy_counter: int = 0
+
+--- pathfinding ---
+
+algorithm: a*
+heuristic: euclidean
+max nodes: 256
+orthogonal cost: 1.0
+diagonal cost: 1.414
+penalty lit cell: 50
+penalty occupied cell: 20
+
+--- behavior ---
+
+one pathfind per tick
+
+when pause_counter > 0:
+  decrement pause_counter
+  done
+
+when standing on extras and cell is lit:
+  pickup from board
+  pause 5
+  done
+
+when available extras exist:
+  seek nearest available extras
+  pause 3
+  done
+
+when standing on missing:
+  place
+  pause 5
+  done
+
+when available missing exist:
+  seek nearest available missing
+  pause 3
+  done
+
+# wander
+when no missing:
+  wander avoiding lit, chance 25%
+  pause 10
+  done
+
+each tick:
+  for each lit cell in current:
+    increase fade by 0.032, cap 1.0
+
+--- rendering ---
+
+physics: 10 hz
+display: 60 hz, interpolated
+
+board pixel: green (0, 64, 0) * fade
+
+agent idle index 0: white (64, 64, 64)
+
+--- goal ---
+
+type: clock
+font: megafont 5x6
+layout: horizontal
+time: wobbly 120s to 300s, fast 1.3x, slow 0.7x
+
+--- collision ---
+
+on collision:
+  increment wait_counter
+  if wait_counter > 5:
+    clear path
+    clear claimed
+    reset wait_counter

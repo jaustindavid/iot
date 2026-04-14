@@ -1,0 +1,166 @@
+## Coati Clock
+## Two autonomous agents rearrange pixels on an LED matrix to display the time.
+
+--- grid ---
+
+32 wide, 8 tall, zigzag wiring
+
+--- layers ---
+
+current: bool, default off
+target: bool, default off
+fade: float, default 0.0
+
+--- landmarks ---
+
+dumpster at (0, 7) and (1, 7), color red (64, 0, 0)
+pool at (30, 7) and (31, 7), color blue (0, 0, 64)
+
+--- terms ---
+
+extras: current is on and target is off
+missing: current is off and target is on
+
+--- agents ---
+
+2 coati agents
+coati 0 starts at (8, 4)
+coati 1 starts at (16, 4)
+
+properties:
+  carrying: bool = false
+  washed: bool = false
+  bored: bool = false
+  wash_counter: int = 0
+  pause_counter: int = 0
+  bored_counter: int = 0
+
+--- pathfinding ---
+
+algorithm: a*
+heuristic: euclidean
+max nodes: 256
+orthogonal cost: 1.0
+diagonal cost: 1.414
+penalty lit cell: 50
+penalty occupied cell: 20
+
+--- behavior ---
+
+one pathfind per tick
+
+## Pause cooldown (after pickup/placement)
+when pause_counter > 0:
+  decrement pause_counter
+  done
+
+## ── CARRYING, NOT YET WASHED ──────────────────────────
+
+when carrying and not washed:
+  if wash_counter > 0:
+    decrement wash_counter
+    if wash_counter is 0:
+      set washed to true
+      release pool
+      clear claimed
+    else:
+      bob at pool
+    done
+  if at pool and pool is free:
+    claim pool
+    set wash_counter to 5
+    step up from pool
+    done
+  seek pool
+
+## ── CARRYING, WASHED ──────────────────────────────────
+
+when carrying and washed:
+  if at dumpster and no missing:
+    discard
+    set carrying to false
+    set washed to false
+    clear claimed
+    pause 4
+    done
+  if standing on missing and at claimed:
+    place
+    set carrying to false
+    set washed to false
+    clear claimed
+    pause 4
+    done
+  if available missing exist:
+    seek nearest available missing
+  else:
+    seek dumpster
+
+## ── NOT CARRYING ──────────────────────────────────────
+
+when not carrying:
+  if standing on extras and cell is lit:
+    pickup from board
+    set carrying to true
+    clear claimed
+    pause 4
+    done
+  if at dumpster and missing exist:
+    pickup from dumpster
+    set carrying to true
+    clear claimed
+    pause 4
+    done
+  if available extras exist:
+    seek nearest available extras
+    done
+  if available missing exist:
+    seek dumpster
+    done
+  ## Nothing to do — wander aimlessly
+  become bored
+  if on lit or at any landmark:
+    force bored_counter to 100
+  increment bored_counter
+  if bored_counter > 4:
+    reset bored_counter
+    wander avoiding lit and landmarks, chance 25%, forced if near lit
+
+## ── FADE ──────────────────────────────────────────────
+
+each tick:
+  for each lit cell in current:
+    increase fade by 0.032, cap 1.0
+
+--- rendering ---
+
+physics: 10 hz
+display: 60 hz, interpolated
+
+board pixel: green (0, 64, 0) * fade
+dumpster: red (64, 0, 0)
+pool: blue (0, 0, 64)
+
+agent carrying not washed: yellow (64, 64, 0) pulse 150ms
+agent carrying washed: yellow (64, 64, 0) solid
+agent bored index 0: gray (32, 32, 32)
+agent bored index 1: dark cyan (0, 32, 32)
+agent waiting: red (64, 25, 25) shimmer 30ms
+agent idle index 0: white (64, 64, 64)
+agent idle index 1: cyan (0, 64, 64)
+
+--- goal ---
+
+type: clock
+font: megafont 5x6
+layout: horizontal
+time: wobbly 120s to 300s, fast 1.3x, slow 0.7x
+
+--- collision ---
+
+on collision:
+  increment wait_counter
+  if wait_counter > 3 + index * 2:
+    clear path
+    clear claimed
+    reset wait_counter
+  color: red (64, 25, 25) shimmer 30ms

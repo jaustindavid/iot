@@ -1,0 +1,76 @@
+"""
+CLI entry point: python -m coati <command> <script.coati> [options]
+
+Commands:
+  run     Run live in terminal (default)
+  step    One tick at a time
+  fast    No rendering, run to convergence
+  parse   Parse and dump IR as JSON
+"""
+from __future__ import annotations
+import argparse
+import json
+import sys
+from dataclasses import asdict
+from .parser import parse_file, ParseError
+from .engine import CoatiEngine
+from .simulator import run_live, run_step, run_fast
+
+
+def _json_default(obj):
+    """Handle non-serializable types in IR."""
+    if isinstance(obj, set):
+        return list(obj)
+    if hasattr(obj, "__dataclass_fields__"):
+        return asdict(obj)
+    return str(obj)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="coati",
+        description="Coati — behavior language for grid particle simulations"
+    )
+    parser.add_argument("command", choices=["run", "step", "fast", "parse"],
+                        help="Simulation mode")
+    parser.add_argument("script", help="Path to .coati script file")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="Simulation speed multiplier (for 'run' mode)")
+    parser.add_argument("--max-ticks", type=int, default=5000,
+                        help="Max ticks before stopping (for 'fast' mode)")
+    parser.add_argument("--time", type=str, default=None,
+                        help="Static time HH:MM (for 'fast' mode, e.g. '12:34')")
+
+    args = parser.parse_args()
+
+    # Parse script
+    try:
+        ir = parse_file(args.script)
+    except ParseError as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print(f"File not found: {args.script}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == "parse":
+        print(json.dumps(asdict(ir), indent=2, default=_json_default))
+        return
+
+    # Build engine
+    engine = CoatiEngine(ir)
+
+    if args.command == "run":
+        run_live(engine, ir, speed=args.speed)
+    elif args.command == "step":
+        run_step(engine, ir)
+    elif args.command == "fast":
+        static_time = None
+        if args.time:
+            parts = args.time.split(":")
+            static_time = (int(parts[0]), int(parts[1]))
+        run_fast(engine, ir, max_ticks=args.max_ticks, static_time=static_time)
+
+
+if __name__ == "__main__":
+    main()
