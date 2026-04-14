@@ -1,7 +1,10 @@
 #include "CoatiEngine.h"
-#include <cstring>
 
-static const uint8_t megafont_bitmaps[][6] = {
+const int   CoatiEngine::nest_count = 1;
+const Point CoatiEngine::nest[] = {{0, 7}};
+
+// megafont 5×6 bitmaps (0–9, colon)
+static const uint8_t _megafont[][6] = {
     {0x70, 0x98, 0x98, 0x98, 0x98, 0x70}, // 0
     {0x30, 0x70, 0x30, 0x30, 0x30, 0x78}, // 1
     {0xF0, 0x18, 0x70, 0xC0, 0xC0, 0xF8}, // 2
@@ -15,32 +18,39 @@ static const uint8_t megafont_bitmaps[][6] = {
     {0x00, 0x18, 0x00, 0x00, 0x18, 0x00}  // :
 };
 
-struct CompareNode {
-    bool operator()(const std::pair<float, Point>& a, const std::pair<float, Point>& b) {
+namespace {
+struct _CmpNode {
+    bool operator()(const std::pair<float,Point>& a,
+                    const std::pair<float,Point>& b) const {
         return a.first > b.first;
     }
 };
+} // namespace
 
 CoatiEngine::CoatiEngine() {
-    agents.push_back(CoatiAgent{{GRID_WIDTH / 4, 4}});
-    agents.push_back(CoatiAgent{{(GRID_WIDTH * 3) / 4, 4}});
+    agents.reserve(80);
+    for (int i = 0; i < 80; i++) {
+        AgentState a;
+        a.index = i;
+        a.pos = {0, 7};
+        a.last_pos = a.pos;
+        a.active = false;
+        agents.push_back(a);
+    }
 }
 
-void CoatiEngine::draw_digit(int x, int y_offset, char char_val) {
+void CoatiEngine::_draw_digit(int x, int y_off, char c) {
     int idx = -1;
-    if (char_val >= '0' && char_val <= '9') idx = char_val - '0';
-    else if (char_val == ':') idx = 10;
-    if (idx == -1) return;
-
+    if (c >= '0' && c <= '9') idx = c - '0';
+    else if (c == ':') idx = 10;
+    if (idx < 0) return;
     for (int row = 0; row < 6; row++) {
-        uint8_t bits = megafont_bitmaps[idx][row];
+        uint8_t bits = _megafont[idx][row];
         for (int col = 0; col < 5; col++) {
             if (bits & (0x80 >> col)) {
-                int px = x + col;
-                int py = row + y_offset; // Allow custom vertical placement
-                if (px >= 0 && px < GRID_WIDTH && py >= 0 && py < GRID_HEIGHT) {
+                int px = x + col, py = row + y_off;
+                if (px >= 0 && px < GRID_W && py >= 0 && py < GRID_H)
                     pending_target[px][py] = true;
-                }
             }
         }
     }
@@ -50,350 +60,389 @@ void CoatiEngine::update_target(time_t virtual_now) {
     if (!Time.isValid()) return;
     int h = Time.hour(virtual_now);
     int m = Time.minute(virtual_now);
-    
-    char h_str[3], m_str[3];
-    snprintf(h_str, sizeof(h_str), "%02d", h);
-    snprintf(m_str, sizeof(m_str), "%02d", m);
-
+    char hs[3], ms_[3];
+    snprintf(hs, sizeof(hs),  "%02d", h);
+    snprintf(ms_, sizeof(ms_), "%02d", m);
     memset(pending_target, 0, sizeof(pending_target));
-    
-    if (GRID_HEIGHT >= 16) {
-        // Square layout (16x16)
-        draw_digit(2, 1, h_str[0]);    // Top row
-        draw_digit(9, 1, h_str[1]);
-        
-        draw_digit(2, 8, m_str[0]); // Bottom row
-        draw_digit(9, 8, m_str[1]);
+    if (GRID_H >= 16) {
+        _draw_digit(2,  1, hs[0]);  _draw_digit(9,  1, hs[1]);
+        _draw_digit(2,  8, ms_[0]); _draw_digit(9,  8, ms_[1]);
     } else {
-        // Wide layout (e.g. 32x8)
-        draw_digit(4, 1, h_str[0]);
-        draw_digit(10, 1, h_str[1]);
-        draw_digit(17, 1, m_str[0]);
-        draw_digit(23, 1, m_str[1]);
+        _draw_digit(4,  1, hs[0]);  _draw_digit(10, 1, hs[1]);
+        _draw_digit(17, 1, ms_[0]); _draw_digit(23, 1, ms_[1]);
     }
-    
-    pending_time = virtual_now;
+    pending_time   = virtual_now;
     target_pending = true;
 }
 
 void CoatiEngine::apply_pending_target() {
     if (!target_pending) return;
     target_pending = false;
-    active_target = pending_time;
-    int target_count = 0;
-    for (int x = 0; x < GRID_WIDTH; x++) {
-        for (int y = 0; y < GRID_HEIGHT; y++) {
+    active_target  = pending_time;
+    for (int x = 0; x < GRID_W; x++)
+        for (int y = 0; y < GRID_H; y++)
             target_board[x][y] = pending_target[x][y];
-            if (target_board[x][y]) target_count++;
-        }
+    // Reset landmark locks
+    // Reset all agents
+    for (auto& a : agents) {
+        a.claimed      = {-1, -1};
+        a.path.clear();
+        a.wait_counter = 0;
+        a.pause_counter = 0;
     }
-    Log.info("Engine: Applied target %lu, pixels=%d, cur_addr=%p, tgt_addr=%p", 
-             (unsigned long)active_target, target_count, (void*)current_board, (void*)target_board);
-
-    pool_user = -1;
-    for (auto &agent : agents) {
-        agent.claimed_target = {-1, -1};
-        agent.current_path.clear();
-        agent.wait_ticks = 0;
-        agent.bored_ticks = 0;
-        agent.wash_ticks = 0;
-        agent.washed = false;
-        agent.pause_ticks = 0;
-    }
+    Log.info("Engine: applied new target");
 }
 
-std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_index, int max_nodes) {
+std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_idx) {
+    if (start == dest) return {};
     memset(pf_visited, 0, sizeof(pf_visited));
-    memset(pf_parent, 0, sizeof(pf_parent));
-    for (int x = 0; x < GRID_WIDTH; x++)
-        for (int y = 0; y < GRID_HEIGHT; y++)
+    for (int x = 0; x < GRID_W; x++)
+        for (int y = 0; y < GRID_H; y++)
             pf_cost[x][y] = 1e9f;
 
-    std::priority_queue<
-        std::pair<float, Point>,
-        std::vector<std::pair<float, Point>>,
-        CompareNode> q;
-
-    pf_cost[start.x][start.y] = 0;
-    q.push({0, start});
-
-    int nodes_expanded = 0;
-    Point best_frontier = {-1, -1};
+    using _PQNode = std::pair<float, Point>;
+    std::priority_queue<_PQNode, std::vector<_PQNode>, _CmpNode> q;
+    pf_cost[start.x][start.y] = 0.0f;
+    q.push({0.0f, start});
+    const int MAX_NODES = 256;
+    int expanded = 0;
+    Point best = {-1, -1};
     float best_h = 1e9f;
 
-    while (!q.empty() && nodes_expanded < max_nodes) {
-        Point curr = q.top().second;
-        q.pop();
-
-        if (curr == dest) { best_frontier = dest; break; }
-        if (pf_visited[curr.x][curr.y]) continue;
-        pf_visited[curr.x][curr.y] = true;
-        nodes_expanded++;
-
-        float h = dist(curr, dest);
-        if (h < best_h) { best_h = h; best_frontier = curr; }
-
+    while (!q.empty() && expanded < MAX_NODES) {
+        Point cur = q.top().second; q.pop();
+        if (cur == dest) { best = dest; break; }
+        if (pf_visited[cur.x][cur.y]) continue;
+        pf_visited[cur.x][cur.y] = true;
+        expanded++;
+        float h = sqrtf((float)((cur.x-dest.x)*(cur.x-dest.x)+(cur.y-dest.y)*(cur.y-dest.y)));
+        if (h < best_h) { best_h = h; best = cur; }
         for (int dx = -1; dx <= 1; dx++) {
             for (int dy = -1; dy <= 1; dy++) {
                 if (dx == 0 && dy == 0) continue;
-                int nx = curr.x + dx, ny = curr.y + dy;
-                if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
-
-                float pixel_cost = (current_board[nx][ny] && !(nx == dest.x && ny == dest.y)) ? 50.0f : 0.0f;
-                float penalty = 0.0f;
-                for (size_t j = 0; j < agents.size(); j++) {
-                    if ((int)j != self_index && agents[j].pos.x == nx && agents[j].pos.y == ny && !(nx == dest.x && ny == dest.y))
-                        penalty = 20.0f;
-                }
-
-                float step = (dx == 0 || dy == 0) ? 1.0f : 1.414f;
-                float nc = pf_cost[curr.x][curr.y] + step + penalty + pixel_cost;
+                int nx = cur.x + dx, ny = cur.y + dy;
+                if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+                bool is_dest = (nx == dest.x && ny == dest.y);
+                float lit_cost = (!is_dest && current_board[nx][ny]) ? 50.0f : 0.0f;
+                float occ_cost = 0.0f;
+                for (size_t j = 0; j < agents.size(); j++)
+                    if ((int)j != self_idx && agents[j].active &&
+                        agents[j].pos.x == nx && agents[j].pos.y == ny && !is_dest)
+                        occ_cost = 20.0f;
+                float step = (dx==0||dy==0) ? 1.000f : 1.414f;
+                float nc = pf_cost[cur.x][cur.y] + step + lit_cost + occ_cost;
                 if (nc < pf_cost[nx][ny]) {
                     pf_cost[nx][ny] = nc;
-                    pf_parent[nx][ny] = curr;
-                    q.push({nc + dist({nx, ny}, dest), {nx, ny}});
+                    pf_parent[nx][ny] = cur;
+                    float g = sqrtf((float)((nx-dest.x)*(nx-dest.x)+(ny-dest.y)*(ny-dest.y)));
+                    q.push({nc + g, {nx, ny}});
                 }
             }
         }
     }
 
-    Point target = (pf_cost[dest.x][dest.y] < 1e8f) ? dest : best_frontier;
+    Point tgt = (pf_cost[dest.x][dest.y] < 1e8f) ? dest : best;
     std::vector<Point> path;
-    if (target.x == -1 || (target.x == start.x && target.y == start.y)) {
-        Log.trace("find_path: No expansion or target=start");
-        return path;
-    }
-
-    Point cur = target;
-    int safety = 0;
-    while (!(cur.x == start.x && cur.y == start.y) && safety < 256) {
+    if (tgt.x < 0 || tgt == start) return path;
+    Point cur = tgt;
+    for (int safety = 0; !(cur == start) && safety < 512; safety++) {
         path.push_back(cur);
         cur = pf_parent[cur.x][cur.y];
-        safety++;
     }
     std::reverse(path.begin(), path.end());
-    Log.trace("find_path: Found path length %d", (int)path.size());
     return path;
 }
 
-Point CoatiEngine::find_closest(Point start, const std::vector<Point>& candidates) {
-    Point best = {-1, -1};
-    float min_d = 1e9;
-    for (auto c : candidates) {
-        float d = dist(start, c);
-        if (d < min_d) { min_d = d; best = c; }
+Point CoatiEngine::_find_closest(Point s, const std::vector<Point>& cands) {
+    Point best = {-1, -1}; float md = 1e9f;
+    for (auto& c : cands) {
+        float d = sqrtf((float)((s.x-c.x)*(s.x-c.x)+(s.y-c.y)*(s.y-c.y)));
+        if (d < md) { md = d; best = c; }
     }
     return best;
 }
 
+bool CoatiEngine::_in_vec(const std::vector<Point>& v, Point p) const {
+    for (auto& c : v) if (c == p) return true;
+    return false;
+}
+
+bool CoatiEngine::_near_lit(Point p) const {
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = p.x+dx, ny = p.y+dy;
+            if (nx>=0 && nx<GRID_W && ny>=0 && ny<GRID_H && current_board[nx][ny])
+                return true;
+        }
+    return false;
+}
+
+bool CoatiEngine::_is_landmark(Point p) const {
+    for (int i = 0; i < nest_count; i++) if (nest[i] == p) return true;
+    return false;
+}
+
 void CoatiEngine::tick() {
-    static std::vector<Point> tk_extras, tk_missing, tk_avail_e, tk_avail_m, tk_wander;
-    tk_extras.clear(); tk_missing.clear();
-    
-    for (int x = 0; x < GRID_WIDTH; x++) {
-        for (int y = 0; y < GRID_HEIGHT; y++) {
-            bool is_dumpster = (y == GRID_HEIGHT - 1 && (x == 0 || x == 1));
-            bool is_pool = (y == GRID_HEIGHT - 1 && (x == GRID_WIDTH - 2 || x == GRID_WIDTH - 1));
-            if (is_dumpster || is_pool) continue;
-            if (current_board[x][y] && !target_board[x][y]) tk_extras.push_back({x, y});
-            if (!current_board[x][y] && target_board[x][y]) tk_missing.push_back({x, y});
+    tk_extras.clear();
+    tk_missing.clear();
+
+    for (int x = 0; x < GRID_W; x++) {
+        for (int y = 0; y < GRID_H; y++) {
+            if (_is_landmark({x, y})) continue;
+            if ((current_board[x][y] && !target_board[x][y])) tk_extras.push_back({x, y});
+            if ((!current_board[x][y] && target_board[x][y])) tk_missing.push_back({x, y});
         }
     }
 
+    // Spawn phase
+    {
+        static int _spawn_timer = 0;
+        if (++_spawn_timer >= 10) {
+            _spawn_timer = 0;
+            if ((!tk_missing.empty())) {
+                for (auto& _sa : agents) {
+                    if (!_sa.active) {
+                        _sa.active    = true;
+                        _sa.pos       = {0, 7};
+                        _sa.last_pos  = _sa.pos;
+                        _sa.path.clear();
+                        _sa.claimed   = {-1, -1};
+                        _sa.wait_counter = 0;
+                        _sa.pause_counter = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
+    // Movement phase
     for (size_t i = 0; i < agents.size(); i++) {
-        CoatiAgent& a = agents[i];
+        AgentState& a = agents[i];
+        if (!a.active) continue;
         a.last_pos = a.pos;
-
-        if (!a.current_path.empty()) {
-            Point next_step = a.current_path.front();
-            bool collision = false;
-            for (size_t j = 0; j < agents.size(); j++) {
-                if (i != j && agents[j].pos == next_step) collision = true;
-            }
-
-            if (collision) {
-                a.wait_ticks++;
-                if (a.wait_ticks > (3 + (int)i * 2)) {
-                    a.current_path.clear();
-                    a.claimed_target = {-1, -1};
-                    a.wait_ticks = 0;
-                }
-                continue;
-            }
-            a.pos = next_step;
-            a.current_path.erase(a.current_path.begin());
-            a.wait_ticks = 0;
-            a.stuck_ticks = 0;
-            continue;
-        }
-    }
-
-    bool path_calculated = false;
-    for (size_t i = 0; i < agents.size(); i++) {
-        CoatiAgent& a = agents[i];
-        if (!a.current_path.empty() || a.wait_ticks > 0) continue;
-        if (a.pause_ticks > 0) { a.pause_ticks--; continue; }
-
-        tk_avail_e.clear();
-        for (auto e : tk_extras) {
-            bool claimed = false;
-            for (size_t j = 0; j < agents.size(); j++) if (i != j && agents[j].claimed_target == e) claimed = true;
-            if (!claimed) tk_avail_e.push_back(e);
-        }
-        tk_avail_m.clear();
-        for (auto m : tk_missing) {
-            bool claimed = false;
-            for (size_t j = 0; j < agents.size(); j++) if (i != j && agents[j].claimed_target == m) claimed = true;
-            if (!claimed) tk_avail_m.push_back(m);
-        }
-
-        if (a.carrying) {
-            if (!a.washed) {
-                if (a.wash_ticks > 0) {
-                    a.wash_ticks--;
-                    if (a.wash_ticks == 0) {
-                        Log.info("Agent %d: Washed", (int)i);
-                        a.washed = true;
-                        if (pool_user == (int)i) pool_user = -1;
-                        a.claimed_target = {-1, -1};
-                    } else {
-                        Point spot = pool[i % 2];
-                        if (a.pos.y == spot.y) a.current_path = {{spot.x, spot.y - 1}};
-                        else a.current_path = {spot};
-                    }
-                    continue;
-                }
-                bool at_pool = (a.pos.x == pool[i % 2].x && a.pos.y == pool[i % 2].y);
-                if (at_pool) {
-                    if (pool_user == -1 || pool_user == (int)i) {
-                        Log.info("Agent %d: At pool, starting wash", (int)i);
-                        pool_user = (int)i;
-                        a.wash_ticks = 5;
-                        a.current_path = {{a.pos.x, a.pos.y - 1}};
-                    }
-                    continue;
-                }
-                if (path_calculated) continue;
-                if (pool_user == -1 || pool_user == (int)i) {
-                    Point pool_dest = pool[i % 2];
-                    Log.info("Agent %d: Calculating path to pool {%d,%d}", (int)i, pool_dest.x, pool_dest.y);
-                    a.current_path = find_path(a.pos, pool_dest, (int)i);
-                    a.claimed_target = pool_dest;
-                    path_calculated = true;
-                    continue;
-                }
-            } else {
-                // Placing logic
-                bool standing_on_m = false;
-                for (auto m : tk_missing) if (a.pos.x == m.x && a.pos.y == m.y) standing_on_m = true;
-                bool standing_on_dumpster_dump = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
-
-                if (standing_on_dumpster_dump && tk_missing.empty()) {
-                    Log.info("Agent %d: Dumped excess pixel at Dumpster", (int)i);
-                    a.carrying = false; a.washed = false; a.claimed_target = {-1, -1}; a.pause_ticks = 4;
-                    continue;
-                } else if (standing_on_m && !current_board[a.pos.x][a.pos.y] && a.pos.x == a.claimed_target.x && a.pos.y == a.claimed_target.y) {
-                    Log.info("Agent %d: Placed pixel at {%d,%d}", (int)i, a.pos.x, a.pos.y);
-                    current_board[a.pos.x][a.pos.y] = true;
-                    fade_board[a.pos.x][a.pos.y] = 0.0f;
-                    a.carrying = false; a.washed = false; a.claimed_target = {-1, -1}; a.pause_ticks = 4;
-                    continue;
-                }
-                if (path_calculated) continue;
-                if (!tk_avail_m.empty()) {
-                    Point dest = find_closest(a.pos, tk_avail_m);
-                    Log.info("Agent %d: Carrying, pathing to missing {%d,%d}", (int)i, dest.x, dest.y);
-                    a.current_path = find_path(a.pos, dest, (int)i);
-                    if (!a.current_path.empty()) a.claimed_target = dest;
-                    path_calculated = true;
-                } else {
-                    Point dest = dumpster[i % 2];
-                    Log.info("Agent %d: Carrying excess, pathing to dumpster {%d,%d}", (int)i, dest.x, dest.y);
-                    a.current_path = find_path(a.pos, dest, (int)i);
-                    a.claimed_target = dest;
-                    path_calculated = true;
-                }
+        if (a.path.empty()) continue;
+        Point nxt = a.path.front();
+        bool col  = false;
+        for (size_t j = 0; j < agents.size(); j++)
+            if (i != j && agents[j].active && agents[j].pos == nxt) { col = true; break; }
+        if (col) {
+            a.wait_counter++;
+            a.wait_counter++;
+            if ((a.wait_counter > 3)) {
+                a.path.clear();
+                a.claimed = {-1, -1};
+                a.wait_counter = 0;  // reset
             }
         } else {
-            // Not carrying
-            bool standing_on_e = false;
-            for (auto e : tk_extras) if (a.pos.x == e.x && a.pos.y == e.y) standing_on_e = true;
-            bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x == 0 || a.pos.x == 1));
-
-            if ((standing_on_e && current_board[a.pos.x][a.pos.y]) || (standing_on_dumpster && !tk_missing.empty())) {
-                Log.info("Agent %d: Picked up pixel at {%d,%d} (Target: %s)", (int)i, a.pos.x, a.pos.y, standing_on_dumpster ? "Dumpster" : "Board");
-                if (standing_on_e) {
-                    current_board[a.pos.x][a.pos.y] = false;
-                    fade_board[a.pos.x][a.pos.y] = 0.0f;
-                }
-                a.carrying = true; a.claimed_target = {-1, -1}; a.pause_ticks = 4;
-                continue;
-            }
-            if (path_calculated) continue;
-            if (!tk_avail_e.empty()) {
-                Point dest = find_closest(a.pos, tk_avail_e);
-                Log.info("Agent %d: Empty, pathing to extra {%d,%d}", (int)i, dest.x, dest.y);
-                a.current_path = find_path(a.pos, dest, (int)i);
-                if (!a.current_path.empty()) a.claimed_target = dest;
-                path_calculated = true;
-            } else if (!tk_avail_m.empty()) {
-                Point dest = dumpster[i % 2];
-                Log.info("Agent %d: Empty/Available, pathing to dumpster {%d,%d}", (int)i, dest.x, dest.y);
-                a.current_path = find_path(a.pos, dest, (int)i);
-                a.claimed_target = dest;
-                path_calculated = true;
-            } else {
-                a.is_bored = true;
-                bool standing_on_dumpster = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x <= 1));
-                bool standing_on_pool = (a.pos.y == GRID_HEIGHT - 1 && (a.pos.x >= GRID_WIDTH - 2));
-
-                if (current_board[a.pos.x][a.pos.y] || standing_on_dumpster || standing_on_pool) {
-                    a.bored_ticks = 100; // Force immediate step away
-                }
-
-                a.bored_ticks++;
-                if (a.bored_ticks > 4) { // Evaluation speed for pacing
-                    a.bored_ticks = 0;
-
-                    std::vector<Point> safe_moves;
-                    bool near_lit = false;
-                    for (int dx = -1; dx <= 1; dx++) {
-                        for (int dy = -1; dy <= 1; dy++) {
-                            if (dx == 0 && dy == 0) continue;
-                            int nx = a.pos.x + dx;
-                            int ny = a.pos.y + dy;
-                            if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
-                            if (current_board[nx][ny]) { near_lit = true; continue; }
-                            if (ny == GRID_HEIGHT - 1 && (nx <= 1 || nx >= GRID_WIDTH - 2)) continue;
-                            
-                            safe_moves.push_back({nx, ny});
-                        }
-                    }
-
-                    if (current_board[a.pos.x][a.pos.y] || standing_on_dumpster || standing_on_pool) {
-                        near_lit = true; 
-                    }
-
-                    if (near_lit && !safe_moves.empty()) {
-                        Point choice = safe_moves[rand() % safe_moves.size()];
-                        a.current_path = {choice};
-                    } else if (!near_lit && (rand() % 100 < 25) && !safe_moves.empty()) {
-                        Point choice = safe_moves[rand() % safe_moves.size()];
-                        a.current_path = {choice};
-                    }
-                }
-            }
+            a.pos = nxt;
+            a.path.erase(a.path.begin());
+            a.wait_counter = 0;
         }
     }
 
-    // Fade updates
-    for (int x = 0; x < GRID_WIDTH; x++) {
-        for (int y = 0; y < GRID_HEIGHT; y++) {
+    // Behavior phase
+    int _pf_budget = 0;
+    for (size_t i = 0; i < agents.size(); i++) {
+        AgentState& a = agents[i];
+        if (!a.active) continue;
+        if (!a.path.empty() || a.wait_counter > 0) continue;
+        if (_pf_budget >= 999) break;
+
+
+        bool _used_pf = false;
+        // Compute available (unclaimed-by-others) term subsets
+        std::vector<Point> tk_avail_extras;
+        for (auto& _p : tk_extras) {
+            bool _cl = false;
+            for (size_t j = 0; j < agents.size(); j++)
+                if (j != i && agents[j].active && agents[j].claimed == _p) { _cl = true; break; }
+            if (!_cl) tk_avail_extras.push_back(_p);
+        }
+        std::vector<Point> tk_avail_missing;
+        for (auto& _p : tk_missing) {
+            bool _cl = false;
+            for (size_t j = 0; j < agents.size(); j++)
+                if (j != i && agents[j].active && agents[j].claimed == _p) { _cl = true; break; }
+            if (!_cl) tk_avail_missing.push_back(_p);
+        }
+
+        auto _eval = [&]() {
+            if ((a.pause_counter > 0)) {
+                a.pause_counter--;
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((_in_vec(tk_extras, a.pos) && current_board[a.pos.x][a.pos.y])) {
+                if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {
+                    current_board[a.pos.x][a.pos.y] = false;
+                    fade_board[a.pos.x][a.pos.y]    = 0.0f;
+                }
+                a.pause_counter = 5;
+                return;  // done
+                return;  // end of when-block
+            }
+            if (current_board[a.pos.x][a.pos.y]) {
+                // set_display_color: simulator-only — omitted on device
+                return;  // done
+                return;  // end of when-block
+            }
+            if (_in_vec(tk_missing, a.pos)) {
+                // set_display_color: simulator-only — omitted on device
+                if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {
+                    current_board[a.pos.x][a.pos.y] = true;
+                    fade_board[a.pos.x][a.pos.y]    = 0.0f;
+                }
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((!tk_avail_missing.empty())) {
+                {  // seek nearest available missing
+                    if (!tk_avail_missing.empty()) {
+                        Point _dest = _find_closest(a.pos, tk_avail_missing);
+                        a.claimed = _dest;
+                        if (a.pos == _dest) return;  // already here
+                        if (!_used_pf) {
+                            a.path = find_path(a.pos, _dest, (int)i);
+                            _used_pf = true;
+                        }
+                    }
+                }
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((!tk_avail_extras.empty())) {
+                {  // seek nearest available extras
+                    if (!tk_avail_extras.empty()) {
+                        Point _dest = _find_closest(a.pos, tk_avail_extras);
+                        a.claimed = _dest;
+                        if (a.pos == _dest) return;  // already here
+                        if (!_used_pf) {
+                            a.path = find_path(a.pos, _dest, (int)i);
+                            _used_pf = true;
+                        }
+                    }
+                }
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((a.pos != nest[i % nest_count])) {
+                // set_display_color: simulator-only — omitted on device
+                {  // seek nest
+                    Point _dest = nest[i % nest_count];
+                    a.claimed = _dest;
+                    if (a.pos == _dest) return;  // already here
+                    if (!_used_pf) {
+                        a.path = find_path(a.pos, _dest, (int)i);
+                        _used_pf = true;
+                    }
+                }
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((a.pos == nest[i % nest_count])) {
+                a.active = false;
+                a.path.clear();
+                a.claimed = {-1, -1};
+                return;  // despawn
+                return;  // end of when-block
+            }
+        };
+        _eval();
+        if (_used_pf) _pf_budget++;
+    }
+
+    // Fade update
+    for (int x = 0; x < GRID_W; x++)
+        for (int y = 0; y < GRID_H; y++)
             if (current_board[x][y] && fade_board[x][y] < 1.0f) {
                 fade_board[x][y] += 0.032f;
                 if (fade_board[x][y] > 1.0f) fade_board[x][y] = 1.0f;
             }
+}
+
+void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, float blend, int rotation) {
+    strip.clear();
+    const int PIXEL_COUNT = GRID_W * GRID_H;
+
+    auto _map = [&](int x, int y) -> int {
+        if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return -1;
+        int rx = x, ry = y;
+        int max_x = GRID_W - 1;
+        int max_y = GRID_H - 1;
+        if (rotation == 90)       { rx = max_y - y; ry = x; }
+        else if (rotation == 180) { rx = max_x - x; ry = max_y - y; }
+        else if (rotation == 270) { rx = y; ry = max_x - x; }
+        int phys_h = (rotation == 90 || rotation == 270) ? GRID_W : GRID_H;
+        if (rx % 2 == 0) return (rx * phys_h) + ry;
+        return (rx * phys_h) + ((phys_h - 1) - ry);
+    };
+
+    auto _set = [&](int x, int y, uint32_t c) {
+        int idx = _map(x, y);
+        if (idx >= 0 && idx < PIXEL_COUNT) strip.setPixelColor(idx, c);
+    };
+
+    auto _cc = [](uint8_t r, uint8_t g, uint8_t b, float s) -> uint32_t {
+        if (s <= 0.0f) return 0;
+        if (s > 1.0f) s = 1.0f;
+        auto scale = [](uint8_t v, float s) -> uint8_t {
+            if (v == 0) return 0;
+            float f = (float)v * s;
+            return (uint8_t)(f < 1.0f ? 1.0f : f);
+        };
+        return Adafruit_NeoPixel::Color(scale(r, s), scale(g, s), scale(b, s));
+    };
+
+    // board pixels (lit cells, excluding landmark cells)
+    for (int x = 0; x < GRID_W; x++) {
+        for (int y = 0; y < GRID_H; y++) {
+            if (!current_board[x][y]) continue;
+            if (_is_landmark({x, y})) continue;
+            _set(x, y, _cc(0, 64, 0, fade_board[x][y] * bri));
         }
     }
+
+    // landmark: nest
+    for (int k = 0; k < nest_count; k++) {
+        const Point& p = nest[k];
+        _set(p.x, p.y, _cc(64, 0, 0, bri));
+    }
+
+    // agents
+    for (size_t i = 0; i < agents.size(); i++) {
+        AgentState& a = agents[i];
+        if (!a.active) continue;
+        uint32_t color = 0;
+        bool matched = false;
+
+        if (!matched && (current_board[a.pos.x][a.pos.y])) {
+            uint32_t _c = _cc(0, 255, 0, bri);
+            color = _c;
+            matched = true;
+        }
+        if (!matched && (_in_vec(tk_missing, a.pos))) {
+            uint32_t _c = _cc(0, 255, 0, bri);
+            color = _c;
+            matched = true;
+        }
+        if (!matched) {
+            uint32_t _c = _cc(255, 0, 0, bri);
+            color = _c;
+            matched = true;
+        }
+
+        if (a.pos == a.last_pos) {
+            _set(a.pos.x, a.pos.y, color);
+        } else {
+            uint8_t r = (color >> 16) & 0xFF;
+            uint8_t g = (color >>  8) & 0xFF;
+            uint8_t b =  color        & 0xFF;
+            _set(a.last_pos.x, a.last_pos.y, _cc(r, g, b, (1.0f - blend)));
+            _set(a.pos.x,      a.pos.y,      _cc(r, g, b, blend));
+        }
+    }
+
+    strip.show();
 }

@@ -15,7 +15,7 @@ Thread* telemetryThread = nullptr;
 
 // Hardware settings
 #define PIXEL_PIN D2        // SPI MOSI
-#define PIXEL_COUNT (GRID_WIDTH * GRID_HEIGHT)
+#define PIXEL_COUNT (GRID_W * GRID_H)
 #define PIXEL_TYPE WS2812B
 
 #ifndef MATRIX_PIN
@@ -172,13 +172,6 @@ void telemetry_worker() {
     }
 }
 
-uint32_t get_pixel_color(uint8_t r, uint8_t g, uint8_t b, float bri) {
-    if (bri == 0) return 0;
-    return strip.Color((uint8_t)(r?max(r*bri,1):0), 
-                       (uint8_t)(g?max(g*bri,1):0),
-                       (uint8_t)(b?max(b*bri,1):0));
-}
-
 void loop() {
     unsigned long now = millis();
 
@@ -229,118 +222,30 @@ void loop() {
     // 3. Render Tick (60Hz / 16ms)
     if (now - last_render_tick >= 16) {
         last_render_tick = now;
-        
+
         float blend = (float)(now - last_physics_tick) / 100.0f;
         if (blend > 1.0f) blend = 1.0f;
 
-        strip.clear();
-        float bri = global_brightness;
-
-        // Draw static endpoints (Dumpster & Pool)
-        uint32_t red = get_pixel_color(64, 0, 0, bri);
-        uint32_t blue = get_pixel_color(0, 0, 64, bri);
-        
-        auto map_pixel = [](int x, int y) {
-            if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return 999; // Return invalid index
-            int rx = x, ry = y;
-            int max_x = GRID_WIDTH - 1;
-            int max_y = GRID_HEIGHT - 1;
-            
-            if (GRID_ROTATION == 90) {
-                rx = max_y - y;
-                ry = x;
-            } else if (GRID_ROTATION == 180) {
-                rx = max_x - x;
-                ry = max_y - y;
-            } else if (GRID_ROTATION == 270) {
-                rx = y;
-                ry = max_x - x;
-            }
-
-            int phys_h = (GRID_ROTATION == 90 || GRID_ROTATION == 270) ? GRID_WIDTH : GRID_HEIGHT;
-            
-            if (rx % 2 == 0) return (rx * phys_h) + ry;
-            return (rx * phys_h) + ((phys_h - 1) - ry);
-        };
-        
-        auto set_safe_pixel = [&](int x, int y, uint32_t color) {
-            int idx = map_pixel(x, y);
-            if (idx >= 0 && idx < PIXEL_COUNT) strip.setPixelColor(idx, color);
-        };
-
         if (!Time.isValid()) {
-            int cx = GRID_WIDTH / 2;
-            int cy = GRID_HEIGHT / 2 - 1;
+            // Loading spinner — system state, not script-driven.
+            strip.clear();
+            int cx = GRID_W / 2;
+            int cy = GRID_H / 2 - 1;
             int phase = (now / 150) % 8;
-            int dx = 0, dy = 0;
-            switch (phase) {
-                case 0: dx = 0; dy = -1; break;
-                case 1: dx = 1; dy = -1; break;
-                case 2: dx = 1; dy = 0; break;
-                case 3: dx = 1; dy = 1; break;
-                case 4: dx = 0; dy = 1; break;
-                case 5: dx = -1; dy = 1; break;
-                case 6: dx = -1; dy = 0; break;
-                case 7: dx = -1; dy = -1; break;
-            }
-            uint32_t spinner_color = get_pixel_color(0, 32, 64, bri);
-            set_safe_pixel(cx + dx, cy + dy, spinner_color);
-            set_safe_pixel(cx, cy, get_pixel_color(0, 16, 32, bri));
+            static const int DX[8] = { 0,  1, 1, 1, 0, -1, -1, -1};
+            static const int DY[8] = {-1, -1, 0, 1, 1,  1,  0, -1};
+            auto pix = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+                if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
+                float s = global_brightness;
+                strip.setPixelColor(x * GRID_H + ((x % 2) ? (GRID_H - 1 - y) : y),
+                                    strip.Color((uint8_t)(r*s), (uint8_t)(g*s), (uint8_t)(b*s)));
+            };
+            pix(cx + DX[phase], cy + DY[phase], 0, 32, 64);
+            pix(cx, cy, 0, 16, 32);
+            strip.show();
+        } else {
+            engine.render(strip, global_brightness, now, blend, GRID_ROTATION);
         }
-
-        set_safe_pixel(0, GRID_HEIGHT - 1, red);
-        set_safe_pixel(1, GRID_HEIGHT - 1, red);
-        set_safe_pixel(GRID_WIDTH - 2, GRID_HEIGHT - 1, blue);
-        set_safe_pixel(GRID_WIDTH - 1, GRID_HEIGHT - 1, blue);
-
-        // Draw physical pixels
-        for (int x = 0; x < GRID_WIDTH; x++) {
-            for (int y = 0; y < GRID_HEIGHT; y++) {
-                if (engine.current_board[x][y]) {
-                    if (y == GRID_HEIGHT - 1 && (x <= 1 || x >= GRID_WIDTH - 2)) continue;
-                    set_safe_pixel(x, y, get_pixel_color(0, 64, 0, engine.fade_board[x][y] * bri));
-                }
-            }
-        }
-
-        // Draw Agents
-        uint32_t white = get_pixel_color(64, 64, 64, bri);
-        uint32_t cyan = get_pixel_color(0, 64, 64, bri);
-        uint32_t shimmer_red = get_pixel_color(64, 25, 25, bri);
-
-        for (size_t i = 0; i < engine.agents.size(); i++) {
-            CoatiAgent& a = engine.agents[i];
-            uint32_t agent_color = 0;
-            if (a.carrying) {
-                float pulse = 0.7f + 0.3f * sin(now / 150.0f);
-                agent_color = get_pixel_color(64, 64, 0, pulse * bri);
-            } else {
-                agent_color = (i == 0) ? white : cyan;
-            }
-
-            if (a.is_bored) {
-                agent_color = (i == 0) ? get_pixel_color(32, 32, 32, bri) : get_pixel_color(0, 32, 32, bri);
-            }
-
-            if (a.wait_ticks > 1) {
-                if ((sin(now / 30.0f) > 0)) agent_color = shimmer_red;
-            }
-
-            if (a.pos == a.last_pos) {
-                set_safe_pixel(a.pos.x, a.pos.y, agent_color);
-            } else {
-                // Motion Blur
-                uint32_t c1 = agent_color;
-                uint8_t r = (c1 >> 16) & 0xFF;
-                uint8_t g = (c1 >> 8) & 0xFF;
-                uint8_t b = c1 & 0xFF;
-                
-                set_safe_pixel(a.last_pos.x, a.last_pos.y, get_pixel_color(r, g, b, (1.0f - blend) * bri));
-                set_safe_pixel(a.pos.x, a.pos.y, get_pixel_color(r, g, b, blend * bri));
-            }
-        }
-
-        strip.show();
     }
 }
 

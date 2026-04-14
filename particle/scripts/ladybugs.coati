@@ -23,7 +23,7 @@ missing: current is off and target is on
 
 --- agents ---
 
-up to 12 ant agents
+up to 80 ant agents
 spawn at (0, 7)
 
 properties:
@@ -51,20 +51,22 @@ when pause_counter > 0:
   decrement pause_counter
   done
 
-when standing on current:
-  wander, chance 25%
-  done
-
 ## Clean up extras (when time changes, old pixels need removing)
 when standing on extras and cell is lit:
   pickup from board
-  pause 2
+  pause 5
+  done
+
+when standing on lit:
+  agent green (0, 255, 0)
+  # wander avoiding landmarks, chance 6%
   done
 
 ## Place a pixel if standing on a missing cell
 when standing on missing:
+  agent green (0, 255, 0)
   place
-  pause 2
+  pause 75 # 15 seconds
   done
 
 ## Go find work
@@ -79,6 +81,7 @@ when available extras exist:
 
 ## No work — go home
 when not at nest:
+  agent darkred (32, 0, 0)
   seek nest
   done
 
@@ -91,13 +94,16 @@ each tick:
 
 --- rendering ---
 
-physics: 10 hz
+physics: 5 hz
 display: 60 hz, interpolated
 
 board pixel: green (0, 64, 0) * fade
 nest: red (64, 0, 0)
 
-agent idle index 0: yellow (200, 150, 0)
+## Rules evaluate top-to-bottom; first match wins.
+when standing on lit: agent green (0, 255, 0)
+when standing on missing: agent green (0, 255, 0)
+agent idle: red (255, 0, 0)
 
 --- goal ---
 

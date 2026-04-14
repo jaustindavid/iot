@@ -160,9 +160,10 @@ class ColorExpr:
 
 @dataclass
 class RenderRule:
-    selector: str          # e.g. "board_pixel", "agent_carrying_not_washed"
+    selector: str          # e.g. "board_pixel", "agent_carrying_not_washed", "agent_when"
     agent_index: int | None = None   # None = all agents
     color: ColorExpr = field(default_factory=lambda: ColorExpr(0, 0, 0))
+    condition: "ConditionNode | None" = None  # only set for "when <cond>: agent" rules
 
 @dataclass
 class RenderingIR:

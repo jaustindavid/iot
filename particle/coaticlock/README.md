@@ -1,47 +1,138 @@
-# Coati Clock Particle Port
+# Coati Clock — Particle Photon 2
 
-A port of the multi-agent LED matrix clock simulation from ESPHome to the Particle Photon 2 platform.
+A multi-agent LED matrix clock for the Particle Photon 2. Two autonomous agents
+rearrange pixels on a 32×8 WS2812 matrix to display the current time.
 
-## Overview
+The physics engine is **generated from the `.coati` script** — edit behavior in
+`scripts/coaticlock.coati`, regenerate, and flash. No C++ editing required for
+behavior changes.
 
-The Coati Clock features a multi-agent physics engine where pixels act as autonomous agents that "clean" the clock digits and interact with a simulated environment (Dumpster and Pool). This port maintains the core C++ engine while optimizing it for the Photon 2's hardware and the Stra2us IoT backend.
+---
 
-## Implementation Details
+## Quick Start
 
-### 1. Physics Engine (`CoatiEngine`)
-- **A* Pathfinding**: Agents calculate paths to target digits, endpoints, or random "bored" walk targets. Pathfinding node limit expanded from 40 to 256 for thorough matrix traversal.
-- **State Machine**: Manages transitions between walking, carrying, washing, and waiting. Agents dynamically evaluate geometric endpoints using matrix inversion bounding rules to aggressively escape "lava" and randomly wander based on grid constraints. Agent aura collision repels idle coatis cleanly from textual data via spatial logic mapping.
-- **Manual Font Rendering**: Implements 5x6 numeric glyphs parsed from `megafont.bdf`. Render buffer shifts downward/inward dynamically based on the grid geometry configuration to prevent layout stalemates.
+```bash
+# 1. Regenerate the engine from the script (run from project root)
+python3 -m coati codegen scripts/coaticlock.coati --output-dir coaticlock/src/
 
-### 2. Time & Drift (`WobblyTime`)
-- Maintains a "virtual epoch" that drifts relative to the real wall-clock time.
-- Adjusts the physics tick rate (20Hz) to reconcile the virtual time with NTP syncs using configurable "snapping" thresholds for massive drift.
-- Timezone offsets natively utilize `Time.zone()` to cleanly map virtual UTC to local timezone rendering.
+# 2. Flash all configured devices
+cd coaticlock && make all
+```
 
-### 3. Telemetry & Configuration (`Stra2usClient`)
-- **Connection**: Uses `TCPClient` for persistent, low-overhead communication with the Stra2us backend.
-- **Security**: Signed requests using HMAC-SHA256 (standalone implementation in `src/`).
-- **Sync**: Periodically polls KV pairs for configuration. Supports Msgpack `int`, `string`, `float32`, and `float64` decoding. Devices dynamically pull their `timezone_offset`, `min_brightness`, and `max_brightness` bounds directly from the Stra2us backend.
+---
 
-### 4. Hardware Integration
-- **Display**: WS2812 32x8 matrix on pin **D2**. Uses **SPI/DMA** for efficient, non-blocking rendering.
-- **Ambient Light Sensor**: CDS cell on **A1** with an automatic inverse-square-root dimming curve with calibrated `4040` (out of 4095) darkness noise floors.
+## Project Layout
 
-## Installation & Build
+```
+coaticlock/
+  src/
+    CoatiEngine.h          ← GENERATED (do not edit manually)
+    CoatiEngine.cpp        ← GENERATED (do not edit manually)
+    coaticlock.cpp         ← HAL: main loop, rendering, Stra2us polling
+    WobblyTime.h           ← Virtual clock with asymmetric drift
+    LightSensor.h          ← CDS cell → brightness curve
+    Stra2usClient.h/.cpp   ← HMAC-signed telemetry client
+    hmac_sha256.h/.cpp     ← Standalone HMAC-SHA256 (no mbedtls)
+    sha256.h/.cpp          ← SHA-256 primitive
+    creds.h                ← Pulled in via device_name.h (see below)
+  <device_name>.h          ← Per-device: grid dims, rotation, credentials
 
-1. **Hardware**: Connect your WS2812 data line to **D2** (MOSI) and your CDS cell voltage divider to **A1**.
-2. **Credentials**:
-   - Copy `device_name.h` to `rachel_raccoon.h` (or your chosen name).
-   - Update `STRA2US_CLIENT_ID` and `STRA2US_SECRET_HEX`.
-3. **Build**:
-   - **Attention**: Before flashing, update the `#define APP_VERSION` macro at the very top of `src/coaticlock.cpp` using the `.HHMM` datecode standard (e.g., `"2026.04.09.0245"`). (We cannot use `project.properties` for this because the Particle Cloud compiler enforces Strict SemVer, silently mangling datecodes like `2026.04` into `1.0.0`).
-   - Use the included `Makefile` to instantly flash all configured devices simultaneously across your network:
-     ```bash
-     make all
-     ```
-   - *Note: You can safely add unlimited geometric layouts (e.g., `square_clock.h`) into the application root block. So long as it doesn't conflict with `device_name.h`, the dynamic bash parsing logic automatically iterates and injects the header directly into the build and deploy sequence!*
+scripts/
+  coaticlock.coati         ← Source of truth for agent behavior
+```
+
+---
+
+## Device Configuration
+
+Each physical device gets its own header file (e.g. `ricky_raccoon.h`).
+`device_name.h` symlinks or includes the active device:
+
+```cpp
+// Example: ricky_raccoon.h
+#define GRID_WIDTH   32
+#define GRID_HEIGHT   8
+#define GRID_ROTATION  0   // 0 | 90 | 180 | 270
+#define STRA2US_CLIENT_ID  "ricky_raccoon"
+#define STRA2US_SECRET_HEX "deadbeef..."
+#define STRATUS_APP        "coaticlock"
+```
+
+The Makefile iterates all `*_raccoon.h` files and flashes each device in sequence.
+
+---
+
+## Hardware
+
+| Component | Details |
+|---|---|
+| MCU | Particle Photon 2 (RTL8721DM, ARM Cortex-M33 @ 200 MHz) |
+| Display | WS2812B 32×8 LED matrix, connected via SPI-DMA on **D2** |
+| Light sensor | CDS cell voltage divider: **A0** = 3.3 V, **A2** = GND, **A1** = ADC input |
+| ADC range | 0 (bright) → 4095 (dark) — inverted and mapped through `sqrtf` curve |
+
+---
+
+## Physics & Rendering
+
+The firmware runs two independent loops:
+
+| Loop | Rate | Purpose |
+|---|---|---|
+| Physics | 10 Hz / 100 ms | Agent tick, pathfinding, board updates |
+| Render | 60 Hz / 16 ms | LED interpolation, motion blur, brightness |
+
+Motion blur interpolates agent positions between physics ticks using the
+`blend = (now - last_physics_tick) / 100.0f` factor, yielding smooth 6× oversampled
+animation despite the 10 Hz physics rate.
+
+---
+
+## Time & WobblyTime
+
+`WobblyTime` maintains a virtual clock that drifts relative to real wall time.
+The physics tick rate is adjusted to reconcile virtual time with NTP.
+
+Parameters (configurable via Stra2us KV):
+- `wobble_min_seconds` / `wobble_max_seconds` — drift bounds
+- `wobble_fast_rate` / `wobble_slow_rate` — asymmetric tick speeds
+- `timezone_offset` — local timezone for `Time.zone()`
+
+---
+
+## Telemetry (Stra2us)
+
+Every `heartbeep` seconds (default: 300 s), the firmware:
+1. Publishes a heartbeat report (uptime, RSSI, memory, brightness, firmware version)
+2. Polls KV pairs for live configuration updates
+
+Signed with HMAC-SHA256. The standalone crypto implementation (`sha256.cpp`,
+`hmac_sha256.cpp`) avoids the mildly unstable mbedtls header exposure in
+Particle OS 6.x.
+
+---
+
+## Modifying Behavior
+
+Edit `scripts/coaticlock.coati` in the project root, then regenerate:
+
+```bash
+python3 -m coati codegen scripts/coaticlock.coati --output-dir coaticlock/src/
+```
+
+Test in the simulator first:
+
+```bash
+python3 -m coati run scripts/coaticlock.coati
+python3 -m coati fast scripts/coaticlock.coati --time 12:34 --max-ticks 500
+```
+
+The simulator and the generated C++ run the same IR, so behavior should be
+identical. See `DESIGN.md §5` for the full IR→C++ mapping.
+
+---
 
 ## Dependencies
 
-- **neopixel**: WS2812 driver for Particle.
-- **Adafruit_GFX_RK**: Graphics core library.
+- `neopixel` — WS2812 driver for Particle
+- `Adafruit_GFX_RK` — (linked but not used directly; kept for compatibility)

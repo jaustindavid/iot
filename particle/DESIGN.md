@@ -252,9 +252,9 @@ Summary of keywords:
 | `seek <landmark>` | Pathfind to agent's assigned cell in the landmark |
 | `seek nearest available <term>` | Pathfind to closest unclaimed cell matching term, claim it |
 | `seek dumpster` | Pathfind to agent's assigned dumpster cell |
-| `pickup from board` | Turn off `current` at position, reset `fade`, set carrying |
-| `pickup from dumpster` | Set carrying (no board change — dumpster is virtual) |
-| `place` | Turn on `current` at position, set `fade` to 0.0 |
+| `pickup from board` | Turn off `current` at position, reset `fade`, set `carrying = true` |
+| `pickup from dumpster` | Set `carrying = true` (no board change — dumpster is virtual) |
+| `place` | Turn on `current` at position, reset `fade`, set `carrying = false` |
 | `discard` | Drop carried pixel (no board change) |
 | `despawn` | Deactivate agent and return to inactive pool (pool mode only) |
 | `set <prop> to <value>` | Assign a property |
@@ -705,27 +705,150 @@ The font renderer uses the same 5x6 bitmasks from the C++ source, encoding digit
 
 ---
 
-## 5. Device Runtime (Future)
+## 5. Device Runtime
 
-### 5.1 Two Approaches
+### 5.1 Codegen Approach (Implemented)
 
-**Option A: C++ Codegen.** The parser emits a `.cpp` file that implements the behavior tree as a series of `if/else` chains — essentially regenerating `CoatiEngine.cpp` from the IR. This is the simplest approach and produces identical performance to the handwritten code.
+`coati/codegen.py` implements **Option A: C++ Codegen**. The command:
 
-**Option B: Embedded VM.** Flash a generic interpreter that reads IR (msgpack-encoded) from flash storage or receives it over-the-air via the Stra2us backend. The VM walks the behavior tree each tick, looking up conditions and dispatching actions. This is more flexible (update behavior without reflashing) but has higher per-tick overhead.
+```bash
+python3 -m coati codegen scripts/coaticlock.coati --output-dir coaticlock/src/
+```
 
-### 5.2 Recommended Path
+produces `CoatiEngine.h` and `CoatiEngine.cpp` for the Particle Photon 2 (ARM Cortex-M33). **The generated files are meant to fully replace the hand-written engine. The thin HAL layer (main loop, pixel output, Stra2us, light sensor) should also eventually be regenerated or rewritten script-driven — none of the hand-written code is load-bearing.** See §5.8 for the current status of this migration and the design debt it has introduced.
 
-Start with **Option A** (codegen). The IR-to-C++ translation is mechanical, the output is debuggable, and it works with the existing Particle build toolchain. Option B becomes worth it when we want OTA behavior updates — at that point the VM is a ~2KB addition to the firmware and the IR msgpack payload is under 1KB.
+**Why codegen over a VM:** The generated C++ is readable, debuggable, and identical in performance to handmade code. The Particle cloud build toolchain takes a `.cpp` file with no extra steps. A VM would add runtime overhead and require an on-device IR parser — worthwhile when OTA behavior updates matter, but not for the current deployment model.
 
-### 5.3 Shared Components
+### 5.2 Generated File Structure
 
-Regardless of approach, the device firmware keeps its existing:
-- NeoPixel driver with SPI/DMA
-- Stra2us telemetry client
-- Light sensor + brightness curve
-- WobblyTime (or the codegen can emit an equivalent)
+**`CoatiEngine.h`** contains:
+- `GRID_W` / `GRID_H` constants (from `--- grid ---` dimensions)
+- `AgentState` struct — built-in fields (`pos`, `last_pos`, `active`, `path`, `claimed`, `wait_counter`) plus every property declared in `--- agents ---` with its type and default
+- `CoatiEngine` class declaration: public board arrays, agents vector, landmark lock ints, the `tick()` / `update_target()` / `apply_pending_target()` methods, and `find_path()`
 
-The behavior engine is the only thing that changes. Grid dimensions, landmark positions, rendering colors, pathfinding costs — all come from the IR instead of being hardcoded.
+**`CoatiEngine.cpp`** contains:
+- Landmark position arrays (static const)
+- Megafont bitmaps array (if `goal: clock`)
+- `CoatiEngine()` constructor — initializes agents at start positions (fixed mode) or as inactive at spawn_point (pool mode)
+- `_draw_digit()`, `update_target()`, `apply_pending_target()` — clock goal methods
+- `find_path()` — A* with costs/penalties from the `--- pathfinding ---` section
+- `_find_closest()`, `_in_vec()`, `_near_lit()`, `_is_landmark()` — helpers
+- `tick()` — the physics tick; see §5.3
+
+### 5.3 The `tick()` Function Structure
+
+Each generated `tick()` follows this fixed structure regardless of script:
+
+```
+1. Compute term vectors (tk_extras, tk_missing, …) by scanning the board
+2. [Pool mode only] Spawn phase: timer + first-inactive-agent activation
+3. Movement phase: advance agents one step along path; run collision rules on block
+4. Behavior phase (per active agent with no path and no wait):
+     a. Compute available (unclaimed-by-others) subsets of each term
+     b. Wrap behavior rules in a lambda (see §5.4)
+     c. Evaluate the lambda
+5. Fade update (from each-tick: block)
+```
+
+### 5.4 `done` and the Lambda Pattern
+
+The behavior tree uses `done` to early-exit the entire rule evaluation for an agent.  The generated C++ wraps each agent's behavior in a **lambda**, making `done` → `return;`.  The outer physics loop retains its own `continue` for movement/pause.
+
+```cpp
+auto _eval = [&]() {
+    if (a.carrying && !a.washed) {   // when carrying and not washed:
+        if (a.wash_counter > 0) {
+            a.wash_counter--;
+            if (a.wash_counter == 0) {
+                a.washed = true;
+                if (pool_user == (int)i) pool_user = -1;
+                a.claimed = {-1, -1};
+                return;  // if-branch fired — skip rest of when-body
+            } else {
+                Point _spot = pool[i % pool_count];
+                if (a.pos.y == _spot.y) a.path = {{_spot.x, _spot.y - 1}};
+                else                    a.path = {_spot};
+            }
+            return;  // done
+        }
+        // seek pool …
+        return;  // end of when-block
+    }
+    // … next when-block …
+};
+_eval();
+```
+
+The key rules:
+- **`when` block fires** → at the end of the block, `return;` (even without `done`)
+- **`done` action** → `return;` immediately
+- **IfNode fires (condition true)** → execute then-body, then `return;` unless then-body already ends with `done`/`despawn`
+- **IfNode does not fire** → execute else-body (if any), then continue to next body item
+
+### 5.5 IR → C++ Condition Mapping
+
+| IR op | Generated C++ |
+|---|---|
+| `and` / `or` / `not` | `(A && B)` / `(A \|\| B)` / `(!A)` |
+| `prop_true` / `prop_false` | `a.prop` / `!a.prop` |
+| `gt` / `gte` / `lt` / `eq` | `a.prop > N` etc. |
+| `gt_expr` (e.g. `3 + index * 2`) | `a.prop > (3 + (int)i * 2)` |
+| `at_landmark` | `a.pos == lm[i % lm_count]` |
+| `at_claimed` | `a.claimed.x >= 0 && a.pos == a.claimed` |
+| `landmark_free` | `lm_user == -1 \|\| lm_user == (int)i` |
+| `standing_on_term` | `_in_vec(tk_term, a.pos)` |
+| `cell_is_lit` / `on_lit` | `current_board[a.pos.x][a.pos.y]` |
+| `near_lit` | `_near_lit(a.pos)` |
+| `term_exists` | `!tk_avail_term.empty()` |
+| `term_empty` | `tk_term.empty()` |
+
+### 5.6 IR → C++ Action Mapping
+
+| IR action | Generated C++ |
+|---|---|
+| `done` | `return;` |
+| `set` / `increment` / `decrement` / `reset` | `a.prop = v;` / `a.prop++;` etc. |
+| `pickup from board` | `current_board[x][y] = false; fade = 0; a.carrying = true;` |
+| `pickup from dumpster` | `a.carrying = true;` |
+| `place` | `current_board[x][y] = true; fade = 0; a.carrying = false;` |
+| `discard` | `// no board change` |
+| `despawn` | `a.active = false; a.path.clear(); return;` |
+| `seek lm` | dest-guard + `a.path = find_path(…); _used_pf = true;` |
+| `seek_nearest term` | available-filter + closest + `find_path(…)` |
+| `bob lm` | Alternating step-above / step-to logic |
+| `step_up lm` | `a.path = {{a.pos.x, a.pos.y - 1}};` |
+| `wander [avoid …] [chance N%]` | Neighbor scan, forced/chance roll, random step |
+| `claim lm` / `release lm` | `lm_user = i;` / `if (lm_user == i) lm_user = -1;` |
+| `set_display_color` | `// simulator only — omitted` |
+
+### 5.7 Pathfind Budget
+
+All `seek` and `seek_nearest` actions check:
+1. **Already at destination?** → `return;` immediately (no A* call, no budget consumed). This fixes the pool starvation bug that existed in the original hand-written engine.
+2. **Budget available?** → If `one pathfind per tick` is set, a `_used_pf` flag gates all A* calls. The first call per agent sets it; subsequent seeks in the same tick are skipped.
+
+### 5.8 HAL Layer — Migration Status
+
+The HAL is being progressively moved under codegen. Nothing in the hand-written layer is load-bearing; each item below is slated for elimination.
+
+**Under codegen (authoritative):**
+- **Rendering** — `CoatiEngine::render(strip, bri, now_ms, blend, rotation)` is emitted by `codegen.py` entirely from the `--- rendering ---` section. Board pixels, landmark colors, agent rules (pulse/shimmer/solid, `multiply_layer` for `* fade`), and motion blur all come from the IR. The device main loop calls a single `engine.render(...)` line.
+
+**Still hand-written (transient):**
+- `coaticlock.cpp` — setup/loop, physics tick scheduling, light-sensor read, Stra2us polling. No longer contains any rendering or script-specific property references. Should eventually be generated in full.
+- `WobblyTime.h` — virtual clock. Should be emitted from the `--- wobbly time ---` section.
+- `LightSensor.h` — CDS brightness curve. Should be driven by a `--- sensors ---` / `--- brightness ---` section.
+- `Stra2usClient.h` / `.cpp` — HMAC-signed telemetry. Keys and variable bindings should come from `--- properties ---` declarations with `stra2us "<key>"` attributes.
+- `sha256.h` / `hmac_sha256.h` — standalone crypto. Fine to keep as vendored libraries; no script-dependent behavior.
+
+**Direction:** the remaining hand-written C++ should collapse into a small generated `main.cpp` (setup/loop, pixel driver glue, Particle.variable/function registrations, stra2us wiring) plus crypto and neopixel-driver headers. Nothing that depends on the script should be editable by hand.
+
+### 5.9 Deferred (Option B / Future)
+
+- OTA behavior updates (IR payload via Stra2us → VM on device)
+- Landmark-color rendering driven by IR (currently hardcoded in `coaticlock.cpp`)
+- `pulse` / `shimmer` LED effects on device
+- `static` and `sequence` goal types
 
 ---
 
@@ -767,11 +890,16 @@ The current parser uses ad-hoc regex matching and string splitting. This works f
 - **`and`/`or` splitting** is naive string splitting, not real boolean expression parsing. Any future condition containing the substring " and " will break. A proper expression parser with precedence would be more robust.
 - **Unrecognized lines are silently dropped.** If `_parse_action()` returns `None`, the line vanishes. This made debugging harder — a typo in a script produces no error, just missing behavior.
 
-### 7.2 The Script and Engine Have Redundant Semantics
+### 7.2 Composite Action Contract (Resolved)
 
-The `pickup` action in the engine implicitly sets `carrying = true`, but both scripts also explicitly `set carrying to true` afterward. This redundancy isn't harmful but signals a design tension: should actions be high-level composites with side effects, or low-level primitives that scripts compose manually?
+`pickup` and `place` are both **composite actions** with implicit side effects on `carrying`:
 
-Recommendation: define a clear "action contract" for each action — document exactly what state it modifies — and enforce it in one place. Either `pickup` is a composite that sets carrying (and scripts shouldn't repeat it), or it's a primitive that only touches the board (and scripts must set carrying).
+- `pickup from board` — turns off `current`, resets `fade`, sets `carrying = true`.
+- `pickup from dumpster` — sets `carrying = true` (no board change).
+- `place` — turns on `current`, resets `fade`, sets `carrying = false`.
+- `discard` — drops the carried pixel with no board change (does *not* clear `carrying` — use `set carrying to false` if needed).
+
+Scripts should **not** manually set `carrying` after these actions. The engine is the single source of truth. Any script that does `set carrying to true` after `pickup from board` is redundant — remove it.
 
 ### 7.3 Rendering Is Not Yet IR-Driven
 
@@ -800,6 +928,56 @@ The simulator's `run_live()` initially hardcoded `tick_interval = 0.1 / speed` i
 ### 7.7 Agent Evaluation Order Matters
 
 Because of the `one pathfind per tick` constraint, agent 0 always gets first priority for pathfinding. If both agents need new paths on the same tick, agent 1 must wait until the next tick. This matches the C++ behavior but can cause asymmetric convergence. The design doc should be explicit that **agent evaluation order is index order** and that the pathfind budget is shared.
+
+### 7.8 Codegen Implementation Lessons
+
+**The `done`-inside-IfNode subtlety.** The Python engine's `_exec_body()` breaks the body loop when an IfNode fires (condition true), regardless of whether the then-body contained `done`. This means `done` serves two roles: (1) explicit early exit *within* a then-body, and (2) implicit "skip rest of when-block" when a top-level IfNode fires. In the generated C++, a lambda `return;` handles both. The codegen tracks whether a then-body's last action is already `done`/`despawn` to avoid emitting a redundant second `return;`.
+
+**Float literals must have a decimal point.** Python's `f"{1.0:.6g}"` formats to `"1"`, producing `1f` in the generated C++. GCC may accept `1f` as an extension, but it is not standard C++ — the correct literal is `1.0f`. The `_cpp_literal()` helper ensures any float whose `:.6g` representation has no `.` or `e` gets `.0` appended before the `f` suffix.
+
+**`seek` already-at-destination is a no-op.** The original hand-written `CoatiEngine.cpp` encountered pool starvation because an agent waiting at an occupied landmark still consumed the one-pathfind-per-tick budget each tick. The generated `seek` and `seek_nearest` actions emit `if (a.pos == dest) return;` before calling A*, short-circuiting both the A* call and the budget flag. This is not just an optimization — it is the behavioral fix for the starvation bug.
+
+**`index` in expression strings requires substitution.** The `gt_expr` IR op stores the comparison value as a raw string (e.g. `"3 + index * 2"`). The codegen substitutes `\bindex\b` → `(int)i` using `re.sub` before emitting. This preserves the intent of index-dependent thresholds without needing the IR to model arbitrary expressions.
+
+**Static `std::vector` in tick() for reuse.** The generated `tick()` declares term vectors as `static` locals to avoid reallocating on every tick (matching the hand-written engine). This is safe because `tick()` is called from a single thread (the Particle main loop). Scratch vectors inside the behavior lambda (available-subset computation, wander choices) are non-static, since their contents depend on the per-agent context.
+
+### 7.9 Anti-Pattern: Letting Hand-Written Code Constrain the Generator
+
+**What went wrong.** The first round of codegen was designed around the idea that the hand-written `coaticlock.cpp` would stay in place and that generated files had to match its expectations — the `AgentState` field names, the presence of `carrying` and `bored`, the landmark colors, the rendering branching logic. The unstated goal was "don't break the thing that already flashes."
+
+That framing was wrong. The hand-written code was a scaffold, not a spec. Preserving it forced three concrete compromises into the generator:
+
+1. **Field-name coupling.** The codegen had to emit an `AgentState` struct whose field names exactly matched what the rendering loop reaches into (`a.carrying`, `a.bored`, `a.pos`, `a.last_pos`, `a.wait_counter`). Scripts that conceptually don't have a `carrying` property still had to produce one.
+2. **Stub-property injection.** When `ladybugs.coati` failed to compile because it didn't declare `carrying`/`bored`, the fix was briefly to have the codegen inject those fields with default `false` regardless of the script. That is the generator lying about the script's semantics to keep the scaffolding compiling — a clear smell.
+3. **Invisible behavioral coupling in the render path.** `coaticlock.cpp` decided pixel colors based on agent properties (`carrying` → pulsing yellow, `bored` → dim, `wait_counter > 1` → shimmer red). Those are *behavioral rendering rules*, but they lived outside the IR entirely. A new script had no way to express "I want my ants rendered differently" without editing the shim.
+
+**The rule.** **Generated code is the source of truth. Hand-written code that references generated symbols is a liability, not a compatibility target.** When the generator and the hand-written code disagree, fix the hand-written code (or delete it) — do not widen the generator's contract to keep the scaffold alive.
+
+**Resolution.** Rendering moved fully under codegen. `CoatiEngine::render(...)` consumes the `--- rendering ---` IR section and emits board, landmark, and agent drawing including pulse/shimmer modulation and motion blur. `coaticlock.cpp`'s entire render block collapsed to a single call. Agent rendering rules that reference undeclared properties are skipped at codegen time, so any script compiles without editing the shim. The `pickup` and `place` actions no longer unconditionally assign `a.carrying`; the assignment is emitted only when the script declares the property.
+
+**Tell-tale signs we had violated the rule (now fixed):**
+- Codegen emitted fields that the script did not declare, because external code referenced them.
+- A new `.coati` script could not compile without either (a) declaring otherwise-unused properties, or (b) editing a `.cpp` the script author should never have to see.
+- "What does the `bored` field mean?" had two answers: one in the script's property list, one in the renderer's shimmer logic.
+
+**Still-open migration work.** `WobblyTime.h`, `LightSensor.h`, `Stra2usClient`, and the setup/loop skeleton in `coaticlock.cpp` should move under codegen (see §5.8). The same rule applies: if the generator and these files diverge, delete from these files, don't widen the generator.
+
+### 7.10 Corollary: "Kill Hand-Written Code" Is Not "Delete Everything"
+
+When §7.9 was applied to the render path, the entire ~110-line render block in `coaticlock.cpp` collapsed to a single `engine.render(...)` call. On the first flash, the pre-sync loading spinner disappeared — because it had lived inside that block and was removed along with the rest.
+
+The spinner is **not** script-coupled. It displays system state (Time-not-valid, waiting for cloud sync), runs before any script logic is meaningful, and has no dependency on agents, landmarks, or properties. Deleting it was an over-correction: it was swept up in the same cleanup as the genuinely-script-coupled rendering.
+
+**The distinction.** Hand-written code is a liability when it *forces shape onto the generator* — when the generator has to widen its contract, inject stub fields, or preserve field names to keep the hand-written code compiling. Hand-written code is **fine** when it implements system-level behavior that is orthogonal to the script: loading states, bootstrap glue, transport drivers, crypto. The test isn't "was this typed by hand?" — it's "does removing this force the script author to change their script?" and "does keeping this force the generator to lie about the script?"
+
+**Applied:**
+- The render block was script-coupled (referenced `a.carrying`, `a.bored`, hardcoded landmark colors) — moved into codegen. Correct.
+- The loading spinner was system-coupled (`!Time.isValid()`) — restored in the hand-written shim, running in place of `engine.render()` until time sync completes. Correct.
+
+**Heuristic for future migrations.** Before deleting a block of hand-written code because §7.9 says so, ask:
+1. Does this block reference anything declared in the script (properties, landmarks, terms)? If yes → move to codegen.
+2. Does this block implement system-state behavior (network, sync, fault, boot) that no script should need to describe? If yes → leave it alone.
+3. Is this block so tangled that it does both? Split it first; migrate the script-coupled half; keep the system-coupled half. The generated `tick()` declares term vectors as `static` locals to avoid reallocating on every tick (matching the hand-written engine). This is safe because `tick()` is called from a single thread (the Particle main loop). Scratch vectors inside the behavior lambda (available-subset computation, wander choices) are non-static, since their contents depend on the per-agent context.
 
 ---
 

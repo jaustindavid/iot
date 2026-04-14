@@ -15,6 +15,7 @@ from dataclasses import asdict
 from .parser import parse_file, ParseError
 from .engine import CoatiEngine
 from .simulator import run_live, run_step, run_fast
+from .codegen import Codegen
 
 
 def _json_default(obj):
@@ -31,8 +32,8 @@ def main():
         prog="coati",
         description="Coati — behavior language for grid particle simulations"
     )
-    parser.add_argument("command", choices=["run", "step", "fast", "parse"],
-                        help="Simulation mode")
+    parser.add_argument("command", choices=["run", "step", "fast", "parse", "codegen"],
+                        help="Simulation mode / codegen")
     parser.add_argument("script", help="Path to .coati script file")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Simulation speed multiplier (for 'run' mode)")
@@ -40,6 +41,8 @@ def main():
                         help="Max ticks before stopping (for 'fast' mode)")
     parser.add_argument("--time", type=str, default=None,
                         help="Static time HH:MM (for 'fast' mode, e.g. '12:34')")
+    parser.add_argument("--output-dir", type=str, default=".",
+                        help="Output directory for generated files (codegen mode)")
 
     args = parser.parse_args()
 
@@ -55,6 +58,27 @@ def main():
 
     if args.command == "parse":
         print(json.dumps(asdict(ir), indent=2, default=_json_default))
+        return
+
+    if args.command == "codegen":
+        import os
+        header, source = Codegen().generate(ir)
+        out_dir = args.output_dir
+        os.makedirs(out_dir, exist_ok=True)
+        h_path = os.path.join(out_dir, "CoatiEngine.h")
+        cpp_path = os.path.join(out_dir, "CoatiEngine.cpp")
+        with open(h_path, "w") as f:
+            f.write(header)
+        with open(cpp_path, "w") as f:
+            f.write(source)
+        lm_info = ", ".join(f"{lm.name}({len(lm.cells)}cells)" for lm in ir.landmarks)
+        rules = len(ir.behavior.rules)
+        count = ir.agents.count
+        mode = "pool" if ir.agents.pool_mode else "fixed"
+        print(f"Generated: {h_path}")
+        print(f"           {cpp_path}")
+        print(f"  Grid:    {ir.grid.width}x{ir.grid.height}  Agents: {count} ({mode})")
+        print(f"  Rules:   {rules}  Landmarks: {lm_info}")
         return
 
     # Build engine

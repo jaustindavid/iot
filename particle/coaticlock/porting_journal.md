@@ -35,3 +35,65 @@ This document tracks the technical challenges ("gotchas") and architectural deci
 ## Architectural Notes
 - **Memory Management**: Pre-allocated pixel boards and agent structures to prevent heap fragmentation during rapid physics looping.
 - **Timing Constraint**: Matrix dimensioning heavily dictates processing limits. Dynamic target generation is carefully scaled into multiple internal geometry mapping rules via mathematical bounding box abstraction for scaling.
+
+---
+
+## Gotcha #7: Hand-Written Engine Replaced by Codegen
+
+### Date
+2026-04-13
+
+### Issue
+
+The hand-written `CoatiEngine.cpp` was developed as a monolithic port of the
+ESPHome coaticlock logic. Over time the Python simulator accumulated behavior
+fixes (pool starvation fix, `place` clearing `carrying`, `seek` no-op at dest,
+Etc.) that needed careful manual backporting to keep the C++ in sync. Adding new
+scripts (ladybugs, future effects) would require writing new C++ engine files by
+hand each time.
+
+### Solution
+
+Replaced the hand-written engine with a code generator (`coati/codegen.py`).
+The command:
+
+```bash
+python3 -m coati codegen scripts/coaticlock.coati --output-dir coaticlock/src/
+```
+
+produces `CoatiEngine.h` and `CoatiEngine.cpp` from the parsed IR. The generated
+engine and the Python simulator now share the same IR as their source of truth,
+so behavioral fixes applied to the Python engine are automatically reflected in
+the next codegen run.
+
+### Key design decisions
+
+**`done` → lambda `return;`.**  The `.coati` language's `done` keyword exits the
+entire behavior rule evaluation for the current agent. In generated C++, each
+agent's behavior is wrapped in a `[&]()` lambda, so `done` maps cleanly to
+`return;`. The outer physics loop still uses `continue` for movement/pause
+short-circuits — the two levels are independent.
+
+**IfNode semantics in the body loop.** When an IfNode's condition is true, the
+Python engine breaks out of the body evaluation loop (skips subsequent body
+items). In C++, the codegen appends `return;` at the end of a then-block, *unless*
+the then-block already ends with `done` or `despawn` (which themselves generate
+`return;`). A helper `_body_ends_with_return()` checks this to avoid unreachable
+duplicate returns.
+
+**Float literals.** Python's `f"{1.0:.6g}"` produces `"1"`. Appending `f` gives
+`"1f"`, which is not standard C++ (requires `"1.0f"`). Fixed in `_cpp_literal()`
+by inserting `.0` before the suffix when the formatted string contains neither
+`.` nor `e`.
+
+**No behavioral regression.** The seek-at-destination and pathfind-budget fixes
+are baked into the generated `seek`/`seek_nearest` emitters, so the generated
+code cannot re-introduce the starvation bug without also changing the codegen.
+
+### `coaticlock.cpp` changes
+
+The only changes to the HAL were three field renames in the render loop:
+- `CoatiAgent&` → `AgentState&`
+- `.is_bored` → `.bored`
+- `.wait_ticks` → `.wait_counter`
+

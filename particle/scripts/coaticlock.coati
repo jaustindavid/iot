@@ -140,11 +140,12 @@ board pixel: green (0, 64, 0) * fade
 dumpster: red (64, 0, 0)
 pool: blue (0, 0, 64)
 
-agent carrying not washed: yellow (64, 64, 0) pulse 150ms
-agent carrying washed: yellow (64, 64, 0) solid
+## Rules evaluate top-to-bottom; first match wins.
+agent waiting: red (64, 25, 25) shimmer 30ms
 agent bored index 0: gray (32, 32, 32)
 agent bored index 1: dark cyan (0, 32, 32)
-agent waiting: red (64, 25, 25) shimmer 30ms
+agent carrying not washed: yellow (64, 64, 0) pulse 150ms
+agent carrying washed: yellow (64, 64, 0) solid
 agent idle index 0: white (64, 64, 64)
 agent idle index 1: cyan (0, 64, 64)
 

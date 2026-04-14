@@ -357,6 +357,10 @@ def _parse_condition(text: str) -> ConditionNode:
     if m:
         return ConditionNode(op="landmark_free", name=m.group(1))
 
+    # "standing on lit" — alias for cell_is_lit (lit is a layer, not a term)
+    if text == "standing on lit":
+        return ConditionNode(op="cell_is_lit")
+
     # "standing on <term>"
     m = re.match(r"standing\s+on\s+(\w+)$", text)
     if m:
@@ -537,6 +541,12 @@ def _parse_action(text: str) -> ActionNode | None:
                           value=float(m.group(2)),
                           source=m.group(3))  # abuse source for cap
 
+    # "agent <colorname> (r, g, b)" — inline display color hint
+    m = re.match(r"agent\s+\w+\s+\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)", text)
+    if m:
+        return ActionNode(action="set_display_color",
+                          value=(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+
     return None
 
 
@@ -647,6 +657,29 @@ def _parse_rendering(text: str) -> RenderingIR:
     ir = RenderingIR()
     for line in _strip_comments(text):
         stripped = line.strip().lower()
+
+        # "when <condition>: agent <colorname> (r, g, b)"
+        m = re.match(r"when\s+(.+?):\s*agent\s+\w+\s+\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)(.*)", stripped)
+        if m:
+            cond = _parse_condition(m.group(1).strip())
+            r, g, b = int(m.group(2)), int(m.group(3)), int(m.group(4))
+            rest = m.group(5).strip()
+            modulation = "solid"
+            mod_period = 0
+            multiply_layer = None
+            if "pulse" in rest:
+                modulation = "pulse"
+                pm = re.search(r"pulse\s+(\d+)\s*ms", rest)
+                if pm:
+                    mod_period = int(pm.group(1))
+            elif "shimmer" in rest:
+                modulation = "shimmer"
+                sm = re.search(r"shimmer\s+(\d+)\s*ms", rest)
+                if sm:
+                    mod_period = int(sm.group(1))
+            color = ColorExpr(r, g, b, modulation, mod_period, multiply_layer)
+            ir.rules.append(RenderRule(selector="agent_when", condition=cond, color=color))
+            continue
 
         # "physics: 10 hz"
         m = re.match(r"physics:\s*(\d+)\s*hz", stripped)

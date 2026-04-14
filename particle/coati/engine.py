@@ -355,19 +355,24 @@ class CoatiEngine:
             lm_cells = self.landmarks.get(action.landmark, [])
             if lm_cells:
                 dest = lm_cells[agent.index % len(lm_cells)]
-                agent.path = self._pathfind(agent, dest)
                 agent.claimed = dest
-            return _PATHFIND_USED
+                if agent.pos == dest:
+                    return None  # already here — no pathfind needed, don't burn budget
+                agent.path = self._pathfind(agent, dest)
+                return _PATHFIND_USED
+            return None
 
         if act == "seek_nearest":
             term_name = action.term
             avail = self._available(term_name, agent)
             if avail:
                 dest = self._closest(agent.pos, avail)
+                agent.claimed = dest
+                if agent.pos == dest:
+                    return None  # already at nearest available — don't burn budget
                 agent.path = self._pathfind(agent, dest)
-                if agent.path:
-                    agent.claimed = dest
-            return _PATHFIND_USED
+                return _PATHFIND_USED
+            return None
 
         if act == "pickup":
             src = action.source
@@ -385,6 +390,7 @@ class CoatiEngine:
             if 0 <= x < self.grid_w and 0 <= y < self.grid_h:
                 self.current()[x][y] = True
                 self.fade()[x][y] = 0.0
+            agent.set("carrying", False)
             return None
 
         if act == "discard":
@@ -443,6 +449,10 @@ class CoatiEngine:
                 elif random.randint(1, 100) <= chance:
                     choice = random.choice(safe_moves)
                     agent.path = [choice]
+            return None
+
+        if act == "set_display_color":
+            agent.props["_display_color"] = action.value
             return None
 
         if act == "fade_update":
@@ -628,6 +638,8 @@ class CoatiEngine:
                 agent.set("pause_counter", pc - 1)
                 continue
 
+            # Reset per-tick display color hint before evaluating behavior
+            agent.props["_display_color"] = None
             agent.set("bored", False)
 
             used_pathfind = False

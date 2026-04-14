@@ -64,8 +64,43 @@ def _agent_status(agent: Agent) -> str:
 
 # ── Agent color ─────────────────────────────────────────────────
 
-def _agent_color(agent: Agent, tick: int, ir: CoatiIR) -> tuple[int, int, int]:
+def _lookup_agent_color(selector: str, agent: Agent, ir: CoatiIR,
+                        engine=None) -> tuple[int, int, int] | None:
+    """
+    Search rendering rules for (selector, agent.index).
+    Index-specific rules beat generic ones.
+    Returns (r, g, b) or None if no matching rule found.
+    """
+    generic = None
+    specific = None
+    for rule in ir.rendering.rules:
+        if rule.selector == selector:
+            if rule.agent_index is None:
+                generic = rule.color
+            elif rule.agent_index == agent.index:
+                specific = rule.color
+    color = specific or generic
+    if color is None:
+        return None
+    return (color.r, color.g, color.b)
+
+
+def _agent_color(agent: Agent, tick: int, ir: CoatiIR,
+                 engine=None) -> tuple[int, int, int]:
     """Determine agent display color based on state, matching render rules."""
+
+    # Behavior-set color hint ('agent <color>' action) — highest priority
+    dc = agent.props.get("_display_color")
+    if dc:
+        return dc
+
+    # Conditional 'when' rules from rendering section — second priority
+    if engine is not None:
+        for rule in ir.rendering.rules:
+            if rule.selector == "agent_when" and rule.condition is not None:
+                if engine._eval_condition(rule.condition, agent):
+                    return (rule.color.r, rule.color.g, rule.color.b)
+
     carrying = agent.get("carrying")
     washed = agent.get("washed")
     bored = agent.get("bored")
@@ -77,9 +112,8 @@ def _agent_color(agent: Agent, tick: int, ir: CoatiIR) -> tuple[int, int, int]:
         return (100, 30, 30)
 
     if bored:
-        if agent.index == 0:
-            return (128, 128, 128)
-        return (0, 128, 128)
+        c = _lookup_agent_color("agent_bored", agent, ir)
+        return c if c else ((128, 128, 128) if agent.index == 0 else (0, 128, 128))
 
     if carrying and not washed:
         pulse = 0.7 + 0.3 * math.sin(tick * 0.5)
@@ -89,9 +123,10 @@ def _agent_color(agent: Agent, tick: int, ir: CoatiIR) -> tuple[int, int, int]:
     if carrying and washed:
         return (255, 255, 0)
 
-    if agent.index == 0:
-        return (255, 255, 255)
-    return (0, 255, 255)
+    # Idle — consult IR first, fall back to white/cyan
+    c = _lookup_agent_color("agent_idle", agent, ir)
+    return c if c else ((255, 255, 255) if agent.index == 0 else (0, 255, 255))
+
 
 
 # ── Render frame ────────────────────────────────────────────────
@@ -143,8 +178,8 @@ def render_frame(engine: CoatiEngine, ir: CoatiIR) -> str:
 
             if pt in agent_map:
                 a = agent_map[pt]
-                r, g, b = _agent_color(a, tick, ir)
-                label = str(a.index)
+                r, g, b = _agent_color(a, tick, ir, engine)
+                label = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[a.index % 36]
                 row_chars.append(f"{_fg(r, g, b)}{label}{_RESET}")
             elif pt in lm_map:
                 name, (r, g, b) = lm_map[pt]
