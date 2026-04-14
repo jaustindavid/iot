@@ -1,0 +1,1301 @@
+"""
+coati/codegen.py — IR → Particle Photon 2 C++ engine generator
+
+Usage:
+    python -m coati codegen scripts/coaticlock.coati [--output-dir DIR]
+
+The generated CoatiEngine.h / CoatiEngine.cpp pair replaces the hand-written
+engine. All other HAL files (coaticlock.cpp, WobblyTime.h, etc.) are unchanged
+except for minor field-name updates in the render loop.
+"""
+from __future__ import annotations
+
+import re
+import textwrap
+from typing import Any
+
+from .ir import (
+    CoatiIR, ConditionNode, ActionNode, IfNode,
+    TermExpr,
+)
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _cpp_literal(v: Any) -> str:
+    """Return a C++ literal for a Python value."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        s = f"{v:.6g}"
+        # Ensure the literal has a decimal point so compilers treat it as float
+        if '.' not in s and 'e' not in s and 'E' not in s:
+            s += '.0'
+        return s + 'f'
+    return str(v)
+
+
+def _cpp_type(t: str) -> str:
+    return {"bool": "bool", "int": "int", "float": "float"}[t]
+
+
+def _sub_index(expr_str: str, idx_var: str) -> str:
+    """Replace 'index' with the C++ index variable in an expression string."""
+    return re.sub(r'\bindex\b', f"(int){idx_var}", str(expr_str))
+
+
+_MEGAFONT = """\
+// megafont 5×6 bitmaps (0–9, colon)
+static const uint8_t _megafont[][6] = {
+    {0x70, 0x98, 0x98, 0x98, 0x98, 0x70}, // 0
+    {0x30, 0x70, 0x30, 0x30, 0x30, 0x78}, // 1
+    {0xF0, 0x18, 0x70, 0xC0, 0xC0, 0xF8}, // 2
+    {0xF8, 0x18, 0x70, 0x18, 0x98, 0x70}, // 3
+    {0x80, 0x98, 0xF8, 0x18, 0x18, 0x18}, // 4
+    {0xF8, 0xC0, 0xF0, 0x18, 0x98, 0x70}, // 5
+    {0x70, 0xC0, 0xF0, 0xC8, 0xC8, 0x70}, // 6
+    {0xF8, 0x18, 0x30, 0x60, 0x60, 0x60}, // 7
+    {0x70, 0x98, 0x70, 0x98, 0x98, 0x70}, // 8
+    {0x70, 0x98, 0x78, 0x18, 0x98, 0x70}, // 9
+    {0x00, 0x18, 0x00, 0x00, 0x18, 0x00}  // :
+};"""
+
+
+# ── lightweight code builder ─────────────────────────────────────────────────
+
+class _E:
+    """Simple indentation-aware line buffer."""
+
+    def __init__(self):
+        self._lines: list[str] = []
+        self._depth = 0
+
+    def __call__(self, line: str = ""):
+        """Append a line at current indentation."""
+        if line == "":
+            self._lines.append("")
+        else:
+            self._lines.append("    " * self._depth + line)
+
+    def indent(self):   self._depth += 1
+    def dedent(self):   self._depth -= 1
+
+    def open(self, header: str = ""):
+        """Emit `header {` and indent."""
+        if header:
+            self(header + " {")
+        else:
+            self("{")
+        self.indent()
+
+    def close(self, suffix: str = ""):
+        self.dedent()
+        self("}" + suffix)
+
+    def result(self) -> str:
+        return "\n".join(self._lines)
+
+
+# ── main class ───────────────────────────────────────────────────────────────
+
+class Codegen:
+    """Transforms a CoatiIR into CoatiEngine.h / CoatiEngine.cpp."""
+
+    def __init__(self):
+        self._ir: CoatiIR | None = None
+        self._lock_lms: list[str] = []      # landmarks that need a _user lock int
+        self._prop_defaults: dict[str, Any] = {}
+
+    # ── public ────────────────────────────────────────────────────────────
+
+    def generate(self, ir: CoatiIR) -> tuple[str, str]:
+        """Return (header_str, source_str)."""
+        self._ir = ir
+        self._lock_lms = self._find_lockable_landmarks()
+        self._prop_defaults = {p.name: p.default for p in ir.agents.properties}
+        return self._header(), self._source()
+
+    # ── lock detection ────────────────────────────────────────────────────
+
+    def _find_lockable_landmarks(self) -> list[str]:
+        """Return sorted list of landmark names that need a *_user lock var."""
+        names: set[str] = set()
+
+        def scan_cond(c: ConditionNode | None):
+            if c is None:
+                return
+            if c.op == "landmark_free" and c.name:
+                names.add(c.name)
+            for arg in c.args:
+                scan_cond(arg)
+
+        def scan_body(body):
+            for item in body:
+                if isinstance(item, ActionNode):
+                    if item.action in ("claim", "release") and item.landmark:
+                        names.add(item.landmark)
+                elif isinstance(item, IfNode):
+                    scan_cond(item.condition)
+                    scan_body(item.then_body)
+                    scan_body(item.else_body)
+
+        ir = self._ir
+        for rule in ir.behavior.rules:
+            scan_cond(rule.condition)
+            scan_body(rule.body)
+        scan_body(ir.collision.body)
+        return sorted(names)
+
+    # ── header ────────────────────────────────────────────────────────────
+
+    def _header(self) -> str:
+        ir = self._ir
+        w, h = ir.grid.width, ir.grid.height
+        e = _E()
+
+        e("#pragma once")
+        e("// Generated by `coati codegen` — DO NOT EDIT MANUALLY")
+        e(f"// Script: {ir.agents.type_name}  Grid: {w}×{h}")
+        e()
+        e('#include "Particle.h"')
+        e('#include "neopixel.h"')
+        e('#include <vector>')
+        e('#include <queue>')
+        e('#include <cmath>')
+        e('#include <algorithm>')
+        e('#include <cstring>')
+        e('#include <cstdlib>')
+        e()
+        e(f"static constexpr int GRID_W = {w};")
+        e(f"static constexpr int GRID_H = {h};")
+        e()
+
+        # Point
+        e("struct Point {")
+        e("    int x, y;")
+        e("    bool operator==(const Point& o) const { return x == o.x && y == o.y; }")
+        e("    bool operator!=(const Point& o) const { return x != o.x || y != o.y; }")
+        e("};")
+        e()
+
+        # AgentState
+        e("struct AgentState {")
+        e("    int   index        = 0;")
+        e("    Point pos          = {0, 0};")
+        e("    Point last_pos     = {0, 0};")
+        active_default = "false" if ir.agents.pool_mode else "true"
+        e(f"    bool  active       = {active_default};")
+        e("    std::vector<Point> path;")
+        e("    Point claimed      = {-1, -1};")
+        e("    int   wait_counter = 0;")
+        for prop in ir.agents.properties:
+            ctype = _cpp_type(prop.type)
+            default = _cpp_literal(prop.default)
+            e(f"    {ctype:<6} {prop.name:<18} = {default};")
+        e("};")
+        e()
+
+        # CoatiEngine class
+        e("class CoatiEngine {")
+        e("public:")
+        e("    bool  current_board[GRID_W][GRID_H] = {false};")
+        e("    bool  target_board[GRID_W][GRID_H]  = {false};")
+        e("    float fade_board[GRID_W][GRID_H]    = {0.0f};")
+        e()
+        if ir.goal.type == "clock":
+            e("    bool          pending_target[GRID_W][GRID_H] = {false};")
+            e("    volatile bool target_pending = false;")
+            e("    time_t        active_target  = 0;")
+            e("    time_t        pending_time   = 0;")
+            e()
+        e("    std::vector<AgentState> agents;")
+        e()
+        for t in ir.terms:
+            e(f"    std::vector<Point> tk_{t.name};")
+        if ir.terms:
+            e()
+        for name in self._lock_lms:
+            e(f"    int {name}_user = -1;")
+        if self._lock_lms:
+            e()
+        for lm in ir.landmarks:
+            n = len(lm.cells)
+            e(f"    static const int   {lm.name}_count;")
+            e(f"    static const Point {lm.name}[];")
+        if ir.landmarks:
+            e()
+        e("    CoatiEngine();")
+        e("    void tick();")
+        if ir.goal.type == "clock":
+            e("    void update_target(time_t virtual_now);")
+            e("    void apply_pending_target();")
+        e("    void render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, float blend, int rotation = 0);")
+        e()
+        e("    std::vector<Point> find_path(Point start, Point dest, int self_idx);")
+        e()
+        e("private:")
+        e("    bool  pf_visited[GRID_W][GRID_H];")
+        e("    Point pf_parent[GRID_W][GRID_H];")
+        e("    float pf_cost[GRID_W][GRID_H];")
+        e()
+        e("    Point _find_closest(Point start, const std::vector<Point>& cands);")
+        e("    bool  _in_vec(const std::vector<Point>& v, Point p) const;")
+        e("    bool  _near_lit(Point p) const;")
+        e("    bool  _is_landmark(Point p) const;")
+        if ir.goal.type == "clock":
+            e("    void  _draw_digit(int x, int y_off, char c);")
+        e("};")
+        return e.result()
+
+    # ── source ────────────────────────────────────────────────────────────
+
+    def _source(self) -> str:
+        ir = self._ir
+        parts: list[str] = []
+
+        def add(s: str):
+            parts.append(s)
+            parts.append("")
+
+        parts.append('#include "CoatiEngine.h"')
+        parts.append("")
+
+        # Landmark static arrays
+        for lm in ir.landmarks:
+            cells = ", ".join(f"{{{x}, {y}}}" for x, y in lm.cells)
+            n = len(lm.cells)
+            parts.append(f"const int   CoatiEngine::{lm.name}_count = {n};")
+            parts.append(f"const Point CoatiEngine::{lm.name}[] = {{{cells}}};")
+        if ir.landmarks:
+            parts.append("")
+
+        # Megafont
+        if ir.goal.type == "clock":
+            parts.append(_MEGAFONT)
+            parts.append("")
+
+        # A* comparator (anonymous namespace)
+        parts.append("namespace {")
+        parts.append("struct _CmpNode {")
+        parts.append("    bool operator()(const std::pair<float,Point>& a,")
+        parts.append("                    const std::pair<float,Point>& b) const {")
+        parts.append("        return a.first > b.first;")
+        parts.append("    }")
+        parts.append("};")
+        parts.append("} // namespace")
+        parts.append("")
+
+        add(self._constructor())
+        if ir.goal.type == "clock":
+            add(self._draw_digit())
+            add(self._update_target())
+            add(self._apply_pending_target())
+        add(self._find_path())
+        add(self._helpers())
+        add(self._tick())
+        parts.append(self._render())
+
+        return "\n".join(parts)
+
+    # ── constructor ───────────────────────────────────────────────────────
+
+    def _constructor(self) -> str:
+        ir = self._ir
+        e = _E()
+        e("CoatiEngine::CoatiEngine() {")
+        e.indent()
+        count = ir.agents.count
+        e(f"agents.reserve({count});")
+
+        if ir.agents.pool_mode:
+            sp = ir.agents.spawn_point or (0, 0)
+            e(f"for (int i = 0; i < {count}; i++) {{")
+            e.indent()
+            e("AgentState a;")
+            e("a.index = i;")
+            e(f"a.pos = {{{sp[0]}, {sp[1]}}};")
+            e("a.last_pos = a.pos;")
+            e("a.active = false;")
+            e("agents.push_back(a);")
+            e.dedent()
+            e("}")
+        else:
+            starts = ir.agents.starts
+            for idx in range(count):
+                pos = starts[idx % len(starts)] if starts else (0, 0)
+                e("{")
+                e.indent()
+                e("AgentState a;")
+                e(f"a.index = {idx};")
+                e(f"a.pos = {{{pos[0]}, {pos[1]}}};")
+                e("a.last_pos = a.pos;")
+                e("agents.push_back(a);")
+                e.dedent()
+                e("}")
+
+        e.dedent()
+        e("}")
+        return e.result()
+
+    # ── clock goal ────────────────────────────────────────────────────────
+
+    def _draw_digit(self) -> str:
+        e = _E()
+        e("void CoatiEngine::_draw_digit(int x, int y_off, char c) {")
+        e.indent()
+        e("int idx = -1;")
+        e("if (c >= '0' && c <= '9') idx = c - '0';")
+        e("else if (c == ':') idx = 10;")
+        e("if (idx < 0) return;")
+        e("for (int row = 0; row < 6; row++) {")
+        e.indent()
+        e("uint8_t bits = _megafont[idx][row];")
+        e("for (int col = 0; col < 5; col++) {")
+        e.indent()
+        e("if (bits & (0x80 >> col)) {")
+        e.indent()
+        e("int px = x + col, py = row + y_off;")
+        e("if (px >= 0 && px < GRID_W && py >= 0 && py < GRID_H)")
+        e("    pending_target[px][py] = true;")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        return e.result()
+
+    def _update_target(self) -> str:
+        e = _E()
+        e("void CoatiEngine::update_target(time_t virtual_now) {")
+        e.indent()
+        e("if (!Time.isValid()) return;")
+        e("int h = Time.hour(virtual_now);")
+        e("int m = Time.minute(virtual_now);")
+        e("char hs[3], ms_[3];")
+        e("snprintf(hs, sizeof(hs),  \"%02d\", h);")
+        e("snprintf(ms_, sizeof(ms_), \"%02d\", m);")
+        e("memset(pending_target, 0, sizeof(pending_target));")
+        e("if (GRID_H >= 16) {")
+        e.indent()
+        e("_draw_digit(2,  1, hs[0]);  _draw_digit(9,  1, hs[1]);")
+        e("_draw_digit(2,  8, ms_[0]); _draw_digit(9,  8, ms_[1]);")
+        e.dedent()
+        e("} else {")
+        e.indent()
+        e("_draw_digit(4,  1, hs[0]);  _draw_digit(10, 1, hs[1]);")
+        e("_draw_digit(17, 1, ms_[0]); _draw_digit(23, 1, ms_[1]);")
+        e.dedent()
+        e("}")
+        e("pending_time   = virtual_now;")
+        e("target_pending = true;")
+        e.dedent()
+        e("}")
+        return e.result()
+
+    def _apply_pending_target(self) -> str:
+        ir = self._ir
+        e = _E()
+        e("void CoatiEngine::apply_pending_target() {")
+        e.indent()
+        e("if (!target_pending) return;")
+        e("target_pending = false;")
+        e("active_target  = pending_time;")
+        e("for (int x = 0; x < GRID_W; x++)")
+        e("    for (int y = 0; y < GRID_H; y++)")
+        e("        target_board[x][y] = pending_target[x][y];")
+        e("// Reset landmark locks")
+        for name in self._lock_lms:
+            e(f"{name}_user = -1;")
+        e("// Reset all agents")
+        e("for (auto& a : agents) {")
+        e.indent()
+        e("a.claimed      = {-1, -1};")
+        e("a.path.clear();")
+        e("a.wait_counter = 0;")
+        for prop in ir.agents.properties:
+            e(f"a.{prop.name} = {_cpp_literal(prop.default)};")
+        e.dedent()
+        e("}")
+        e('Log.info("Engine: applied new target");')
+        e.dedent()
+        e("}")
+        return e.result()
+
+    # ── pathfinding ───────────────────────────────────────────────────────
+
+    def _find_path(self) -> str:
+        ir = self._ir
+        pf = ir.pathfinding
+        lit_pen = next((p.cost for p in pf.penalties if p.condition == "lit"),  0.0)
+        occ_pen = next((p.cost for p in pf.penalties if p.condition == "occupied"), 0.0)
+
+        e = _E()
+        e("std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_idx) {")
+        e.indent()
+        e("if (start == dest) return {};")
+        e("memset(pf_visited, 0, sizeof(pf_visited));")
+        e("for (int x = 0; x < GRID_W; x++)")
+        e("    for (int y = 0; y < GRID_H; y++)")
+        e("        pf_cost[x][y] = 1e9f;")
+        e()
+        e("using _PQNode = std::pair<float, Point>;")
+        e("std::priority_queue<_PQNode, std::vector<_PQNode>, _CmpNode> q;")
+        e("pf_cost[start.x][start.y] = 0.0f;")
+        e("q.push({0.0f, start});")
+        e(f"const int MAX_NODES = {pf.max_nodes};")
+        e("int expanded = 0;")
+        e("Point best = {-1, -1};")
+        e("float best_h = 1e9f;")
+        e()
+        e("while (!q.empty() && expanded < MAX_NODES) {")
+        e.indent()
+        e("Point cur = q.top().second; q.pop();")
+        e("if (cur == dest) { best = dest; break; }")
+        e("if (pf_visited[cur.x][cur.y]) continue;")
+        e("pf_visited[cur.x][cur.y] = true;")
+        e("expanded++;")
+        e("float h = sqrtf((float)((cur.x-dest.x)*(cur.x-dest.x)+(cur.y-dest.y)*(cur.y-dest.y)));")
+        e("if (h < best_h) { best_h = h; best = cur; }")
+        e("for (int dx = -1; dx <= 1; dx++) {")
+        e.indent()
+        e("for (int dy = -1; dy <= 1; dy++) {")
+        e.indent()
+        e("if (dx == 0 && dy == 0) continue;")
+        e("int nx = cur.x + dx, ny = cur.y + dy;")
+        e("if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;")
+        e("bool is_dest = (nx == dest.x && ny == dest.y);")
+        e(f"float lit_cost = (!is_dest && current_board[nx][ny]) ? {lit_pen:.1f}f : 0.0f;")
+        e("float occ_cost = 0.0f;")
+        e("for (size_t j = 0; j < agents.size(); j++)")
+        e("    if ((int)j != self_idx && agents[j].active &&")
+        e("        agents[j].pos.x == nx && agents[j].pos.y == ny && !is_dest)")
+        e(f"        occ_cost = {occ_pen:.1f}f;")
+        e(f"float step = (dx==0||dy==0) ? {pf.orthogonal_cost:.3f}f : {pf.diagonal_cost:.3f}f;")
+        e("float nc = pf_cost[cur.x][cur.y] + step + lit_cost + occ_cost;")
+        e("if (nc < pf_cost[nx][ny]) {")
+        e.indent()
+        e("pf_cost[nx][ny] = nc;")
+        e("pf_parent[nx][ny] = cur;")
+        e("float g = sqrtf((float)((nx-dest.x)*(nx-dest.x)+(ny-dest.y)*(ny-dest.y)));")
+        e("q.push({nc + g, {nx, ny}});")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e()
+        e("Point tgt = (pf_cost[dest.x][dest.y] < 1e8f) ? dest : best;")
+        e("std::vector<Point> path;")
+        e("if (tgt.x < 0 || tgt == start) return path;")
+        e("Point cur = tgt;")
+        e("for (int safety = 0; !(cur == start) && safety < 512; safety++) {")
+        e.indent()
+        e("path.push_back(cur);")
+        e("cur = pf_parent[cur.x][cur.y];")
+        e.dedent()
+        e("}")
+        e("std::reverse(path.begin(), path.end());")
+        e("return path;")
+        e.dedent()
+        e("}")
+        return e.result()
+
+    # ── private helpers ───────────────────────────────────────────────────
+
+    def _helpers(self) -> str:
+        ir = self._ir
+        e = _E()
+
+        e("Point CoatiEngine::_find_closest(Point s, const std::vector<Point>& cands) {")
+        e.indent()
+        e("Point best = {-1, -1}; float md = 1e9f;")
+        e("for (auto& c : cands) {")
+        e.indent()
+        e("float d = sqrtf((float)((s.x-c.x)*(s.x-c.x)+(s.y-c.y)*(s.y-c.y)));")
+        e("if (d < md) { md = d; best = c; }")
+        e.dedent()
+        e("}")
+        e("return best;")
+        e.dedent()
+        e("}")
+        e()
+
+        e("bool CoatiEngine::_in_vec(const std::vector<Point>& v, Point p) const {")
+        e.indent()
+        e("for (auto& c : v) if (c == p) return true;")
+        e("return false;")
+        e.dedent()
+        e("}")
+        e()
+
+        e("bool CoatiEngine::_near_lit(Point p) const {")
+        e.indent()
+        e("for (int dx = -1; dx <= 1; dx++)")
+        e("    for (int dy = -1; dy <= 1; dy++) {")
+        e("        if (dx == 0 && dy == 0) continue;")
+        e("        int nx = p.x+dx, ny = p.y+dy;")
+        e("        if (nx>=0 && nx<GRID_W && ny>=0 && ny<GRID_H && current_board[nx][ny])")
+        e("            return true;")
+        e("    }")
+        e("return false;")
+        e.dedent()
+        e("}")
+        e()
+
+        e("bool CoatiEngine::_is_landmark(Point p) const {")
+        e.indent()
+        for lm in ir.landmarks:
+            e(f"for (int i = 0; i < {lm.name}_count; i++) if ({lm.name}[i] == p) return true;")
+        e("return false;")
+        e.dedent()
+        e("}")
+
+        return e.result()
+
+    # ── tick ──────────────────────────────────────────────────────────────
+
+    def _tick(self) -> str:
+        ir = self._ir
+        e = _E()
+        e("void CoatiEngine::tick() {")
+        e.indent()
+
+        # ── term vectors ──────────────────────────────────────────────────
+        term_names = [t.name for t in ir.terms]
+        if term_names:
+            for n in term_names:
+                e(f"tk_{n}.clear();")
+            e()
+            e("for (int x = 0; x < GRID_W; x++) {")
+            e.indent()
+            e("for (int y = 0; y < GRID_H; y++) {")
+            e.indent()
+            e("if (_is_landmark({x, y})) continue;")
+            for term in ir.terms:
+                cond = self._term_expr(term.expr, "x", "y")
+                e(f"if ({cond}) tk_{term.name}.push_back({{x, y}});")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e()
+
+        # ── pool-mode spawn ───────────────────────────────────────────────
+        if ir.agents.pool_mode and ir.spawning:
+            sp = ir.agents.spawn_point or (0, 0)
+            every = ir.spawning.every_ticks
+            spawn_cond = ir.spawning.condition
+            e("// Spawn phase")
+            e("{")
+            e.indent()
+            e("static int _spawn_timer = 0;")
+            e(f"if (++_spawn_timer >= {every}) {{")
+            e.indent()
+            e("_spawn_timer = 0;")
+            if spawn_cond:
+                cond_str = self._cond(spawn_cond, "0", spawn_ctx=True)
+                e(f"if ({cond_str}) {{")
+            else:
+                e("if (true) {")
+            e.indent()
+            e("for (auto& _sa : agents) {")
+            e.indent()
+            e("if (!_sa.active) {")
+            e.indent()
+            e("_sa.active    = true;")
+            e(f"_sa.pos       = {{{sp[0]}, {sp[1]}}};")
+            e("_sa.last_pos  = _sa.pos;")
+            e("_sa.path.clear();")
+            e("_sa.claimed   = {-1, -1};")
+            e("_sa.wait_counter = 0;")
+            for prop in ir.agents.properties:
+                e(f"_sa.{prop.name} = {_cpp_literal(prop.default)};")
+            e("break;")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e()
+
+        # ── movement phase ────────────────────────────────────────────────
+        e("// Movement phase")
+        e("for (size_t i = 0; i < agents.size(); i++) {")
+        e.indent()
+        e("AgentState& a = agents[i];")
+        e("if (!a.active) continue;")
+        e("a.last_pos = a.pos;")
+        e("if (a.path.empty()) continue;")
+        e("Point nxt = a.path.front();")
+        e("bool col  = false;")
+        e("for (size_t j = 0; j < agents.size(); j++)")
+        e("    if (i != j && agents[j].active && agents[j].pos == nxt) { col = true; break; }")
+        e("if (col) {")
+        e.indent()
+        e("a.wait_counter++;")
+        if ir.collision.body:
+            self._body(ir.collision.body, e, "i", in_lambda=False)
+        e.dedent()
+        e("} else {")
+        e.indent()
+        e("a.pos = nxt;")
+        e("a.path.erase(a.path.begin());")
+        e("a.wait_counter = 0;")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+        e()
+
+        # ── behavior phase ────────────────────────────────────────────────
+        pathfind_limited = ir.behavior.pathfind_limit > 0
+        e("// Behavior phase")
+        if pathfind_limited:
+            e("int _pf_budget = 0;")
+        e("for (size_t i = 0; i < agents.size(); i++) {")
+        e.indent()
+        e("AgentState& a = agents[i];")
+        e("if (!a.active) continue;")
+        e("if (!a.path.empty() || a.wait_counter > 0) continue;")
+        if pathfind_limited:
+            e(f"if (_pf_budget >= {ir.behavior.pathfind_limit}) break;")
+        e()
+
+        # Reset bored each tick if the property exists
+        if any(p.name == "bored" for p in ir.agents.properties):
+            e("a.bored = false;")
+
+        e()
+        e("bool _used_pf = false;")
+        e("// Compute available (unclaimed-by-others) term subsets")
+        for term in ir.terms:
+            e(f"std::vector<Point> tk_avail_{term.name};")
+            e(f"for (auto& _p : tk_{term.name}) {{")
+            e.indent()
+            e("bool _cl = false;")
+            e("for (size_t j = 0; j < agents.size(); j++)")
+            e("    if (j != i && agents[j].active && agents[j].claimed == _p) { _cl = true; break; }")
+            e("if (!_cl) tk_avail_{n}.push_back(_p);".replace("{n}", term.name))
+            e.dedent()
+            e("}")
+        if ir.terms:
+            e()
+
+        # Wrap behavior in a lambda so `done`/action-fallthrough → `return`
+        e("auto _eval = [&]() {")
+        e.indent()
+        for rule in ir.behavior.rules:
+            cond_str = self._cond(rule.condition, "i")
+            e(f"if ({cond_str}) {{")
+            e.indent()
+            self._body(rule.body, e, "i", in_lambda=True)
+            e("return;  // end of when-block")
+            e.dedent()
+            e("}")
+        e.dedent()
+        e("};")
+        e("_eval();")
+        if pathfind_limited:
+            e("if (_used_pf) _pf_budget++;")
+        e.dedent()
+        e("}")
+        e()
+
+        # ── tick actions (fade etc.) ───────────────────────────────────────
+        for act in ir.behavior.tick_actions:
+            if act.action == "fade_update":
+                amount = float(act.value) if act.value is not None else 0.032
+                cap    = float(act.source) if act.source else 1.0
+                amount_lit = _cpp_literal(amount)
+                cap_lit    = _cpp_literal(cap)
+                e("// Fade update")
+                e("for (int x = 0; x < GRID_W; x++)")
+                e("    for (int y = 0; y < GRID_H; y++)")
+                e(f"        if (current_board[x][y] && fade_board[x][y] < {cap_lit}) {{")
+                e(f"            fade_board[x][y] += {amount_lit};")
+                e(f"            if (fade_board[x][y] > {cap_lit}) fade_board[x][y] = {cap_lit};")
+                e("        }")
+
+        e.dedent()
+        e("}")
+        return e.result()
+
+    # ── term expression (TermExpr) → C++ ─────────────────────────────────
+
+    def _term_expr(self, expr: TermExpr, xv: str, yv: str) -> str:
+        op = expr.op
+        if op == "eq":
+            layer, val = expr.layer, expr.value
+            if layer == "current":
+                return f"current_board[{xv}][{yv}]" if val else f"!current_board[{xv}][{yv}]"
+            if layer == "target":
+                return f"target_board[{xv}][{yv}]" if val else f"!target_board[{xv}][{yv}]"
+            if layer == "fade":
+                return f"fade_board[{xv}][{yv}] == {_cpp_literal(val)}"
+        if op == "and":
+            return "(" + " && ".join(self._term_expr(a, xv, yv) for a in expr.args) + ")"
+        if op == "or":
+            return "(" + " || ".join(self._term_expr(a, xv, yv) for a in expr.args) + ")"
+        if op == "not":
+            return f"(!{self._term_expr(expr.args[0], xv, yv)})"
+        return "false /* unknown term op */"
+
+    # ── condition → C++ ──────────────────────────────────────────────────
+
+    def _cond(self, cond: ConditionNode, idx: str, spawn_ctx: bool = False) -> str:
+        """Emit a C++ boolean expression for a ConditionNode.
+        idx      – C++ variable holding the agent index (e.g. 'i')
+        spawn_ctx – True when evaluating outside an agent loop (spawn phase)
+        """
+        op = cond.op
+
+        if op == "and":
+            return "(" + " && ".join(self._cond(a, idx, spawn_ctx) for a in cond.args) + ")"
+        if op == "or":
+            return "(" + " || ".join(self._cond(a, idx, spawn_ctx) for a in cond.args) + ")"
+        if op == "not":
+            return f"(!{self._cond(cond.args[0], idx, spawn_ctx)})"
+
+        if op == "prop_true":  return f"a.{cond.prop}"
+        if op == "prop_false": return f"!a.{cond.prop}"
+
+        if op == "gt":
+            return f"(a.{cond.prop} > {_cpp_literal(cond.value)})"
+        if op == "gte":
+            return f"(a.{cond.prop} >= {_cpp_literal(cond.value)})"
+        if op == "lt":
+            return f"(a.{cond.prop} < {_cpp_literal(cond.value)})"
+        if op == "eq":
+            return f"(a.{cond.prop} == {_cpp_literal(cond.value)})"
+        if op == "neq":
+            return f"(a.{cond.prop} != {_cpp_literal(cond.value)})"
+
+        if op == "gt_expr":
+            # value is a string expression, e.g. "3 + index * 2"
+            expr_str = _sub_index(str(cond.value), idx)
+            return f"(a.{cond.prop} > ({expr_str}))"
+
+        if op == "at_landmark":
+            lm = cond.name
+            return f"(a.pos == {lm}[{idx} % {lm}_count])"
+        if op == "not_at_landmark":
+            lm = cond.name
+            return f"(a.pos != {lm}[{idx} % {lm}_count])"
+        if op == "at_any_landmark":
+            return "_is_landmark(a.pos)"
+        if op == "at_claimed":
+            return "(a.claimed.x >= 0 && a.pos == a.claimed)"
+        if op == "landmark_free":
+            lm = cond.name
+            return f"({lm}_user == -1 || {lm}_user == (int){idx})"
+
+        if op in ("cell_is_lit", "on_lit"):
+            return "current_board[a.pos.x][a.pos.y]"
+        if op == "near_lit":
+            return "_near_lit(a.pos)"
+
+        if op == "standing_on_term":
+            return f"_in_vec(tk_{cond.name}, a.pos)"
+
+        if op == "term_exists":
+            if spawn_ctx:
+                # Outside agent loop: use raw term vec (no claim filter)
+                return f"(!tk_{cond.name}.empty())"
+            return f"(!tk_avail_{cond.name}.empty())"
+
+        if op == "term_empty":
+            if spawn_ctx:
+                return f"(tk_{cond.name}.empty())"
+            return f"(tk_{cond.name}.empty())"
+
+        if op == "missing_exist":
+            return "(!tk_missing.empty())"
+
+        return f"false /* unhandled cond: {op} */"
+
+    # ── body emitter ──────────────────────────────────────────────────────
+
+    def _body(self, body, e: _E, idx: str, in_lambda: bool):
+        """Emit a list of ActionNode/IfNode items."""
+        for item in body:
+            if isinstance(item, ActionNode):
+                self._action(item, e, idx, in_lambda)
+            elif isinstance(item, IfNode):
+                cond_str = self._cond(item.condition, idx)
+                e(f"if ({cond_str}) {{")
+                e.indent()
+                self._body(item.then_body, e, idx, in_lambda)
+                # If in a lambda and the then-body doesn't already end with `return`,
+                # emit one to implement IfNode-fires-breaks-body semantics.
+                if in_lambda and not self._body_ends_with_return(item.then_body):
+                    e("return;  // if-branch fired — skip rest of when-body")
+                e.dedent()
+                if item.else_body:
+                    e("} else {")
+                    e.indent()
+                    self._body(item.else_body, e, idx, in_lambda)
+                    e.dedent()
+                e("}")
+
+    @staticmethod
+    def _body_ends_with_return(body) -> bool:
+        """True if the last executable item in body unconditionally returns."""
+        # Walk backwards to find the last non-empty item
+        for item in reversed(body):
+            if isinstance(item, ActionNode):
+                return item.action in ("done", "despawn")
+            if isinstance(item, IfNode):
+                # An IfNode only guarantees return if both branches return,
+                # and there's an else. Conservative: say False.
+                return False
+        return False
+
+    # ── action emitter ────────────────────────────────────────────────────
+
+    def _action(self, action: ActionNode, e: _E, idx: str, in_lambda: bool):
+        act = action.action
+
+        if act == "done":
+            if in_lambda:
+                e("return;  // done")
+            return
+
+        if act == "set":
+            e(f"a.{action.prop} = {_cpp_literal(action.value)};")
+            return
+
+        if act == "increment":
+            e(f"a.{action.prop}++;")
+            return
+
+        if act == "decrement":
+            e(f"a.{action.prop}--;")
+            return
+
+        if act == "reset":
+            default = _cpp_literal(self._prop_defaults.get(action.prop, 0))
+            e(f"a.{action.prop} = {default};  // reset")
+            return
+
+        if act == "force":
+            e(f"a.{action.prop} = {_cpp_literal(action.value)};  // force")
+            return
+
+        if act == "increase":
+            amount = _cpp_literal(action.value)
+            cap    = f"{float(action.source):.4g}f" if action.source else "1.0f"
+            e(f"a.{action.prop} += {amount};")
+            e(f"if (a.{action.prop} > {cap}) a.{action.prop} = {cap};")
+            return
+
+        if act == "clear_claimed":
+            e("a.claimed = {-1, -1};")
+            return
+
+        if act == "clear_path":
+            e("a.path.clear();")
+            return
+
+        if act == "reset_wait":
+            e("a.wait_counter = 0;")
+            return
+
+        if act == "pause":
+            val = int(action.value) if action.value is not None else 1
+            e(f"a.pause_counter = {val};")
+            return
+
+        if act == "claim":
+            e(f"{action.landmark}_user = (int){idx};")
+            return
+
+        if act == "release":
+            e(f"if ({action.landmark}_user == (int){idx}) {action.landmark}_user = -1;")
+            return
+
+        if act == "pickup":
+            if action.source == "board":
+                e("if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {")
+                e.indent()
+                e("current_board[a.pos.x][a.pos.y] = false;")
+                e("fade_board[a.pos.x][a.pos.y]    = 0.0f;")
+                e.dedent()
+                e("}")
+            # Only set `carrying` if the script declares that property.
+            if "carrying" in self._prop_defaults:
+                e("a.carrying = true;")
+            return
+
+        if act == "place":
+            e("if (a.pos.x >= 0 && a.pos.x < GRID_W && a.pos.y >= 0 && a.pos.y < GRID_H) {")
+            e.indent()
+            e("current_board[a.pos.x][a.pos.y] = true;")
+            e("fade_board[a.pos.x][a.pos.y]    = 0.0f;")
+            e.dedent()
+            e("}")
+            if "carrying" in self._prop_defaults:
+                e("a.carrying = false;")
+            return
+
+        if act == "discard":
+            e("// discard — no board change")
+            return
+
+        if act == "despawn":
+            e("a.active = false;")
+            e("a.path.clear();")
+            e("a.claimed = {-1, -1};")
+            if in_lambda:
+                e("return;  // despawn")
+            return
+
+        if act == "become_bored":
+            e("a.bored = true;")
+            return
+
+        if act == "seek":
+            lm = action.landmark
+            e(f"{{  // seek {lm}")
+            e.indent()
+            e(f"Point _dest = {lm}[{idx} % {lm}_count];")
+            e("a.claimed = _dest;")
+            e("if (a.pos == _dest) return;  // already here")
+            e("if (!_used_pf) {")
+            e.indent()
+            e(f"a.path = find_path(a.pos, _dest, (int){idx});")
+            e("_used_pf = true;")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            return
+
+        if act == "seek_nearest":
+            term = action.term
+            e(f"{{  // seek nearest available {term}")
+            e.indent()
+            e(f"if (!tk_avail_{term}.empty()) {{")
+            e.indent()
+            e(f"Point _dest = _find_closest(a.pos, tk_avail_{term});")
+            e("a.claimed = _dest;")
+            e("if (a.pos == _dest) return;  // already here")
+            e("if (!_used_pf) {")
+            e.indent()
+            e(f"a.path = find_path(a.pos, _dest, (int){idx});")
+            e("_used_pf = true;")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            return
+
+        if act == "bob":
+            lm = action.landmark
+            e(f"{{  // bob at {lm}")
+            e.indent()
+            e(f"Point _spot = {lm}[{idx} % {lm}_count];")
+            e("if (a.pos.y == _spot.y) a.path = {{_spot.x, _spot.y - 1}};")
+            e("else                    a.path = {_spot};")
+            e.dedent()
+            e("}")
+            return
+
+        if act == "step_up":
+            e("a.path = {{a.pos.x, a.pos.y - 1}};  // step up from landmark")
+            return
+
+        if act == "wander":
+            self._wander(action, e, idx)
+            return
+
+        if act in ("set_display_color", "fade_update"):
+            e(f"// {act}: simulator-only — omitted on device")
+            return
+
+        e(f"// TODO: unhandled action '{act}'")
+
+    def _wander(self, action: ActionNode, e: _E, idx: str):
+        avoid   = action.avoid or []
+        chance  = action.chance if action.chance is not None else 100
+        forced  = action.forced_condition  # e.g. "near_lit"
+
+        e("{  // wander")
+        e.indent()
+        e("static const int _wdx[] = { 0, 1, 0,-1, 1, 1,-1,-1};")
+        e("static const int _wdy[] = {-1, 0, 1, 0,-1, 1, 1,-1};")
+        e("std::vector<Point> _choices;")
+        e("bool _near = false;")
+        e("for (int _d = 0; _d < 8; _d++) {")
+        e.indent()
+        e("int _nx = a.pos.x + _wdx[_d], _ny = a.pos.y + _wdy[_d];")
+        e("if (_nx < 0 || _nx >= GRID_W || _ny < 0 || _ny >= GRID_H) continue;")
+        if "lit" in avoid:
+            e("if (current_board[_nx][_ny]) { _near = true; continue; }")
+        else:
+            e("if (current_board[_nx][_ny]) _near = true;")
+        if "landmarks" in avoid:
+            e("if (_is_landmark({_nx, _ny})) continue;")
+        e("_choices.push_back({_nx, _ny});")
+        e.dedent()
+        e("}")
+        e("if (current_board[a.pos.x][a.pos.y]) _near = true;  // standing on lit")
+        # forced condition
+        if forced and ("near_lit" in forced or "near lit" in forced):
+            forced_expr = "_near"
+        elif forced:
+            forced_expr = "_near"  # best effort
+        else:
+            forced_expr = "false"
+        e(f"if ({forced_expr} || (rand() % 100 < {chance})) {{")
+        e.indent()
+        e("if (!_choices.empty())")
+        e("    a.path = {_choices[rand() % _choices.size()]};")
+        e.dedent()
+        e("}")
+        e.dedent()
+        e("}")
+
+    # ── rendering ─────────────────────────────────────────────────────────
+
+    def _agent_rule_cond(self, rule, idx_var: str) -> str | None:
+        """Return C++ boolean expression for a RenderRule's agent selector,
+        or None if the rule references a property the script didn't declare
+        (in which case the rule should be skipped entirely).
+        """
+        sel = rule.selector
+        parts: list[str] = []
+
+        if rule.agent_index is not None:
+            parts.append(f"((int){idx_var} == {rule.agent_index})")
+
+        if sel == "agent_idle":
+            # Baseline: no extra condition.
+            pass
+        elif sel == "agent_waiting":
+            parts.append("(a.wait_counter > 1)")
+        elif sel == "agent_when":
+            if rule.condition is None:
+                return None
+            # Refuse to emit if the condition references undeclared props.
+            refd = self._cond_referenced_props(rule.condition)
+            if not refd.issubset(self._prop_defaults.keys()):
+                return None
+            parts.append(self._cond(rule.condition, idx_var))
+        elif sel.startswith("agent_"):
+            tokens = sel[len("agent_"):].split("_")
+            neg = False
+            for tok in tokens:
+                if tok == "not":
+                    neg = True
+                    continue
+                if tok not in self._prop_defaults:
+                    return None
+                parts.append(f"(!a.{tok})" if neg else f"a.{tok}")
+                neg = False
+        else:
+            return None
+
+        if not parts:
+            return "true"
+        return " && ".join(parts)
+
+    def _cond_referenced_props(self, cond) -> set[str]:
+        out: set[str] = set()
+        if cond is None:
+            return out
+        if cond.prop:
+            out.add(cond.prop)
+        for a in cond.args:
+            out |= self._cond_referenced_props(a)
+        return out
+
+    def _color_rgb_tuple(self, color) -> str:
+        return f"{color.r}, {color.g}, {color.b}"
+
+    def _emit_color_expr(self, e: _E, varname: str, color, bri_expr: str):
+        """Emit `uint32_t <varname> = ...;` for a ColorExpr with optional
+        pulse/shimmer/multiply_layer modulation.  `bri_expr` is a C++ expression
+        for the effective brightness scalar (e.g. `bri` or `fade_board[x][y]*bri`).
+        """
+        rgb = self._color_rgb_tuple(color)
+        if color.modulation == "pulse" and color.mod_period_ms > 0:
+            amp = f"(0.7f + 0.3f * sinf((float)now_ms / {color.mod_period_ms}.0f))"
+            e(f"uint32_t {varname} = _cc({rgb}, {amp} * ({bri_expr}));")
+        elif color.modulation == "shimmer" and color.mod_period_ms > 0:
+            # shimmer = on/off at period; use absolute sin
+            amp = f"((sinf((float)now_ms / {color.mod_period_ms}.0f) > 0) ? 1.0f : 0.0f)"
+            e(f"uint32_t {varname} = _cc({rgb}, {amp} * ({bri_expr}));")
+        else:
+            e(f"uint32_t {varname} = _cc({rgb}, {bri_expr});")
+
+    def _is_shimmer(self, color) -> bool:
+        return color.modulation == "shimmer" and color.mod_period_ms > 0
+
+    def _render(self) -> str:
+        ir = self._ir
+        e = _E()
+
+        # Partition rules
+        rules = ir.rendering.rules
+        board_rule = next((r for r in rules if r.selector == "board_pixel"), None)
+        landmark_rules = {
+            lm.name: next((r for r in rules if r.selector == lm.name), None)
+            for lm in ir.landmarks
+        }
+        agent_rules = [
+            r for r in rules
+            if r.selector.startswith("agent_") or r.selector == "agent_when"
+        ]
+
+        e("void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, float blend, int rotation) {")
+        e.indent()
+        e("strip.clear();")
+        e("const int PIXEL_COUNT = GRID_W * GRID_H;")
+        e()
+
+        # Zigzag pixel mapper (column-major serpentine), with rotation.
+        e("auto _map = [&](int x, int y) -> int {")
+        e.indent()
+        e("if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return -1;")
+        e("int rx = x, ry = y;")
+        e("int max_x = GRID_W - 1;")
+        e("int max_y = GRID_H - 1;")
+        e("if (rotation == 90)       { rx = max_y - y; ry = x; }")
+        e("else if (rotation == 180) { rx = max_x - x; ry = max_y - y; }")
+        e("else if (rotation == 270) { rx = y; ry = max_x - x; }")
+        e("int phys_h = (rotation == 90 || rotation == 270) ? GRID_W : GRID_H;")
+        e("if (rx % 2 == 0) return (rx * phys_h) + ry;")
+        e("return (rx * phys_h) + ((phys_h - 1) - ry);")
+        e.dedent()
+        e("};")
+        e()
+        e("auto _set = [&](int x, int y, uint32_t c) {")
+        e.indent()
+        e("int idx = _map(x, y);")
+        e("if (idx >= 0 && idx < PIXEL_COUNT) strip.setPixelColor(idx, c);")
+        e.dedent()
+        e("};")
+        e()
+        # Color combiner: applies brightness scaling, with 1-floor semantics
+        # to avoid a color channel rounding to 0 when its non-zero input was small.
+        e("auto _cc = [](uint8_t r, uint8_t g, uint8_t b, float s) -> uint32_t {")
+        e.indent()
+        e("if (s <= 0.0f) return 0;")
+        e("if (s > 1.0f) s = 1.0f;")
+        e("auto scale = [](uint8_t v, float s) -> uint8_t {")
+        e.indent()
+        e("if (v == 0) return 0;")
+        e("float f = (float)v * s;")
+        e("return (uint8_t)(f < 1.0f ? 1.0f : f);")
+        e.dedent()
+        e("};")
+        e("return Adafruit_NeoPixel::Color(scale(r, s), scale(g, s), scale(b, s));")
+        e.dedent()
+        e("};")
+        e()
+
+        # ── Board pixels ──
+        if board_rule is not None:
+            rgb = self._color_rgb_tuple(board_rule.color)
+            mul = board_rule.color.multiply_layer
+            if mul == "fade":
+                bri_expr = "fade_board[x][y] * bri"
+            elif mul:
+                bri_expr = f"/* unknown layer {mul} */ bri"
+            else:
+                bri_expr = "bri"
+            e("// board pixels (lit cells, excluding landmark cells)")
+            e("for (int x = 0; x < GRID_W; x++) {")
+            e.indent()
+            e("for (int y = 0; y < GRID_H; y++) {")
+            e.indent()
+            e("if (!current_board[x][y]) continue;")
+            e("if (_is_landmark({x, y})) continue;")
+            e(f"_set(x, y, _cc({rgb}, {bri_expr}));")
+            e.dedent()
+            e("}")
+            e.dedent()
+            e("}")
+            e()
+
+        # ── Landmarks ──
+        for lm in ir.landmarks:
+            rule = landmark_rules.get(lm.name)
+            if rule is None:
+                continue
+            rgb = self._color_rgb_tuple(rule.color)
+            e(f"// landmark: {lm.name}")
+            e(f"for (int k = 0; k < {lm.name}_count; k++) {{")
+            e.indent()
+            e(f"const Point& p = {lm.name}[k];")
+            e(f"_set(p.x, p.y, _cc({rgb}, bri));")
+            e.dedent()
+            e("}")
+            e()
+
+        # ── Agents ──
+        # Emit rules in script order; first-match-wins.
+        e("// agents")
+        e("for (size_t i = 0; i < agents.size(); i++) {")
+        e.indent()
+        e("AgentState& a = agents[i];")
+        e("if (!a.active) continue;")
+        e("uint32_t color = 0;")
+        e("bool matched = false;")
+        e()
+
+        emitted_any = False
+        for rule in agent_rules:
+            cond_cpp = self._agent_rule_cond(rule, "i")
+            if cond_cpp is None:
+                continue  # references a prop not declared in this script
+            emitted_any = True
+            if cond_cpp == "true":
+                e("if (!matched) {")
+            else:
+                e(f"if (!matched && ({cond_cpp})) {{")
+            e.indent()
+            self._emit_color_expr(e, "_c", rule.color, "bri")
+            e("color = _c;")
+            e("matched = true;")
+            e.dedent()
+            e("}")
+        if not emitted_any:
+            # Fallback so agents are still visible
+            e("if (!matched) { color = _cc(64, 64, 64, bri); matched = true; }")
+        e()
+
+        # Motion blur
+        e("if (a.pos == a.last_pos) {")
+        e.indent()
+        e("_set(a.pos.x, a.pos.y, color);")
+        e.dedent()
+        e("} else {")
+        e.indent()
+        e("uint8_t r = (color >> 16) & 0xFF;")
+        e("uint8_t g = (color >>  8) & 0xFF;")
+        e("uint8_t b =  color        & 0xFF;")
+        e("_set(a.last_pos.x, a.last_pos.y, _cc(r, g, b, (1.0f - blend)));")
+        e("_set(a.pos.x,      a.pos.y,      _cc(r, g, b, blend));")
+        e.dedent()
+        e("}")
+
+        e.dedent()
+        e("}")   # agents loop
+        e()
+        e("strip.show();")
+        e.dedent()
+        e("}")
+        return e.result()
