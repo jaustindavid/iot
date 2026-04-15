@@ -45,7 +45,7 @@ when pause_counter > 0:
 
 when standing on extras and cell is lit:
   pickup from board
-  pause 2
+  pause 5
   done
 
 when available extras exist:
@@ -55,18 +55,18 @@ when available extras exist:
 
 when standing on missing:
   place
-  pause 4
+  pause 5
   done
 
 when available missing exist:
   seek nearest available missing
-  pause 2
+  pause 5
   done
 
 # wander
 when no missing:
   wander avoiding lit, chance 25%
-  pause 10
+  pause 20
   done
 
 each tick:
@@ -75,11 +75,11 @@ each tick:
 
 --- rendering ---
 
-physics: 2 hz
+physics: 5 hz
 display: 60 hz, interpolated
 
 board pixel: green (0, 64, 0) * fade
-agent idle: green (0, 255, 0)
+agent idle: green (0, 255, 0) pulse 1000ms
 
 --- goal ---
 

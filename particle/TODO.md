@@ -19,3 +19,9 @@ this line should have been `Point _dest = _find_closest(a.pos, tk_extras);`
 4. aphids: idle color no worky?  missing: are still pretty bright?  spawned have no color?  setting a color for role == 0 overrides everything else?
 
 5. slow physics also breaks interpolation rate
+
+6. sim doesn't work with 16x16
+
+7. tortoise / ladybug: wander ON a lit area (new primitive "current" ?)
+
+8. remove wobbly params from the script.

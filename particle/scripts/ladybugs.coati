@@ -93,7 +93,7 @@ each tick:
 
 --- rendering ---
 
-physics: 2 hz
+physics: 3 hz
 display: 60 hz, interpolated
 
 board pixel: green (0, 64, 0) * fade

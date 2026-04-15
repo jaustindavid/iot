@@ -1,7 +1,7 @@
 #include "CoatiEngine.h"
 
 const int   CoatiEngine::nest_count = 1;
-const Point CoatiEngine::nest[] = {{0, 15}};
+const Point CoatiEngine::nest[] = {{0, 7}};
 
 // megafont 5×6 bitmaps (0–9, colon)
 static const uint8_t _megafont[][6] = {
@@ -28,28 +28,14 @@ struct _CmpNode {
 } // namespace
 
 CoatiEngine::CoatiEngine() {
-    agents.reserve(32);
-    for (int i = 0; i < 32; i++) {
+    agents.reserve(80);
+    for (int i = 0; i < 80; i++) {
         AgentState a;
         a.index = i;
-        a.pos = {0, 15};
+        a.pos = {0, 7};
         a.last_pos = a.pos;
         a.active = false;
         agents.push_back(a);
-    }
-    {
-        AgentState& a = agents[0];
-        a.pos = {8, 4};
-        a.last_pos = a.pos;
-        a.active = true;
-        a.role = 1;
-    }
-    {
-        AgentState& a = agents[1];
-        a.pos = {16, 4};
-        a.last_pos = a.pos;
-        a.active = true;
-        a.role = 1;
     }
 }
 
@@ -103,16 +89,6 @@ void CoatiEngine::apply_pending_target() {
         a.path.clear();
         a.wait_counter = 0;
         a.pause_counter = 0;
-        a.role = 0;
-        switch (a.index) {
-          case 0:
-            a.role = 1;
-            break;
-          case 1:
-            a.role = 1;
-            break;
-          default: break;
-        }
     }
     Log.info("Engine: applied new target");
 }
@@ -128,7 +104,7 @@ std::vector<Point> CoatiEngine::find_path(Point start, Point dest, int self_idx)
     std::priority_queue<_PQNode, std::vector<_PQNode>, _CmpNode> q;
     pf_cost[start.x][start.y] = 0.0f;
     q.push({0.0f, start});
-    const int MAX_NODES = 64;
+    const int MAX_NODES = 256;
     int expanded = 0;
     Point best = {-1, -1};
     float best_h = 1e9f;
@@ -222,28 +198,18 @@ void CoatiEngine::tick() {
     // Spawn phase
     {
         static int _spawn_timer = 0;
-        if (++_spawn_timer >= 5) {
+        if (++_spawn_timer >= 10) {
             _spawn_timer = 0;
             if ((!tk_missing.empty())) {
                 for (auto& _sa : agents) {
                     if (!_sa.active) {
                         _sa.active    = true;
-                        _sa.pos       = {0, 15};
+                        _sa.pos       = {0, 7};
                         _sa.last_pos  = _sa.pos;
                         _sa.path.clear();
                         _sa.claimed   = {-1, -1};
                         _sa.wait_counter = 0;
                         _sa.pause_counter = 0;
-                        _sa.role = 0;
-                        switch (_sa.index) {
-                          case 0:
-                            _sa.role = 1;
-                            break;
-                          case 1:
-                            _sa.role = 1;
-                            break;
-                          default: break;
-                        }
                         break;
                     }
                 }
@@ -303,45 +269,22 @@ void CoatiEngine::tick() {
         }
 
         auto _eval = [&]() {
-            if ((a.role == 1)) {
-                {  // despawn neighbors where extras (eat agent + pixel)
-                    for (auto& _o : agents) {
-                        if (!_o.active || _o.index == a.index) continue;
-                        int _dx = _o.pos.x - a.pos.x, _dy = _o.pos.y - a.pos.y;
-                        if ((_dx == 0 && _dy == 0) || _dx < -1 || _dx > 1 || _dy < -1 || _dy > 1) continue;
-                        if (!_in_vec(tk_extras, _o.pos)) continue;
-                        _o.active = false;
-                        _o.path.clear();
-                        _o.claimed = {-1, -1};
-                        _o.wait_counter = 0;
-                        if (_o.pos.x >= 0 && _o.pos.x < GRID_WIDTH && _o.pos.y >= 0 && _o.pos.y < GRID_HEIGHT) {
-                            current_board[_o.pos.x][_o.pos.y] = false;
-                            fade_board[_o.pos.x][_o.pos.y] = 0.0f;
-                        }
-                    }
-                }
-                {  // wander
-                    static const int _wdx[] = { 0, 1, 0,-1, 1, 1,-1,-1};
-                    static const int _wdy[] = {-1, 0, 1, 0,-1, 1, 1,-1};
-                    std::vector<Point> _choices;
-                    bool _near = false;
-                    for (int _d = 0; _d < 8; _d++) {
-                        int _nx = a.pos.x + _wdx[_d], _ny = a.pos.y + _wdy[_d];
-                        if (_nx < 0 || _nx >= GRID_WIDTH || _ny < 0 || _ny >= GRID_HEIGHT) continue;
-                        if (current_board[_nx][_ny]) { _near = true; continue; }
-                        _choices.push_back({_nx, _ny});
-                    }
-                    if (current_board[a.pos.x][a.pos.y]) _near = true;  // standing on lit
-                    if (false || (rand() % 100 < 100)) {
-                        if (!_choices.empty())
-                            a.path = {_choices[rand() % _choices.size()]};
-                    }
-                }
+            if ((a.pause_counter > 0)) {
+                a.pause_counter--;
                 return;  // done
                 return;  // end of when-block
             }
-            if ((a.pause_counter > 0)) {
-                a.pause_counter--;
+            if ((_in_vec(tk_extras, a.pos) && current_board[a.pos.x][a.pos.y])) {
+                if (a.pos.x >= 0 && a.pos.x < GRID_WIDTH && a.pos.y >= 0 && a.pos.y < GRID_HEIGHT) {
+                    current_board[a.pos.x][a.pos.y] = false;
+                    fade_board[a.pos.x][a.pos.y]    = 0.0f;
+                }
+                a.pause_counter = 5;
+                return;  // done
+                return;  // end of when-block
+            }
+            if (current_board[a.pos.x][a.pos.y]) {
+                // set_display_color: simulator-only — omitted on device
                 return;  // done
                 return;  // end of when-block
             }
@@ -351,28 +294,6 @@ void CoatiEngine::tick() {
                     current_board[a.pos.x][a.pos.y] = true;
                     fade_board[a.pos.x][a.pos.y]    = 0.0f;
                 }
-                a.pause_counter = 75;
-                return;  // done
-                return;  // end of when-block
-            }
-            if (_in_vec(tk_extras, a.pos)) {
-                // set_display_color: simulator-only — omitted on device
-                return;  // done
-                return;  // end of when-block
-            }
-            if ((!tk_avail_extras.empty())) {
-                {  // seek nearest available extras
-                    if (!tk_avail_extras.empty()) {
-                        Point _dest = _find_closest(a.pos, tk_avail_extras);
-                        a.claimed = _dest;
-                        if (a.pos == _dest) return;  // already here
-                        if (!_used_pf) {
-                            a.path = find_path(a.pos, _dest, (int)i);
-                            _used_pf = true;
-                        }
-                    }
-                }
-                // set_display_color: simulator-only — omitted on device
                 return;  // done
                 return;  // end of when-block
             }
@@ -388,7 +309,21 @@ void CoatiEngine::tick() {
                         }
                     }
                 }
-                // set_display_color: simulator-only — omitted on device
+                return;  // done
+                return;  // end of when-block
+            }
+            if ((!tk_avail_extras.empty())) {
+                {  // seek nearest available extras
+                    if (!tk_avail_extras.empty()) {
+                        Point _dest = _find_closest(a.pos, tk_avail_extras);
+                        a.claimed = _dest;
+                        if (a.pos == _dest) return;  // already here
+                        if (!_used_pf) {
+                            a.path = find_path(a.pos, _dest, (int)i);
+                            _used_pf = true;
+                        }
+                    }
+                }
                 return;  // done
                 return;  // end of when-block
             }
@@ -483,28 +418,18 @@ void CoatiEngine::render(Adafruit_NeoPixel& strip, float bri, uint32_t now_ms, f
         uint32_t color = 0;
         bool matched = false;
 
-        if (!matched && ((a.role == 1))) {
-            uint32_t _c = _cc(64, 0, 0, (0.7f + 0.3f * sinf((float)now_ms / 2000.0f)) * (bri));
-            color = _c;
-            matched = true;
-        }
         if (!matched && (current_board[a.pos.x][a.pos.y])) {
             uint32_t _c = _cc(0, 255, 0, bri);
             color = _c;
             matched = true;
         }
         if (!matched && (_in_vec(tk_missing, a.pos))) {
-            uint32_t _c = _cc(32, 64, 32, bri);
+            uint32_t _c = _cc(0, 255, 0, bri);
             color = _c;
             matched = true;
         }
-        if (!matched && (_in_vec(tk_extras, a.pos))) {
-            uint32_t _c = _cc(64, 64, 64, bri);
-            color = _c;
-            matched = true;
-        }
-        if (!matched && ((a.role == 0))) {
-            uint32_t _c = _cc(16, 16, 16, (0.7f + 0.3f * sinf((float)now_ms / 1000.0f)) * (bri));
+        if (!matched) {
+            uint32_t _c = _cc(255, 0, 0, bri);
             color = _c;
             matched = true;
         }
