@@ -1,0 +1,28 @@
+# ok_diagonal_per_agent.crit: diagonal enabled on a specific agent block
+# (not at top level). Validates that the per-agent both-or-neither rule
+# accepts a complete pair nested under an agent type header.
+--- colors ---
+hare: (200, 160, 120)
+green: (0, 255, 0)
+
+--- agents ---
+hare starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+hare:
+  diagonal: allowed
+  diagonal_cost: 1.5
+  max nodes: 256
+
+--- behavior ---
+hare:
+  seek nearest missing
+  if standing on missing:
+    draw green
+    pause 2
+    done
+  pause 3
+  done

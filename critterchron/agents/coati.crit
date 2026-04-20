@@ -1,0 +1,150 @@
+# coati.crit: Scavenge, Wash, Place.
+#
+# Two coatis that shuttle between trash (source of paint), pool (washing
+# ritual), and the clock face. They have three states — dirty, clean,
+# none — that gate which landmark they visit next. The `step (0,-1)` /
+# `step (0,1)` pattern at a landmark is the "bobbing" animation; it uses
+# the unguarded step opcode and assumes the cell is free (which the pool
+# and trash landmarks are, by design).
+
+--- colors ---
+darkgreen: (0, 48, 0)   # trash landmark color
+blue:      (0, 0, 255)  # pool landmark color
+green:     (0, 255, 0)  # paint color for clock pixels
+white:     (255,255,255)
+grey:      (128, 128, 128)
+midgrey:   (32, 32, 32)
+darkgrey:  (1, 1, 1)
+coati:   cycle grey 15, midgrey 15, darkgrey 15, midgrey 15
+
+
+--- landmarks ---
+trash: darkgreen
+  (0, max_y)
+  (1, max_y)
+
+pool: blue
+  (max_x-1, max_y)
+  (max_x, max_y)
+
+--- agents ---
+coati: state {none, dirty, clean}
+coati starts at (0,0), state = dirty
+coati starts at (max_x,0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- pathfinding ---
+coati:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+coati:
+  # State `dirty`: head to pool and bob to become clean.
+  if state == dirty:
+    seek pool
+    if on pool:
+      # Bobbing ritual: step up, pause, step back, pause 2.
+      # `step (dx, dy)` is unguarded — if the target is off-grid or occupied,
+      # the animation degrades silently. Pool/trash rows are placed to keep
+      # this safe.
+      step (0, -1)
+      pause
+      step (0, 1)
+      pause 2
+      # Probabilistic extra bobs — gives the ritual variety so two coatis
+      # don't sync up visibly.
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      set state = clean
+      done
+
+  # State `clean`: try to place paint on a missing cell, else dump at pool.
+  if state == clean:
+    seek missing
+    if on missing:
+      draw green
+      set state = none
+      pause 4
+      done
+
+    # No missing cells exist — the clock is already converged. Dump the load
+    # at the pool instead of sitting on an arbitrary cell.
+    seek pool
+    if on pool:
+      step (0, -1)
+      pause
+      step (0, 1)
+      pause 2
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      set state = none
+      done
+
+  # Opportunistic: erase any extra (wrongly-lit) cells.
+  if extra:
+    seek extra
+    if on extra:
+      erase
+      set state = dirty
+      pause 4
+      done
+
+  # Empty-handed: go to trash to load up, then become dirty.
+  if missing:
+    seek trash
+    if on trash:
+      step (0, -1)
+      pause
+      step (0, 1)
+      pause 2
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      if random 50%:
+        step (0, -1)
+        pause
+        step (0, 1)
+        pause
+      set state = dirty
+      pause 4
+      done
+
+  # Nothing to do — amble around. `wander avoiding any` keeps coatis
+  # off occupied tiles, so the two don't crowd the same corner.
+  if random 10%:
+    wander avoiding any
+  pause 1-5
+  done

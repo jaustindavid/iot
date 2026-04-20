@@ -1,0 +1,74 @@
+# ants.crit: LOTS of 'em, squatting.
+#
+# Up to 80 ants spawn from the nest, find an intended cell, paint it, and
+# sit on it. Any ant on an unintended cell erases and retries. The effect
+# is a swarm that steadily covers the clock glyphs in grey.
+
+--- colors ---
+sand:     (64, 48, 0)   # nest landmark color
+ant:      (64, 64, 64)  # agent body color
+darkgrey: (1, 1, 1)     # the tint an ant paints when it settles
+
+--- landmarks ---
+nest: sand
+  (0, max_y)
+  (1, max_y)
+
+--- agents ---
+up to 80 ant
+
+--- spawning ---
+# One ant per 10 ticks (500ms at 50ms tick) while any intended cell is still
+# unlit. Stops spawning once convergence is reached.
+spawn ant at nest every 10 ticks when missing
+
+--- simulation ---
+# 50Hz physics — fast enough that 80 agents feel like a swarm rather than a
+# stop-motion animation. Render stays at 50Hz on hardware regardless.
+tick rate: 50ms
+
+--- pathfinding ---
+ant:
+  max nodes: 64            # small budget; ants are cheap and numerous
+  penalty lit cell: 50     # prefer routes through dark cells
+  penalty occupied cell: 20
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+ant:
+  # Already on a correct cell — just sit.
+  if on current:
+    pause
+    done
+
+  # Unlit intended cell underfoot — paint and sit.
+  if on missing:
+    draw darkgrey
+    pause
+    done
+
+  # There IS work to do somewhere; wipe whatever we were on and go find it.
+  # The timeout form is what makes this line yield when pathfinding can't
+  # reach the target in 20 ticks, which keeps a stuck ant from starving
+  # others in the tick budget.
+  if missing:
+    erase
+    seek missing timeout 20
+    done
+
+  # Traffic jam: another ant is on this cell. Head home.
+  if on ant:
+    seek nest timeout 60
+
+  # Stray ink somewhere else — clean up what we're standing on if it's part
+  # of the problem.
+  if on extra:
+    erase
+
+  # No work left; return to nest and despawn so the population drains.
+  seek nest timeout 60
+  if on nest:
+    despawn
+
+  done

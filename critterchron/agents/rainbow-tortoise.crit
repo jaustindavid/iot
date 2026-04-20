@@ -1,0 +1,41 @@
+# tortoise.crit: Methodical maintenance
+--- colors ---
+tortoise: (64, 48, 0)
+green: (0, 255, 0)
+red: (255, 0, 0)
+blue: (0, 0, 255)
+rainbow: cycle red 2, green 2, blue 2
+
+--- agents ---
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+all:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.5
+
+--- behavior ---
+tortoise:
+  if extra:
+    set color = rainbow
+    seek nearest extra
+    set color = tortoise
+    if standing on extra:
+      erase
+      pause 2
+      done
+
+  seek nearest missing
+  if standing on missing:
+    draw green
+    pause 2
+    done
+
+  pause 3-5
+  wander avoiding current
+  done

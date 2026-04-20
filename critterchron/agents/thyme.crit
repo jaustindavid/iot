@@ -1,0 +1,108 @@
+# thyme.crit: Predator and Prey logic.
+#
+# Aphids paint the clock (green tiles on intended cells). A ladybug roams
+# and eats aphids, with rules that tune how destructive she is based on
+# whether the aphid is on a correct cell, a wrong cell, or a not-yet-lit
+# cell.
+#
+# The aim is a low-key, animate clock face: aphids drift in, paint, the
+# ladybug keeps their population in check, the display converges.
+
+--- colors ---
+red:     (255, 0, 0)    # unused — ladybug's color comes from the `ladybug` entry below
+leaf:    (0, 128, 0)    # the tint an aphid paints
+brightleaf:   (8, 160, 8)  # agent body color
+aphid: cycle leaf 20, brightleaf 5
+ladybug: (255, 0, 0)    # agent body color
+black:   (0, 0, 0)      # nest landmark color (invisible background)
+
+--- landmarks ---
+nest: black
+  (0, max_y)
+
+--- agents ---
+up to 16 aphid
+ladybug: state {starting, running}
+ladybug starts at (max_x,0), state = running
+
+--- spawning ---
+spawn aphid at nest every 10 ticks when missing
+
+--- simulation ---
+tick rate: 125ms
+
+--- pathfinding ---
+aphid:
+  max nodes: 32
+  step rate: 3    # third speed — aphids feel slow and squatting
+
+ladybug:
+  max nodes: 256
+  step rate: 2    # 50% faster than aphids; predator outpaces prey
+  diagonal: allowed
+  diagonal_cost: 1.414
+  penalty lit cell: 1.5        # prefer dark lanes — less disruptive
+  penalty occupied cell: 3
+
+--- behavior ---
+aphid:
+  # If there's a wrong cell, eat it.
+  if extra:
+    seek nearest extra
+    if standing on extra:
+      pause 5
+      erase
+      done
+
+  # Otherwise paint an intended cell.
+  if missing:
+    seek nearest missing
+    if standing on missing:
+      draw leaf
+      pause 6
+      done
+
+  # Nothing needed — park on a correct cell so the ladybug has to work for
+  # the kill (see the `seek aphid on current` branch below).
+  seek current
+  pause 10
+  done
+
+ladybug:
+  # `starting` is used once at boot to hold off for 30s, giving aphids a
+  # head-start so the clock paints before the predator arrives.
+  if state == starting:
+    pause 240  # 30 secs
+    set state = running
+
+  # Priority 1: aphid on a wrong cell — fully destructive, erase the tile
+  # and the aphid in one strike. Cheap kill.
+  seek aphid on extra
+  if on aphid:
+    despawn aphid
+    erase
+    pause 3
+    done
+
+  # Priority 2: aphid on a not-yet-lit cell (missing or blank). Kill the
+  # aphid; erase to undo any paint-in-progress. Short cooldown.
+  seek aphid not on current
+  if on aphid:
+    despawn aphid
+    erase
+    pause 12  # 1.5 secs
+    done
+
+  # Priority 3: aphid sitting on a correct cell. Killing this one costs the
+  # clock a correct pixel, so cooldown is long (1 minute) — the ladybug
+  # pays for the regression.
+  seek aphid on current
+  if on aphid:
+    despawn aphid
+    pause 240  # 1 minute
+    done
+
+  # Nothing in range. Drift.
+  wander
+  pause 16  # 2 secs
+  done

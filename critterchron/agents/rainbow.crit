@@ -1,0 +1,17 @@
+# rainbow.crit — sit-in-place agent cycling red→green→blue
+--- colors ---
+red:     (255, 0, 0)
+green:   (0, 255, 0)
+blue:    (0, 0, 255)
+rainbow: cycle red 2, green 2, blue 2
+bug:     (128, 128, 128)
+--- agents ---
+bug: state {none}
+bug starts at (8, 4)
+--- simulation ---
+tick rate: 100ms
+--- behavior ---
+bug:
+  set color = rainbow
+  pause 10
+  done

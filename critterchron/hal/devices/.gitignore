@@ -1,0 +1,5 @@
+# Ignore all header files
+*.h
+
+# But do not ignore device_name.h
+!device_name.h

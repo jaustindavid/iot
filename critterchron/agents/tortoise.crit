@@ -1,0 +1,52 @@
+# tortoise.crit: Methodical maintenance
+#
+# Simplest painter script: one agent walks the grid, turning unintended-lit
+# cells off (`extra`) and intended-unlit cells on (`missing`). Slow tick
+# rate (500ms) makes the motion legible; the default `draw green` is the
+# only color the agent ever uses.
+
+--- colors ---
+tortoise: (64, 48, 0)   # agent body color
+green:    (0, 255, 0)   # painted-tile color used by `draw green`
+
+--- agents ---
+# No `up to N` or `state {}` — the agent type is auto-registered by its
+# `starts at`. No explicit color block entry needed here either; the
+# `colors` table already names `tortoise`.
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+# `all:` is the fallback block applied to every agent type unless overridden.
+# For a single-agent script you could equally write `tortoise:`; using
+# `all:` is just idiomatic when the settings are type-agnostic.
+all:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.5
+
+--- behavior ---
+tortoise:
+  # Priority 1: erase any wrongly-lit cell.
+  seek nearest extra
+  if standing on extra:
+    erase
+    pause 2
+    done
+
+  # Priority 2: paint any unlit intended cell.
+  seek nearest missing
+  if standing on missing:
+    draw green
+    pause 2
+    done
+
+  # Idle: slow drift so convergence failures are visible as motion.
+  # `wander avoiding current` keeps the tortoise off cells that are
+  # already correct, so it's more likely to bump into work.
+  pause 3-5
+  wander avoiding current
+  done

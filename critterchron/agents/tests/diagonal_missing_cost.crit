@@ -1,0 +1,23 @@
+# diagonal_missing_cost.crit: `diagonal: allowed` without an explicit
+# `diagonal_cost:` should be rejected (both-or-neither rule).
+--- colors ---
+tortoise: (64, 48, 0)
+green: (0, 255, 0)
+
+--- agents ---
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+diagonal: allowed
+
+all:
+  max nodes: 256
+  step rate: 1
+
+--- behavior ---
+tortoise:
+  pause 3
+  done

@@ -1,0 +1,29 @@
+# ok_diagonal.crit: minimal script using `diagonal: allowed` + `diagonal_cost`.
+# Proves the pathfinding both-or-neither rule accepts the "both" case.
+--- colors ---
+tortoise: (64, 48, 0)
+green: (0, 255, 0)
+
+--- agents ---
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+diagonal: allowed
+diagonal_cost: 1.5
+
+all:
+  max nodes: 256
+  step rate: 1
+
+--- behavior ---
+tortoise:
+  seek nearest missing
+  if standing on missing:
+    draw green
+    pause 2
+    done
+  pause 3
+  done

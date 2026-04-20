@@ -1,0 +1,9 @@
+# Everything under src/ is generated at build time by the Makefile — the
+# engine + interfaces come from hal/, the Particle shims come from
+# hal/particle/src/, creds.h comes from hal/devices/<device>.h, and the
+# IR header is emitted by hal/ir/ir_encoder.py. Nothing here should be
+# edited directly; edit the canonical source in one of those directories.
+src/
+
+# Particle build artifacts
+*.bin

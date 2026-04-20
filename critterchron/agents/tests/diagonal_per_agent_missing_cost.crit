@@ -1,0 +1,22 @@
+# diagonal_per_agent_missing_cost.crit: `diagonal: allowed` inside a
+# per-agent block without a matching `diagonal_cost:` must be rejected —
+# the both-or-neither rule applies at the per-agent scope too.
+--- colors ---
+hare: (200, 160, 120)
+green: (0, 255, 0)
+
+--- agents ---
+hare starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+hare:
+  diagonal: allowed
+  max nodes: 256
+
+--- behavior ---
+hare:
+  pause 3
+  done

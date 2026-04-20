@@ -1,0 +1,22 @@
+# unknown_instruction_bare_state.crit: `state = running` is not a recognized
+# opcode — the correct form is `set state = running`. Without the `set`
+# prefix the interpreter silently falls through, which in the wild caused a
+# guarded startup pause to re-fire every loop iteration because the state
+# flag never flipped. Compiler must reject unrecognized instructions.
+--- colors ---
+ladybug: (255, 0, 0)
+
+--- agents ---
+ladybug: state {starting, running}
+ladybug starts at (0,0), state = starting
+
+--- simulation ---
+tick rate: 500ms
+
+--- behavior ---
+ladybug:
+  if state == starting:
+    pause 5
+    state = running
+  pause 1
+  done

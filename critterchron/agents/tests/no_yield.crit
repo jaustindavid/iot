@@ -1,0 +1,78 @@
+# thyme.crit: Predator and Prey logic
+--- colors ---
+red: (255, 0, 0)
+leaf: (16, 196, 16)
+aphid: (0, 255, 0)
+ladybug: (255, 0, 0)
+black: (0, 0, 0)
+
+--- landmarks ---
+nest: black
+  (0, max_y)
+
+--- agents ---
+up to 8 aphid
+# ladybug starts at (0,0)
+ladybug starts at (max_x,0)
+
+--- spawning ---
+spawn aphid at nest every 10 ticks when missing
+
+--- simulation ---
+tick rate: 250ms
+
+--- pathfinding ---
+aphid:
+  max nodes: 32
+  step rate: 3 # third speed
+
+ladybug:
+  max nodes: 256
+  step rate: 2 # Full speed
+
+--- behavior ---
+aphid:
+  if extra:
+    seek nearest extra
+    if standing on extra:
+      pause 5
+      erase
+    done
+
+  if missing:
+    seek nearest missing
+    if standing on missing:
+      draw leaf
+      pause 6
+    done
+
+  seek current
+  pause 10
+  done
+
+ladybug:
+  seek aphid on extra
+  if on aphid:
+    despawn aphid
+    erase
+    pause 3
+    done
+  
+  seek aphid not on current
+  if on aphid:
+    despawn aphid
+    erase
+    pause 3
+    done
+
+  seek aphid on current
+  if on aphid:
+    despawn aphid
+    pause 240 # 1 minute
+    done
+  
+  # The compiler rejects this file: if all three `seek`s find nothing and
+  # all three `if on aphid` branches are false, control reaches this final
+  # `done` without any yield — `_validate_loops` flags it and prints the
+  # instruction trace leading here.
+  done
