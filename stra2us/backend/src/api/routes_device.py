@@ -1,20 +1,43 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from core.redis_client import get_redis_client
+from core.security import sign_payload
 import msgpack
 from .dependencies import verify_device_request, check_acl
 import time
 
 router = APIRouter()
 
-class MsgPackResponse(Response):
-    media_type = "application/x-msgpack"
+MSGPACK_MT = "application/x-msgpack"
 
-    def render(self, content: any) -> bytes:
-        return msgpack.packb(content)
+def signed_response(context: dict, request: Request, body: bytes,
+                    status_code: int = 200,
+                    media_type: str = MSGPACK_MT) -> Response:
+    """Wrap `body` in a Response and attach X-Response-{Timestamp,Signature}.
 
-@router.post("/q/{topic}", response_class=MsgPackResponse)
+    Signature layout matches the request direction: HMAC-SHA256 over
+    `URI + body + timestamp`, keyed by the requesting client's shared secret.
+    A client that already holds its own secret can verify without any new
+    key material. Empty-body responses (e.g. 204) still get signed over the
+    URI + empty-bytes + timestamp so the caller can trust the status line.
+    """
+    ts = int(time.time())
+    uri = str(request.url.path)
+    sig = sign_payload(context["secret_hex"], uri, body, ts)
+    headers = {
+        "X-Response-Timestamp": str(ts),
+        "X-Response-Signature": sig,
+    }
+    return Response(content=body, status_code=status_code,
+                    media_type=media_type, headers=headers)
+
+def signed_msgpack(context: dict, request: Request, obj,
+                   status_code: int = 200) -> Response:
+    return signed_response(context, request, msgpack.packb(obj),
+                           status_code=status_code)
+
+@router.post("/q/{topic}")
 async def publish_message(
-    topic: str, 
+    topic: str,
     request: Request,
     ttl: int = 3600,
     context: dict = Depends(verify_device_request)
@@ -53,11 +76,12 @@ async def publish_message(
     # Global TTL to prevent abandoned topic memory leaks
     await redis.expire(f"q:{topic}", 604800)
 
-    return {"status": "ok"}
+    return signed_msgpack(context, request, {"status": "ok"})
 
-@router.get("/q/{topic}", response_class=MsgPackResponse)
+@router.get("/q/{topic}")
 async def consume_message(
     topic: str,
+    request: Request,
     envelope: bool = False,
     context: dict = Depends(verify_device_request)
 ):
@@ -84,7 +108,7 @@ async def consume_message(
         messages = await redis.xread({f"q:{topic}": last_id}, count=50)
 
         if not messages:
-            return Response(status_code=204)
+            return signed_response(context, request, b"", status_code=204)
 
         stream_name, records = messages[0]
 
@@ -98,7 +122,7 @@ async def consume_message(
                 raw_payload = fields[b"payload"]
 
                 if not envelope:
-                    return Response(content=raw_payload, media_type="application/x-msgpack")
+                    return signed_response(context, request, raw_payload)
 
                 # --- Envelope mode ---
                 # Decode the stored payload so it becomes the `data` field value
@@ -120,14 +144,14 @@ async def consume_message(
                     "client_id": publisher_id,
                     "received_at": received_at,
                 }, use_bin_type=True)
-                return Response(content=wrapped, media_type="application/x-msgpack")
+                return signed_response(context, request, wrapped)
 
         # advance cursor and keep polling if all current batch were expired
         await redis.set(cursor_key, last_id)
 
-@router.post("/kv/{key:path}", response_class=MsgPackResponse)
+@router.post("/kv/{key:path}")
 async def write_kv(
-    key: str, 
+    key: str,
     request: Request,
     context: dict = Depends(verify_device_request)
 ):
@@ -150,11 +174,12 @@ async def write_kv(
     redis = get_redis_client()
     await redis.set(f"kv:{key}", body)
 
-    return {"status": "ok"}
+    return signed_msgpack(context, request, {"status": "ok"})
 
-@router.get("/kv/{key:path}", response_class=MsgPackResponse)
+@router.get("/kv/{key:path}")
 async def read_kv(
     key: str,
+    request: Request,
     context: dict = Depends(verify_device_request)
 ):
     await check_acl(context, f"kv/{key}", mode="read")
@@ -162,6 +187,6 @@ async def read_kv(
     val = await redis.get(f"kv:{key}")
 
     if val is None:
-        return {"status": "not_found"}
-        
-    return Response(content=val, media_type="application/x-msgpack")
+        return signed_msgpack(context, request, {"status": "not_found"})
+
+    return signed_response(context, request, val)

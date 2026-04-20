@@ -43,6 +43,7 @@ async def verify_device_request(
 
     return {
         "client_id": client_id,
+        "secret_hex": secret_hex,
         "acl": acl
     }
 
