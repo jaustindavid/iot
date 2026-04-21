@@ -2,7 +2,7 @@ import re
 import sys
 import json
 
-IR_VERSION = 1
+IR_VERSION = 4
 
 # Tile-predicate tokens that can appear after `if on` / `seek [nearest]`.
 # These are NOT landmark or agent names — they describe cell state.
@@ -10,13 +10,31 @@ _TILE_PREDICATES = {"current", "extra", "missing"}
 
 
 class CritCompiler:
-    def __init__(self, width=16, height=16):
+    def __init__(self, width=16, height=16, preserve_symbolic_coords=False):
         self.width = width
         self.height = height
+        # When True, landmark points and initial-agent positions that
+        # reference max_x/max_y are kept as symbolic strings (e.g.
+        # "max_x-1") in the IR dict instead of being resolved to integers.
+        # Used by publish_ir so the on-device parser resolves against the
+        # target's real geometry at load time — one blob, any device.
+        # Compile-time paths (ir_encoder building a device-specific header)
+        # stay with the default and get integers.
+        self.preserve_symbolic_coords = preserve_symbolic_coords
         self.ir = {
             "ir_version": IR_VERSION,
             "simulation": {"tick_rate": 500},
             "colors": {},
+            # Sparse night-mode palette. Populated only when a `--- colors ---`
+            # section contains a `night:` child block. Each entry is a tuple
+            # (literal RGB) or a string (name reference resolved via the day
+            # colors table). When empty, night mode is a no-op — old blobs
+            # behave exactly as they did before the feature existed.
+            "night_colors": {},
+            # Optional fallback color for agents/landmarks not listed in
+            # night_colors. Tuple or name reference. None = unlisted colors
+            # stay at their day value at night (the user's chosen default).
+            "night_default": None,
             "landmarks": {},
             "agents": {},
             "behaviors": {},
@@ -29,9 +47,47 @@ class CritCompiler:
             },
         }
 
+    def _parse_coord(self, raw, axis_max):
+        """Parse one axis token: int, "max_x[-N]", or "max_y[-N]".
+
+        Returns a cleaned symbolic string when preserve_symbolic_coords
+        is on and the token references max_x/max_y; otherwise returns
+        an int resolved against `axis_max` (the grid's max index on this
+        axis, i.e. width-1 or height-1).
+        """
+        s = raw.strip()
+        has_symbol = ('max_x' in s) or ('max_y' in s)
+        if self.preserve_symbolic_coords and has_symbol:
+            return ''.join(s.split())
+        t = s.replace('max_x', str(axis_max)).replace('max_y', str(axis_max))
+        return int(eval(t))
+
+    def _parse_point(self, raw):
+        """Parse a `(x, y)` or `x, y` coordinate pair. Returns (x, y)
+        where each entry is either int or symbolic str per `_parse_coord`.
+        """
+        s = raw.strip()
+        if s.startswith('('):
+            s = s[1:]
+        if s.endswith(')'):
+            s = s[:-1]
+        xs, ys = s.split(',', 1)
+        return (self._parse_coord(xs, self.width - 1),
+                self._parse_coord(ys, self.height - 1))
+
     def compile(self, file_path):
         with open(file_path, 'r') as f:
             content = f.read()
+
+        # Tabs are banned: whitespace-sensitive sections (behavior indent,
+        # landmark indent) need deterministic column math, and mixing tabs
+        # with spaces silently shifts the parsed indent.
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            if '\t' in line:
+                raise ValueError(
+                    f"Compilation Failed: tab character on line {lineno}. "
+                    f"Indent .crit files with spaces only."
+                )
 
         # Split by sections, ignoring the header/comment block
         sections = re.split(r'--- (.*?) ---', content)
@@ -44,10 +100,12 @@ class CritCompiler:
         # Post-passes run after all sections are parsed, so that name
         # resolution has the full landmark + agent declaration set in
         # scope.
+        self._validate_name_collisions()
         self._resolve_names_in_behaviors()
         self._validate_instructions()
         self._validate_pathfinding()
         self._validate_loops()
+        self._validate_night_palette()
 
         # Validate agent colors
         for agent_name in self.ir["agents"]:
@@ -72,44 +130,7 @@ class CritCompiler:
                     self.ir["simulation"]["tick_rate"] = int(val)
 
         elif header == "colors":
-            for line in lines:
-                line = line.strip()
-                name, val = line.split(':', 1)
-                val = val.strip()
-                name = name.strip()
-                if val.startswith('cycle '):
-                    # cycle red 2, green 2, blue 2 — entries are (color_name, render_frames)
-                    entries = []
-                    for part in val[len('cycle '):].split(','):
-                        toks = part.strip().split()
-                        if len(toks) < 2:
-                            raise ValueError(
-                                f"Compilation Failed: cycle color {name!r} "
-                                f"entry {part.strip()!r} needs a color name "
-                                f"and a frame count."
-                            )
-                        if len(toks) > 2:
-                            # Almost always a missing comma between entries —
-                            # silently taking toks[0:2] here would paint the
-                            # wrong color on hardware with no explanation.
-                            raise ValueError(
-                                f"Compilation Failed: cycle color {name!r} "
-                                f"entry {part.strip()!r} has extra tokens — "
-                                f"did you forget commas between entries? "
-                                f"Expected: 'cycle red 2, green 2, blue 2'."
-                            )
-                        try:
-                            frames = int(toks[1])
-                        except ValueError:
-                            raise ValueError(
-                                f"Compilation Failed: cycle color {name!r} "
-                                f"entry {part.strip()!r}: frame count "
-                                f"{toks[1]!r} is not an integer."
-                            )
-                        entries.append((toks[0], frames))
-                    self.ir["colors"][name] = {"kind": "cycle", "entries": entries}
-                else:
-                    self.ir["colors"][name] = eval(val)
+            self._parse_colors_section(lines)
 
         elif header == "landmarks":
             current_landmark = None
@@ -120,13 +141,11 @@ class CritCompiler:
                     current_landmark = name.strip()
                     self.ir["landmarks"][current_landmark] = {"color": color.strip(), "points": []}
                 elif current_landmark:
-                    # Resolve max_x/max_y into actual grid coordinates
-                    raw_point = line.strip().replace('max_x', str(self.width - 1))
-                    raw_point = raw_point.replace('max_y', str(self.height - 1))
                     try:
-                        self.ir["landmarks"][current_landmark]["points"].append(eval(raw_point))
-                    except:
-                        pass
+                        pt = self._parse_point(line.strip())
+                    except Exception:
+                        continue
+                    self.ir["landmarks"][current_landmark]["points"].append(pt)
 
         elif header == "agents":
             for line in lines:
@@ -144,26 +163,43 @@ class CritCompiler:
                     states = [s.strip() for s in state_match.group(1).split(',')]
                     self.ir["agents"][agent_name]["states"] = states
                     
-                starts_match = re.search(r'(\w+)\s+starts at\s+\((.*?)\)(?:,\s*state\s*=\s*(\w+))?', line)
+                starts_match = re.search(
+                    r'(\w+)\s+starts at\s+(\(([^)]*)\)|(\w+))'
+                    r'(?:\s*,\s*state\s*=\s*(\w+))?',
+                    line
+                )
                 if starts_match:
-                    agent_name, coords_str, state_val = starts_match.groups()
-                    raw_point = coords_str.replace('max_x', str(self.width - 1))
-                    raw_point = raw_point.replace('max_y', str(self.height - 1))
-                    try:
-                        pos = list(eval(f"({raw_point})"))
-                        # Auto-register the type if `starts at` is the only
-                        # mention. tortoise.crit has no `up to N` or `state {}`
-                        # line — without this, AGENT_TYPES would be empty and
-                        # the C++ engine would index into a 0-element array.
-                        if agent_name not in self.ir["agents"]:
-                            self.ir["agents"][agent_name] = {"limit": 0, "states": []}
-                        self.ir["initial_agents"].append({
-                            "name": agent_name,
-                            "pos": pos,
-                            "state": state_val or "none"
-                        })
-                    except:
-                        pass
+                    agent_name = starts_match.group(1)
+                    coords_str = starts_match.group(3)
+                    landmark_name = starts_match.group(4)
+                    state_val = starts_match.group(5)
+                    if coords_str is not None:
+                        try:
+                            pos = list(self._parse_point(coords_str))
+                        except Exception:
+                            continue
+                    else:
+                        lm = self.ir["landmarks"].get(landmark_name)
+                        if lm is None or not lm.get("points"):
+                            raise ValueError(
+                                f"Compilation Failed: agent {agent_name!r} "
+                                f"has 'starts at {landmark_name}', but "
+                                f"{landmark_name!r} is not a defined landmark "
+                                f"with at least one point. Declare the "
+                                f"landmarks section before agents."
+                            )
+                        pos = list(lm["points"][0])
+                    # Auto-register the type if `starts at` is the only
+                    # mention. tortoise.crit has no `up to N` or `state {}`
+                    # line — without this, AGENT_TYPES would be empty and
+                    # the C++ engine would index into a 0-element array.
+                    if agent_name not in self.ir["agents"]:
+                        self.ir["agents"][agent_name] = {"limit": 0, "states": []}
+                    self.ir["initial_agents"].append({
+                        "name": agent_name,
+                        "pos": pos,
+                        "state": state_val or "none"
+                    })
 
         elif header == "behavior":
             current_agent = None
@@ -200,6 +236,124 @@ class CritCompiler:
 
         elif header == "pathfinding":
             self._parse_pathfinding_section(lines)
+
+    def _parse_colors_section(self, lines):
+        """Parse the `--- colors ---` section, including the optional nested
+        `night:` child block.
+
+        Top level: `name: <value>` where value is an RGB tuple literal or a
+        `cycle ...` directive (same as before).
+
+        Nested `night:` block (no value after the colon, followed by indented
+        entries):
+            night:
+              <name>:   <value>        # overrides day color for this agent
+              default:  <value>        # fallback for unlisted colors
+        Night entries additionally accept a bare name reference (e.g.
+        `doozer: warmwhite`), which resolves through the day palette at
+        color-lookup time. `night` and `default` are reserved identifiers
+        inside the colors section — `night` can't be a top-level color
+        (it's the block marker), `default` is reserved only inside the
+        night block."""
+        in_night = False
+        for raw in lines:
+            stripped = raw.strip()
+            # filter already dropped blanks/comment-onlys, but we still need
+            # to strip trailing inline comments — the interpreter never sees
+            # color lines, but eval() would choke on `(255,0,0) # red`.
+            if '#' in stripped:
+                stripped = stripped.split('#', 1)[0].rstrip()
+            if not stripped:
+                continue
+            indent = len(raw) - len(raw.lstrip())
+
+            name, sep, val = stripped.partition(':')
+            if not sep:
+                raise ValueError(
+                    f"Compilation Failed: color line {stripped!r} is missing ':'."
+                )
+            name = name.strip()
+            val = val.strip()
+
+            if indent == 0:
+                in_night = False  # leaving any previous nested block
+                if name == "night":
+                    if val:
+                        raise ValueError(
+                            "Compilation Failed: 'night' is a reserved block "
+                            "marker in the colors section and cannot also be "
+                            "a color name. Remove the value, or rename the "
+                            "color."
+                        )
+                    in_night = True
+                    continue
+                self.ir["colors"][name] = self._parse_color_value(
+                    name, val, allow_name_ref=False,
+                )
+            else:
+                if not in_night:
+                    raise ValueError(
+                        f"Compilation Failed: indented color entry "
+                        f"{stripped!r} is not inside a recognized nested "
+                        f"block. Only 'night:' introduces a nested block "
+                        f"in the colors section."
+                    )
+                parsed = self._parse_color_value(
+                    name, val, allow_name_ref=True,
+                )
+                if name == "default":
+                    self.ir["night_default"] = parsed
+                else:
+                    self.ir["night_colors"][name] = parsed
+
+    def _parse_color_value(self, name, val, allow_name_ref):
+        """Parse the right-hand side of a color entry.
+
+        Accepts:
+          - `(r, g, b)` tuple literal
+          - `cycle <name> <frames>, <name> <frames>, ...`
+          - a bare identifier (name reference) iff allow_name_ref
+
+        `name` is passed only for error messages."""
+        if val.startswith('cycle '):
+            entries = []
+            for part in val[len('cycle '):].split(','):
+                toks = part.strip().split()
+                if len(toks) < 2:
+                    raise ValueError(
+                        f"Compilation Failed: cycle color {name!r} "
+                        f"entry {part.strip()!r} needs a color name "
+                        f"and a frame count."
+                    )
+                if len(toks) > 2:
+                    # Almost always a missing comma between entries —
+                    # silently taking toks[0:2] here would paint the
+                    # wrong color on hardware with no explanation.
+                    raise ValueError(
+                        f"Compilation Failed: cycle color {name!r} "
+                        f"entry {part.strip()!r} has extra tokens — "
+                        f"did you forget commas between entries? "
+                        f"Expected: 'cycle red 2, green 2, blue 2'."
+                    )
+                try:
+                    frames = int(toks[1])
+                except ValueError:
+                    raise ValueError(
+                        f"Compilation Failed: cycle color {name!r} "
+                        f"entry {part.strip()!r}: frame count "
+                        f"{toks[1]!r} is not an integer."
+                    )
+                entries.append((toks[0], frames))
+            return {"kind": "cycle", "entries": entries}
+        if val.startswith('('):
+            return eval(val)
+        if allow_name_ref and re.fullmatch(r'\w+', val):
+            return val
+        raise ValueError(
+            f"Compilation Failed: color {name!r} value {val!r} is not a "
+            f"tuple literal, a cycle, or "
+            f"{'a color name reference' if allow_name_ref else 'a recognized form'}."
+        )
 
     # Map authored pathfinding keys (as they appear in .crit source) to the
     # canonical IR key names used by the engine. Keep spelling stable — the
@@ -314,6 +468,32 @@ class CritCompiler:
                 f"but 'diagonal' is not 'allowed' \u2014 author intent is ambiguous."
             )
 
+    def _validate_name_collisions(self):
+        """Reject name reuse across landmarks vs agents and landmarks vs
+        colors. Color/agent same-name is *required* (every agent must have
+        a color of its own name for default rendering), so we don't check
+        that pair. A shared *color* name across a non-self agent is still
+        allowed — if the author wants `bricks` color used by `doozer`
+        agent, that's fine — but they must avoid picking a color name that
+        matches a *different* agent's name (unusual; left as future work)."""
+        colors = set(self.ir["colors"].keys())
+        landmarks = set(self.ir["landmarks"].keys())
+        agents = set(self.ir["agents"].keys())
+        for ia in self.ir["initial_agents"]:
+            agents.add(ia["name"])
+        pairs = (
+            ("color", colors, "landmark", landmarks),
+            ("landmark", landmarks, "agent", agents),
+        )
+        for kind_a, set_a, kind_b, set_b in pairs:
+            overlap = sorted(set_a & set_b)
+            if overlap:
+                raise ValueError(
+                    f"Compilation Failed: name {overlap[0]!r} is declared "
+                    f"as both a {kind_a} and a {kind_b}. Pick distinct "
+                    f"names."
+                )
+
     def _resolve_names_in_behaviors(self):
         """Rewrite bare names in `if on` / `seek` instructions into disambiguated
         `landmark <name>` or `agent <name>` forms. Tile predicates
@@ -322,6 +502,7 @@ class CritCompiler:
 
         landmarks = set(self.ir["landmarks"].keys())
         agents = set(self.ir["agents"].keys())
+        colors = set(self.ir["colors"].keys())
         for ia in self.ir["initial_agents"]:
             agents.add(ia["name"])
         agents |= set(self.ir["behaviors"].keys())
@@ -370,15 +551,24 @@ class CritCompiler:
                 m = if_standing_re.match(body)
                 if m:
                     prefix, name, rest = m.group(1), m.group(2), m.group(3) or ''
-                    if name in _TILE_PREDICATES:
+                    if (name in _TILE_PREDICATES
+                            or name in ("landmark", "color")):
                         continue
-                    raise ValueError(
-                        f"Compilation Failed: 'if standing on {name}' \u2014 "
-                        f"'standing on' only accepts tile predicates "
-                        f"({', '.join(sorted(_TILE_PREDICATES))}). "
-                        f"For agent/landmark proximity use 'if on {name}'. "
-                        f"Instruction: {inst!r}"
+                    if name in colors:
+                        kind = "color"
+                    elif name in landmarks:
+                        kind = "landmark"
+                    else:
+                        raise ValueError(
+                            f"Compilation Failed: 'if standing on {name}' \u2014 "
+                            f"{name!r} is not a tile predicate "
+                            f"({', '.join(sorted(_TILE_PREDICATES))}), "
+                            f"color, or landmark. Instruction: {inst!r}"
+                        )
+                    insts[idx] = (
+                        indent, f"{prefix}{kind} {name}{rest}{colon}"
                     )
+                    continue
 
                 m = if_exist_re.match(body)
                 if m:
@@ -428,7 +618,6 @@ class CritCompiler:
     # of `set state = running` firing a guarded startup pause every loop).
     _OPCODE_PATTERNS = [
         re.compile(r'if\s+.+:'),
-        re.compile(r'else:'),
         re.compile(r'done'),
         re.compile(r'set\s+state\s*=\s*\w+'),
         re.compile(r'set\s+color\s*=\s*\w+'),
@@ -440,6 +629,7 @@ class CritCompiler:
         re.compile(r'step\s*\(\s*-?\d+\s*,\s*-?\d+\s*\)'),
         re.compile(
             r'seek(\s+nearest)?(\s+(agent|landmark))?\s+\w+'
+            r'(\s+with\s+state\s*==\s*\w+)?'
             r'(\s+(not\s+)?on\s+\w+)?(\s+timeout\s+\d+)?'
         ),
     ]
@@ -447,6 +637,20 @@ class CritCompiler:
     def _validate_instructions(self):
         for agent, insts in self.ir.get("behaviors", {}).items():
             for indent, inst in insts:
+                if inst == "else:":
+                    # `else:` looks like Python but the runtime only treats it
+                    # as a "finished the true branch, skip my body" marker —
+                    # the false branch of the preceding `if` skips everything
+                    # at higher indent, including the else body. So code under
+                    # `else:` is effectively dead. Reject outright and point
+                    # the author at the idiomatic rewrite.
+                    raise ValueError(
+                        f"Compilation Failed: `else:` is not supported in "
+                        f"agent {agent!r}. The false branch of an `if` already "
+                        f"skips to the next instruction at the if's indent — "
+                        f"put fallback code there (or use a separate `if` "
+                        f"block), not under `else:`."
+                    )
                 if any(p.fullmatch(inst) for p in self._OPCODE_PATTERNS):
                     continue
                 raise ValueError(
@@ -536,6 +740,69 @@ class CritCompiler:
                     f"that can fall off the bottom of its behavior block without "
                     f"hitting a 'done' or bare 'despawn'."
                 )
+
+    def _validate_night_palette(self):
+        """Cross-check the night palette against the day palette.
+
+        Every night override must target a day color that actually exists,
+        and every name-ref or cycle sub-entry inside a night value must
+        resolve to a real day color. The HAL IR loader already enforces
+        this at device boot — if we don't catch it here, a stray name
+        (e.g. `landed:` with no corresponding day color) silently passes
+        the Python sim, then bricks a freshly-OTA'd device when the blob
+        fails to load and `begin()` returns false. Fail at compile time
+        instead so the error surfaces on the laptop, not in the field.
+        """
+        day = self.ir.get("colors", {})
+
+        def _check_ref_target(target, where):
+            if target not in day:
+                raise ValueError(
+                    f"Compilation Failed: {where} references day color "
+                    f"{target!r}, which is not defined in the day "
+                    f"palette. Known day colors: "
+                    f"{', '.join(sorted(day)) or '(none)'}."
+                )
+
+        def _check_value(val, where):
+            # Tuple RGB — always OK.
+            if isinstance(val, tuple):
+                return
+            # Bare name ref.
+            if isinstance(val, str):
+                _check_ref_target(val, where)
+                return
+            # Cycle dict — every sub-entry color name must be a day color.
+            if isinstance(val, dict) and val.get("kind") == "cycle":
+                for sub_name, _frames in val.get("entries", []):
+                    _check_ref_target(sub_name, f"{where} cycle entry")
+                return
+            # Anything else is an internal parse bug, not a user error —
+            # the colors-section parser only emits the shapes above.
+            raise ValueError(
+                f"Compilation Failed: {where} has unexpected value "
+                f"shape {val!r} (internal parser error)."
+            )
+
+        for override_name, val in self.ir.get("night_colors", {}).items():
+            # The override must name a day color — this is the check
+            # that would have caught swarm.crit's `landed:` stray.
+            if override_name not in day:
+                raise ValueError(
+                    f"Compilation Failed: night override "
+                    f"{override_name!r} has no matching day color. "
+                    f"Each entry in the 'night:' block must override a "
+                    f"color declared at the top level of the colors "
+                    f"section. Known day colors: "
+                    f"{', '.join(sorted(day)) or '(none)'}. "
+                    f"Did you forget to add {override_name!r} to the "
+                    f"day palette, or mean a different name?"
+                )
+            _check_value(val, f"night override {override_name!r}")
+
+        night_default = self.ir.get("night_default")
+        if night_default is not None:
+            _check_value(night_default, "night default")
 
 
 if __name__ == "__main__":

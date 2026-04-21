@@ -58,6 +58,15 @@ def main():
     parser.add_argument("--height", type=int, default=16,
                         help="Grid height in tiles (default 16). Scripts that use "
                              "max_y resolve against this value.")
+    parser.add_argument("--trace", action="store_true",
+                        help="Print one line per instruction dispatched by any "
+                             "agent (tick, name#id, pos, state, pc, opcode). "
+                             "Firehose; pipe to grep for a specific agent.")
+    parser.add_argument("--night", action="store_true",
+                        help="Force night mode on. Engine resolves colors "
+                             "through the script's `night:` palette (if "
+                             "present) instead of the day palette. Blobs "
+                             "without a night palette are unaffected.")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -76,6 +85,8 @@ def main():
 
     # 2. Initialize Engine & Renderer
     engine = CritterEngine(ir, width=args.width, height=args.height)
+    engine.trace = args.trace
+    engine.night_mode = args.night
     renderer = None if args.headless else CritterRenderer(engine)
 
     dump_file = open(args.dump_state, "w") if args.dump_state else None

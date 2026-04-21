@@ -38,7 +38,9 @@ ENGINE_COPIES := \
 	$(SRC_DIR)/CritterEngine.cpp \
 	$(SRC_DIR)/interface/Config.h \
 	$(SRC_DIR)/interface/LedSink.h \
-	$(SRC_DIR)/interface/TimeSource.h
+	$(SRC_DIR)/interface/TimeSource.h \
+	$(SRC_DIR)/ir/IrRuntime.h \
+	$(SRC_DIR)/ir/IrRuntime.cpp
 
 PARTICLE_FILES  := $(notdir $(wildcard $(PARTICLE_SRC)/*))
 PARTICLE_COPIES := $(addprefix $(SRC_DIR)/,$(PARTICLE_FILES))
@@ -97,6 +99,10 @@ $(SRC_DIR)/interface/Config.h: $(HAL_ROOT)/interface/Config.h | $(SRC_DIR)/inter
 $(SRC_DIR)/interface/LedSink.h: $(HAL_ROOT)/interface/LedSink.h | $(SRC_DIR)/interface
 	cp $< $@
 $(SRC_DIR)/interface/TimeSource.h: $(HAL_ROOT)/interface/TimeSource.h | $(SRC_DIR)/interface
+	cp $< $@
+$(SRC_DIR)/ir/IrRuntime.h: $(HAL_ROOT)/ir/IrRuntime.h | $(SRC_DIR)/ir
+	cp $< $@
+$(SRC_DIR)/ir/IrRuntime.cpp: $(HAL_ROOT)/ir/IrRuntime.cpp | $(SRC_DIR)/ir
 	cp $< $@
 
 $(SRC_DIR)/%: $(PARTICLE_SRC)/% | $(SRC_DIR)

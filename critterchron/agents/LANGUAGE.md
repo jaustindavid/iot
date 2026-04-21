@@ -56,6 +56,26 @@ ignored (use it for a file header comment).
 Lines starting with `#` are comments. `#` mid-line also starts a comment in
 behavior blocks.
 
+Indent with spaces only. A tab anywhere in the file fails compilation with a
+line number — mixed indentation has bitten too many scripts.
+
+### Name spaces and collisions
+
+Colors, landmarks, and agent types share a flat namespace with one deliberate
+overlap:
+
+- **Agent name == color name is required.** Every agent type must have a
+  color of the same name; that's the default body color at spawn. This is
+  the *one* overlap the compiler demands.
+- **Landmark name == agent name is forbidden.** `if on <name>` /
+  `seek <name>` would be ambiguous.
+- **Landmark name == color name is forbidden.** `if standing on <name>`
+  would be ambiguous.
+
+Pick landmark names that aren't already colors or agents. If a pile-of-thing
+agent collides with its tile color (e.g. `brick` tiles and a `brick` agent),
+rename one — `bricks` plural for the pile reads naturally.
+
 ## Blocks
 
 ### `--- colors ---`
@@ -101,7 +121,12 @@ up to 8 aphid                         # type + population cap
 ladybug: state {starting, running}    # type + named states
 ladybug starts at (max_x, 0), state = running   # initial agent
 coati starts at (0, 0)                # type is auto-registered if novel
+ant starts at nest                    # spawn at a landmark point
 ```
+
+`starts at <landmark>` picks one point from the landmark's point set at seed
+time (deterministic under a fixed RNG seed). Use it to colocate initial
+agents with their home without duplicating coordinates.
 
 If an agent type appears only in `starts at` with no `up to` or `state {}`,
 it's auto-registered with limit 0 and no named states. `set state = X`
@@ -165,7 +190,7 @@ could spin forever in one tick.
 
 | Opcode                    | Effect                                                   |
 |---------------------------|----------------------------------------------------------|
-| `if <cond>:`              | See conditions below. `else:` for the false branch.      |
+| `if <cond>:`              | See conditions below. `else:` is not supported — put fallback code at the if's indent. |
 | `done`                    | End of this tick's execution; PC resets to 0.            |
 | `set state = <name>`      | Change named state (declared in `agents` block).         |
 | `set color = <name>`      | Rebind agent color; cycles start animating immediately.  |
@@ -209,6 +234,8 @@ seek [nearest] [agent|landmark] <name> [on <pred>|not on <pred>] [timeout N]
 | `if agent <name>`                    | Any other agent of that type exists.         |
 | `if landmark <name>`                 | Landmark is defined (compile-time constant). |
 | `if standing on <pred>`              | Same as `if on <pred>` but only for tile predicates. |
+| `if standing on <color>`             | Agent's cell is lit with that color (walks cycle entries for cycle colors). |
+| `if standing on landmark <name>`     | Alias for `if on landmark <name>`.           |
 
 Tile predicates: `current` (intended AND lit), `missing` (intended AND
 unlit), `extra` (unintended AND lit).
@@ -217,6 +244,9 @@ Bare names after `if on`, `if <name>`, `seek`, and `despawn` are resolved
 at compile time: if `<name>` is a landmark it becomes `if on landmark
 <name>`, if it's an agent type it becomes `if on agent <name>`. A name
 that's both is a compile error — disambiguate explicitly.
+
+`if on <name>` resolves agent/landmark first, so it never matches a bare
+color. Use `if standing on <color>` to test the tile's paint color.
 
 ## Runtime model
 
@@ -236,10 +266,21 @@ that's both is a compile error — disambiguate explicitly.
 
 The compiler rejects:
 
+- Tab characters anywhere in the source (spaces-only indentation).
 - Unknown opcodes (typos in `state = running` miss the leading `set`).
+- `else:` — not supported; put fallback code at the if's indent.
 - Paths through a behavior that can fall off the bottom without `done`.
 - Paths to `done` that never yield.
-- Agent names without a color.
+- Agent names without a color of the same name.
+- Landmark name colliding with an agent type or a color.
 - Ambiguous bare names (both a landmark and an agent type).
 - `diagonal`/`diagonal_cost` present without the other.
 - Cycle colors referencing unknown colors or empty cycle lists.
+
+## Versioning
+
+The compiler emits IR v3 (encoder `ir_encoder/2`). Devices refuse blobs with
+`ir_version` above what they support, so bumping IR_VERSION is the gate for
+any wire-breaking change. Wire format: body ends at a `END <fletcher16>`
+line; an optional `SOURCE <n>` trailer with the original `.crit` text lives
+after END, so devices parse up to END and skip the rest.

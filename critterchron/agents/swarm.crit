@@ -1,0 +1,54 @@
+# swarm.crit: /the locusts/
+
+--- colors ---
+leaf:    (0, 255, 0)
+locust:  (10, 196, 10)
+black:   (0, 0, 0)      # nest landmark color (invisible background)
+
+night:
+  leaf:    (0, 1, 0)
+  locust:  (0, 2, 0)
+
+--- landmarks ---
+nest: black
+  (0, max_y)
+
+--- agents ---
+up to 16 locust
+
+--- spawning ---
+spawn locust at nest every 2 ticks when missing
+
+--- simulation ---
+tick rate: 50ms
+
+--- pathfinding ---
+locust:
+  max nodes: 256
+  diagonal: allowed
+  diagonal_cost: 1.414
+  penalty lit cell: 1.5        # prefer dark lanes — less disruptive
+  penalty occupied cell: 5
+
+--- behavior ---
+locust:
+  # If there's a wrong cell, eat it.
+  if extra:
+    seek nearest extra
+    if standing on extra:
+      pause 5
+      erase
+      done
+
+  # Otherwise paint an intended cell.
+  if missing:
+    seek nearest missing
+    if standing on missing:
+      draw leaf
+      pause 6
+      done
+
+  # Nothing needed — park on a leaf
+  seek current
+  pause 10
+  done

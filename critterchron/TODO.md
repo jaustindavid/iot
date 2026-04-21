@@ -11,6 +11,16 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   Fine for pool-bobbing at known-safe coordinates; wants a guarded form
   (`step (dx, dy) if free` or similar) before it's trusted in unknown
   contexts. `coati.crit:37` / `coati.crit:63` tag the locations.
+- **Device-side error channel on the heartbeat.** Today an OTA failure
+  (malformed blob, sha mismatch, parse error) only surfaces as a
+  `Log.error` on serial — useless for remote troubleshooting on deployed
+  devices. Capture the most recent error string(s) in a small ring buffer
+  on the device and pipe them into the heartbeat payload, one or two per
+  heartbeat max so we don't flood the channel. Rate-limit: not more than
+  1/heartbeat, drop oldest on overflow. Same hook probably useful for
+  sensor read failures, watchdog resets, etc. — any non-fatal `Log.error`
+  the device wants an operator to know about without shipping a serial
+  cable.
 - **blink** or other color pattern on conditions.  ~~Maybe add a type of
   color which blinks or changes, and let agents set themselves or a tile
   to the color?~~ Landed 2026-04-19 as `cycle` colors + `set color =` —
@@ -23,12 +33,21 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 2 — Environmental polish:**~~ light sensor + brightness
   smoothing landed 2026-04-19; Stra2us KV overrides for the tuning
   knobs landed with Phase 4.
-- **Night mode palette.** The sink's floor-clamp keeps dim pixels visible
-  by bumping nonzero channels to 1, which distorts hue near the bottom of
-  the brightness range. A deliberate "night mode" — swap agent/landmark
-  colors for a warm-white or red-only palette below some ambient
-  threshold, with hysteresis — would look intentional instead of
-  accidentally tinted. Stretch feature; phase-2 adjacent.
+- ~~**Night mode palette.**~~ Landed 2026-04-20. Sparse `night:` block
+  inside `--- colors ---` overrides day colors (static, cycle, or
+  name-ref); optional `default:` catches unlisted colors. Trigger is
+  device-side: Schmitt hysteresis on smoothed sink brightness, entering
+  at `NIGHT_ENTER_BRIGHTNESS` (defaults to `MIN_BRIGHTNESS`, i.e. the
+  floor-clamp regime itself), exiting a few units higher. Both
+  thresholds are live-tunable via Stra2us KV
+  (`night_enter_brightness` / `night_exit_brightness`, `<app>/<device>`
+  + `<app>` fallback like every other key); exit is clamped to
+  `enter + 1` on read so a misconfigured pair can't deadlock the
+  trigger. Blobs without a `night:` block are untouched — `--night` /
+  entering night-bri is a no-op at render time. Wire format adds
+  optional `NIGHT_COLORS` / `NIGHT_DEFAULT` sections; IR_VERSION bumped
+  to 4. See `agents/tests/night.crit` for the hello-world, `--night`
+  flag on `main.py` and the host harness for forced-mode testing.
 - ~~**Phase 3 — WobblyTime**~~ (landed 2026-04-19). `TimeSource` decorator
   around the Particle time source. Tuning via Stra2us KV lands with
   phase 4.
@@ -40,6 +59,15 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 # Completed
 
+- **2026-04-20 — Compiler rejects unknown day-color refs in night
+  palette.** `_validate_night_palette` cross-checks every night
+  override name, every bare name-ref value, and every cycle sub-entry
+  against the day palette; unknown targets fail at compile time with
+  a message listing the known day colors. Closes the sim-vs-HAL gap
+  that let swarm.crit's stray `landed:` slip past `main.py`, pass
+  encoding, and fail `IrRuntime::load` on rachel (whose `begin()` then
+  returned false → black panel). Negative fixtures:
+  `agents/tests/night_unknown_{override,ref}.crit`.
 - **2026-04-19 — Compiler catches consecutive-seek fallthroughs.**
   `_is_yield` treats bare `seek` as non-yielding (only `seek ... timeout N`
   yields), so three chained `seek`→`if on ...`→`done` paths that all miss

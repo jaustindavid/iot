@@ -154,6 +154,61 @@ bool CritterEngine::colorRGB(const char* name, uint8_t& r, uint8_t& g, uint8_t& 
 
 void CritterEngine::resolveColor(int idx, uint32_t frame,
                                  uint8_t& r, uint8_t& g, uint8_t& b) const {
+    // Night-mode preempt: if the active day color has a NIGHT_COLORS
+    // override (or if NIGHT_DEFAULT applies), resolve through the night
+    // palette instead. Night entries that reference day colors (kind 2
+    // "ref", and each cycle sub-entry) bounce back into the day-palette
+    // walker below — `skip_night` parameter on the recursive call
+    // prevents an infinite bounce if someone authored night_default as
+    // a day-color name.
+    if (night_mode_ && idx >= 0 && idx < (int)critter_ir::COLOR_COUNT) {
+        uint8_t night_ref = critter_ir::NIGHT_FOR[idx];
+        const critter_ir::NightEntry* N = nullptr;
+        if (night_ref < critter_ir::NIGHT_COLOR_COUNT) {
+            N = &critter_ir::NIGHT_COLORS[night_ref];
+        } else if (critter_ir::HAS_NIGHT_DEFAULT) {
+            N = &critter_ir::NIGHT_DEFAULT;
+        }
+        if (N) {
+            if (N->kind == 0) {                       // static RGB
+                r = N->r; g = N->g; b = N->b;
+                return;
+            }
+            if (N->kind == 2) {                       // ref → walk day palette
+                resolveDayColor(N->target_day_idx, frame, r, g, b);
+                return;
+            }
+            if (N->kind == 1 && N->cycle_count > 0) { // cycle → pick sub-entry, then day walk
+                uint32_t total = 0;
+                for (uint8_t k = 0; k < N->cycle_count; ++k) {
+                    uint8_t f = critter_ir::NIGHT_CYCLE_ENTRIES[N->cycle_start + k].frames;
+                    if (f == 0) f = 1;
+                    total += f;
+                }
+                if (total == 0) { r = N->r; g = N->g; b = N->b; return; }
+                uint32_t t = frame % total;
+                for (uint8_t k = 0; k < N->cycle_count; ++k) {
+                    uint8_t f = critter_ir::NIGHT_CYCLE_ENTRIES[N->cycle_start + k].frames;
+                    if (f == 0) f = 1;
+                    if (t < f) {
+                        int sub = critter_ir::NIGHT_CYCLE_ENTRIES[N->cycle_start + k].color_idx;
+                        resolveDayColor(sub, frame, r, g, b);
+                        return;
+                    }
+                    t -= f;
+                }
+                r = N->r; g = N->g; b = N->b;
+                return;
+            }
+        }
+        // No night override for this day color and no NIGHT_DEFAULT —
+        // fall through to the day palette unchanged.
+    }
+    resolveDayColor(idx, frame, r, g, b);
+}
+
+void CritterEngine::resolveDayColor(int idx, uint32_t frame,
+                                    uint8_t& r, uint8_t& g, uint8_t& b) const {
     // Nested cycles aren't a language feature — a cycle's entries always
     // reference static colors — but guard against a pathological table
     // anyway. Depth 4 is plenty.
@@ -258,7 +313,34 @@ float CritterEngine::pfDiagonalCost(uint16_t type_idx) const {
 // =======================================================================
 
 bool CritterEngine::begin() {
+    // Materialize the runtime IR tables from the compiled-in blob. Same
+    // parser we'll later use for OTA blobs — exercised every boot so
+    // latent format breakage surfaces on-device before it surfaces in the
+    // field. Caller gets no useful recovery path on failure beyond a log,
+    // so we just refuse to come up.
+    if (!critter_ir::loadDefault()) return false;
+    return reinit();
+}
+
+// Rebuild engine state from whatever is currently in the critter_ir tables.
+// Called by begin() after loadDefault(), and by the OTA path after
+// critter_ir::load() has replaced the tables under us.
+bool CritterEngine::reinit() {
     if (critter_ir::IR_VERSION > SUPPORTED_IR_VERSION) return false;
+
+    // Agents hold indices into BEHAVIORS/AGENT_TYPES/COLORS, so any cached
+    // state from a prior IR is garbage the moment we swap tables. Zero
+    // everything and respawn from INITIAL_AGENTS. Metrics reset too — they
+    // measured a different script.
+    for (uint16_t i = 0; i < agent_count_; ++i) agents_[i].alive = false;
+    agent_count_   = 0;
+    painter_mask_  = 0;
+    metrics_       = {};
+    // tick_count_ and render_frame_ deliberately preserved so cycle-color
+    // phase continuity survives a swap — the visible script is new, but the
+    // clock shouldn't jitter.
+    std::memset(grid_, 0, sizeof(grid_));
+    clearClaims();
 
     // Painter mask: agent types whose behavior contains draw/erase are
     // excluded from the occupied-cell lookup (they *become* the pixel).
@@ -553,6 +635,29 @@ bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
             return tileMatches(a.pos.x, a.pos.y, kind);
     }
 
+    // standing on landmark <name> — same semantics as `on landmark <name>`.
+    if (n == 4 && strEq(tok[0], "standing") && strEq(tok[1], "on")
+            && strEq(tok[2], "landmark")) {
+        int lm = landmarkIndex(tok[3]);
+        if (lm < 0) return false;
+        const auto& L = critter_ir::LANDMARKS[lm];
+        for (uint16_t i = 0; i < L.point_count; ++i)
+            if (L.points[i].x == a.pos.x && L.points[i].y == a.pos.y) return true;
+        return false;
+    }
+
+    // standing on color <name> — tile at agent pos is lit AND its current
+    // resolved RGB matches the named color. Cycle colors compare against
+    // the color's live phase (same resolution path used by painting).
+    if (n == 4 && strEq(tok[0], "standing") && strEq(tok[1], "on")
+            && strEq(tok[2], "color")) {
+        const Tile& t = grid_[a.pos.x][a.pos.y];
+        if (!t.state) return false;
+        uint8_t r, g, b;
+        if (!colorRGB(tok[3], r, g, b)) return false;
+        return t.r == r && t.g == g && t.b == b;
+    }
+
     // on landmark <name>
     if (n == 3 && strEq(tok[0], "on") && strEq(tok[1], "landmark")) {
         int lm = landmarkIndex(tok[2]);
@@ -563,13 +668,27 @@ bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
         return false;
     }
 
-    // on agent <name>
-    if (n == 3 && strEq(tok[0], "on") && strEq(tok[1], "agent")) {
+    // on agent <name> [with state == <value>]
+    // 3 tokens: no state filter.  7 tokens: "with state == <value>" suffix.
+    if ((n == 3 || n == 7) && strEq(tok[0], "on") && strEq(tok[1], "agent")) {
+        const char* want_state = nullptr;
+        if (n == 7) {
+            if (!strEq(tok[3], "with") || !strEq(tok[4], "state") || !strEq(tok[5], "=="))
+                return false;
+            want_state = tok[6];
+        }
         for (uint16_t i = 0; i < agent_count_; ++i) {
             const Agent& o = agents_[i];
             if (!o.alive || o.id == a.id) continue;
             if (!strEq(critter_ir::AGENT_TYPES[o.type_idx].name, tok[2])) continue;
-            if (o.pos.x == a.pos.x && o.pos.y == a.pos.y) return true;
+            if (o.pos.x != a.pos.x || o.pos.y != a.pos.y) continue;
+            if (want_state) {
+                const auto& otype = critter_ir::AGENT_TYPES[o.type_idx];
+                const char* os = (o.state_str_id == 0) ? "none"
+                    : (o.state_str_id <= otype.state_count ? otype.states[o.state_str_id - 1] : "none");
+                if (!strEq(os, want_state)) continue;
+            }
+            return true;
         }
         return false;
     }
@@ -925,7 +1044,10 @@ void CritterEngine::processAgent(Agent& a) {
             return;
         }
 
-        // ---- seek [nearest] [agent|landmark] <target> [(on|not on) <k>] [timeout N] ----
+        // ---- seek [nearest] [agent|landmark] <target>
+        //           [with state == <name>]
+        //           [(on|not on) <k>]
+        //           [timeout N] ----
         if (startsWith(inst, "seek")) {
             char buf[128];
             std::strncpy(buf, inst, sizeof(buf) - 1);
@@ -939,6 +1061,15 @@ void CritterEngine::processAgent(Agent& a) {
                 target_kind = tok[i]; ++i;
             }
             const char* target_type = (i < t) ? tok[i++] : nullptr;
+
+            // Optional state filter (agent targets only). Four tokens:
+            // with state == <value>. Ignored for non-agent targets.
+            const char* state_filter = nullptr;
+            if (i + 3 < t && strEq(tok[i], "with")
+                    && strEq(tok[i + 1], "state") && strEq(tok[i + 2], "==")) {
+                state_filter = tok[i + 3];
+                i += 4;
+            }
 
             const char* filter_mode = nullptr;
             const char* filter_kind = nullptr;
@@ -971,6 +1102,12 @@ void CritterEngine::processAgent(Agent& a) {
                     const Agent& o = agents_[k];
                     if (!o.alive || o.id == a.id) continue;
                     if (!strEq(critter_ir::AGENT_TYPES[o.type_idx].name, target_type)) continue;
+                    if (state_filter) {
+                        const auto& otype = critter_ir::AGENT_TYPES[o.type_idx];
+                        const char* os = (o.state_str_id == 0) ? "none"
+                            : (o.state_str_id <= otype.state_count ? otype.states[o.state_str_id - 1] : "none");
+                        if (!strEq(os, state_filter)) continue;
+                    }
                     cands[nc++] = o.pos;
                 }
             } else if (target_kind && strEq(target_kind, "landmark") && target_type) {

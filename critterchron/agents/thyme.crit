@@ -16,6 +16,13 @@ aphid: cycle leaf 20, brightleaf 5
 ladybug: (255, 0, 0)    # agent body color
 black:   (0, 0, 0)      # nest landmark color (invisible background)
 
+night:
+  red: (1, 0, 0)
+  leaf: (0, 1, 0)
+  brightleaf: (0, 1, 0)
+  aphid: (0, 1, 0)
+  ladybug: (1, 0, 0)
+
 --- landmarks ---
 nest: black
   (0, max_y)
@@ -33,12 +40,15 @@ tick rate: 125ms
 
 --- pathfinding ---
 aphid:
-  max nodes: 32
-  step rate: 3    # third speed — aphids feel slow and squatting
+  max nodes: 64
+  step rate: 3
+  diagonal: allowed
+  diagonal_cost: 3
+  penalty lit cell: 5
 
 ladybug:
   max nodes: 256
-  step rate: 2    # 50% faster than aphids; predator outpaces prey
+  step rate: 2
   diagonal: allowed
   diagonal_cost: 1.414
   penalty lit cell: 1.5        # prefer dark lanes — less disruptive
@@ -81,7 +91,7 @@ ladybug:
   if on aphid:
     despawn aphid
     erase
-    pause 3
+    pause 10
     done
 
   # Priority 2: aphid on a not-yet-lit cell (missing or blank). Kill the

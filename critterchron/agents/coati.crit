@@ -15,7 +15,7 @@ white:     (255,255,255)
 grey:      (128, 128, 128)
 midgrey:   (32, 32, 32)
 darkgrey:  (1, 1, 1)
-coati:   cycle grey 15, midgrey 15, darkgrey 15, midgrey 15
+coati:   cycle grey 25, midgrey 25, darkgrey 25, midgrey 25
 
 
 --- landmarks ---

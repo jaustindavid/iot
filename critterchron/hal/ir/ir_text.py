@@ -91,7 +91,36 @@ def encode(ir: dict, meta: dict) -> str:
             emit(f"static {name} {int(r)} {int(g)} {int(b)}")
     emit("")
 
+    # ---- NIGHT_COLORS (optional) ----
+    # Sparse override: each entry names a day color to replace while the
+    # device is in night mode. Value forms parallel day colors but add
+    # `ref <day_color_name>` so a night entry can point at another entry
+    # in the day palette without duplicating its RGB. Section is only
+    # emitted when there's at least one override — a blob without a night
+    # palette is byte-identical to a pre-night-feature blob.
+    night_colors = ir.get("night_colors", OrderedDict())
+    if night_colors:
+        emit(f"NIGHT_COLORS {len(night_colors)}")
+        for name, val in night_colors.items():
+            _check_token(name, "night color name")
+            emit(_fmt_night_body(val, name))
+        emit("")
+
+    # ---- NIGHT_DEFAULT (optional) ----
+    # Fallback color for day colors that aren't explicitly listed in
+    # NIGHT_COLORS. Same value grammar as a night entry, no name slot —
+    # this line stands alone. Omitted entirely when no default is set;
+    # the device reads that as "fall through to the day palette".
+    night_default = ir.get("night_default")
+    if night_default is not None:
+        emit(f"NIGHT_DEFAULT {_fmt_night_body(night_default, None)}")
+        emit("")
+
     # ---- LANDMARKS ----
+    # Coords may be plain ints or symbolic tokens ("max_x", "max_y-1").
+    # The device-side parser resolves symbolic tokens against its own
+    # GRID_WIDTH/GRID_HEIGHT at load time, so the same blob works on any
+    # geometry. See compiler.py `preserve_symbolic_coords`.
     landmarks = ir.get("landmarks", OrderedDict())
     emit(f"LANDMARKS {len(landmarks)}")
     for name, lm in landmarks.items():
@@ -100,7 +129,7 @@ def encode(ir: dict, meta: dict) -> str:
         pts = lm.get("points", [])
         emit(f"{name} {lm['color']} {len(pts)}")
         for x, y in pts:
-            emit(f"  {int(x)} {int(y)}")
+            emit(f"  {_fmt_coord(x)} {_fmt_coord(y)}")
     emit("")
 
     # ---- AGENTS ----
@@ -123,7 +152,7 @@ def encode(ir: dict, meta: dict) -> str:
         state = ia.get("state") or "none"
         _check_token(state, "initial agent state")
         x, y = ia["pos"]
-        emit(f"{ia['name']} {int(x)} {int(y)} {state}")
+        emit(f"{ia['name']} {_fmt_coord(x)} {_fmt_coord(y)} {state}")
     emit("")
 
     # ---- SPAWNS ----
@@ -187,23 +216,30 @@ def encode(ir: dict, meta: dict) -> str:
                 raise ValueError(f"behavior text contains a newline: {text!r}")
             emit(f"  {int(indent)} {text}")
 
-    # ---- SOURCE (optional) ----
-    # Original .crit text, for debugging / audit. Carried as a line-count-
-    # prefixed block; every source line gets a `| ` prefix (`|` alone for
-    # empty lines) so the blob stays greppable and the line-oriented parser
-    # doesn't need to reason about byte counts.
+    # ---- checksum + END ----
+    # END marks the boundary between IR proper (covered by fletcher16) and
+    # the optional trailing SOURCE block. Devices stream the whole blob
+    # through the SHA256 hasher but only need to buffer bytes up to END.
+    body = "\n".join(lines) + "\n"
+    csum = fletcher16(body.encode("utf-8"))
+    out = body + f"END {csum:04x}\n"
+
+    # ---- SOURCE (optional, trailing) ----
+    # Original .crit text, for debugging / audit. Lives *after* END so the
+    # device parser sees `END <csum>` and stops — source bytes still flow
+    # through the OTA SHA256 stream (so content_sha covers them) but the
+    # device never buffers or parses them. Tools that want to extract
+    # source read past END. Every source line gets a `| ` prefix (`|` alone
+    # for empty lines) so the blob stays greppable.
     source = meta.get("source")
     if source is not None:
         src_lines = source.splitlines()
-        emit("")
-        emit(f"SOURCE {len(src_lines)}")
+        trailer = [f"SOURCE {len(src_lines)}"]
         for ln in src_lines:
-            emit(f"|" if ln == "" else f"| {ln}")
+            trailer.append("|" if ln == "" else f"| {ln}")
+        out += "\n".join(trailer) + "\n"
 
-    # ---- checksum + END ----
-    body = "\n".join(lines) + "\n"
-    csum = fletcher16(body.encode("utf-8"))
-    return body + f"END {csum:04x}\n"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +258,20 @@ def decode(text: str) -> tuple[dict, dict]:
     round-trip bugs surface loudly)."""
     raw = text if text.endswith("\n") else text + "\n"
 
-    # Find and verify END line.
-    end_pos = raw.rfind("\nEND ")
+    # Find and verify END line. `find` (not `rfind`) because END marks the
+    # start of the optional SOURCE trailer — source lines are `| ...`-
+    # prefixed so they can never produce another column-0 "END " match,
+    # but semantically we want the *first* END.
+    end_pos = raw.find("\nEND ")
     if end_pos < 0:
         raise DecodeError("Missing END line")
     body = raw[: end_pos + 1]                      # up to and including its trailing \n
-    end_line = raw[end_pos + 1:].rstrip("\n")
+    # END line ends at the next \n.
+    end_line_end = raw.find("\n", end_pos + 1)
+    if end_line_end < 0:
+        raise DecodeError("END line is truncated")
+    end_line = raw[end_pos + 1 : end_line_end]
+    trailer = raw[end_line_end + 1 :]              # may be empty or hold SOURCE
     try:
         expected_csum = int(end_line.split()[1], 16)
     except (IndexError, ValueError):
@@ -271,6 +315,8 @@ def decode(text: str) -> tuple[dict, dict]:
         "ir_version": int(meta.get("ir_version", 1)),
         "simulation": {},
         "colors": OrderedDict(),
+        "night_colors": OrderedDict(),
+        "night_default": None,
         "landmarks": OrderedDict(),
         "agents": OrderedDict(),
         "behaviors": OrderedDict(),
@@ -311,6 +357,19 @@ def decode(text: str) -> tuple[dict, dict]:
                 else:
                     raise DecodeError(f"Unknown color kind: {parts[0]!r}")
 
+        elif kind == "NIGHT_COLORS":
+            n = int(toks[1])
+            for _ in range(n):
+                parts = cur.next().split()
+                day_name, val = _parse_night_body(parts, with_name=True)
+                ir["night_colors"][day_name] = val
+
+        elif kind == "NIGHT_DEFAULT":
+            # Whole line is `NIGHT_DEFAULT <kind> [args]` — pass parts past
+            # the section keyword to the shared body parser.
+            _, val = _parse_night_body(toks[1:], with_name=False)
+            ir["night_default"] = val
+
         elif kind == "LANDMARKS":
             n = int(toks[1])
             for _ in range(n):
@@ -319,7 +378,7 @@ def decode(text: str) -> tuple[dict, dict]:
                 pts = []
                 for _ in range(pt_count):
                     xy = cur.next().split()
-                    pts.append([int(xy[0]), int(xy[1])])
+                    pts.append([_decode_coord(xy[0]), _decode_coord(xy[1])])
                 ir["landmarks"][name] = {"color": color, "points": pts}
 
         elif kind == "AGENTS":
@@ -338,7 +397,7 @@ def decode(text: str) -> tuple[dict, dict]:
                 parts = cur.next().split()
                 ir["initial_agents"].append({
                     "name":  parts[0],
-                    "pos":   [int(parts[1]), int(parts[2])],
+                    "pos":   [_decode_coord(parts[1]), _decode_coord(parts[2])],
                     "state": parts[3],
                 })
 
@@ -375,19 +434,6 @@ def decode(text: str) -> tuple[dict, dict]:
                     block[k] = _parse_pf_value(k, v)
                 ir["pathfinding"]["per_agent"][agent] = block
 
-        elif kind == "SOURCE":
-            n = int(toks[1])
-            src_lines: list[str] = []
-            for _ in range(n):
-                ln2 = cur.next()
-                if ln2 == "|":
-                    src_lines.append("")
-                elif ln2.startswith("| "):
-                    src_lines.append(ln2[2:])
-                else:
-                    raise DecodeError(f"Malformed SOURCE line: {ln2!r}")
-            meta["source"] = "\n".join(src_lines)
-
         elif kind == "BEHAVIORS":
             n = int(toks[1])
             for _ in range(n):
@@ -407,6 +453,31 @@ def decode(text: str) -> tuple[dict, dict]:
 
         else:
             raise DecodeError(f"Unknown section kind: {kind!r}")
+
+    # ---- trailing SOURCE (optional) ----
+    # Anything after END. Current grammar: a single `SOURCE <n>` block of
+    # `| `-prefixed lines. Unknown trailer kinds are ignored so the format
+    # can grow later without breaking older tools.
+    trailer_lines = trailer.splitlines()
+    t_cur = _Cursor(trailer_lines)
+    while not t_cur.eof():
+        ln = t_cur.next_nonempty_or_none()
+        if ln is None:
+            break
+        toks = ln.split()
+        if toks[0] == "SOURCE":
+            n = int(toks[1])
+            src_lines: list[str] = []
+            for _ in range(n):
+                ln2 = t_cur.next()
+                if ln2 == "|":
+                    src_lines.append("")
+                elif ln2.startswith("| "):
+                    src_lines.append(ln2[2:])
+                else:
+                    raise DecodeError(f"Malformed SOURCE line: {ln2!r}")
+            meta["source"] = "\n".join(src_lines)
+        # else: unknown trailer section; skip silently.
 
     return ir, meta
 
@@ -447,6 +518,76 @@ class _Cursor:
         return None
 
 
+def _fmt_night_body(val, day_name) -> str:
+    """Serialize one night palette entry as a whitespace-delimited body line.
+
+    `day_name` is the day color this entry overrides (None for
+    NIGHT_DEFAULT, where no name slot applies). `val` is one of:
+      - tuple / list (r, g, b)           → "static [<day_name>] r g b"
+      - str (bare color name reference)  → "ref [<day_name>] <target>"
+      - {"kind": "cycle", "entries": …}  → "cycle [<day_name>] m sub1 f1 ..."
+    """
+    name_slot = ""
+    if day_name is not None:
+        _check_token(day_name, "night day-color name")
+        name_slot = f" {day_name}"
+    if isinstance(val, str):
+        _check_token(val, "night ref target")
+        return f"ref{name_slot} {val}"
+    if isinstance(val, dict) and val.get("kind") == "cycle":
+        entries = val.get("entries", [])
+        parts = [f"cycle{name_slot}", str(len(entries))]
+        for sub_name, frames in entries:
+            _check_token(sub_name, "night cycle color ref")
+            parts.append(sub_name)
+            parts.append(str(int(frames)))
+        return " ".join(parts)
+    if isinstance(val, (tuple, list)) and len(val) == 3:
+        r, g, b = val
+        return f"static{name_slot} {int(r)} {int(g)} {int(b)}"
+    raise ValueError(
+        f"night entry {day_name!r}: unexpected value shape {val!r} "
+        f"(expected tuple, cycle dict, or name-ref string)"
+    )
+
+
+def _parse_night_body(parts, with_name):
+    """Inverse of _fmt_night_body. `parts` is a whitespace-split token list,
+    starting at the kind token (static/ref/cycle). Returns (day_name or
+    None, value)."""
+    if not parts:
+        raise DecodeError("empty night entry")
+    kind = parts[0]
+    day_name = None
+    idx = 1
+    if with_name:
+        if idx >= len(parts):
+            raise DecodeError(f"night {kind} entry missing day-color name")
+        day_name = parts[idx]
+        idx += 1
+    if kind == "static":
+        if len(parts) - idx < 3:
+            raise DecodeError(f"night static entry malformed: {parts!r}")
+        r, g, b = int(parts[idx]), int(parts[idx+1]), int(parts[idx+2])
+        return day_name, [r, g, b]
+    if kind == "ref":
+        if len(parts) - idx < 1:
+            raise DecodeError(f"night ref entry malformed: {parts!r}")
+        return day_name, parts[idx]
+    if kind == "cycle":
+        if len(parts) - idx < 1:
+            raise DecodeError(f"night cycle entry malformed: {parts!r}")
+        m = int(parts[idx]); idx += 1
+        entries = []
+        for i in range(m):
+            if idx + 1 >= len(parts):
+                raise DecodeError(f"night cycle entry truncated: {parts!r}")
+            entries.append([parts[idx], int(parts[idx+1])])
+            idx += 2
+        return day_name, {"kind": "cycle", "entries": entries}
+    raise DecodeError(f"unknown night entry kind: {kind!r}")
+
+
 def _check_token(s: str, what: str) -> None:
     """Validate that `s` is a single whitespace-free token — the text format
     uses whitespace as the record separator, so a name with an embedded
@@ -455,6 +596,27 @@ def _check_token(s: str, what: str) -> None:
         raise ValueError(f"Empty {what}")
     if any(c.isspace() for c in s):
         raise ValueError(f"{what} contains whitespace: {s!r}")
+
+
+def _decode_coord(tok: str):
+    """Inverse of `_fmt_coord`: int token → int, max_x/max_y token → str.
+    Symbolic tokens flow through unchanged for the host-side round-trip
+    test; the device parser does the actual geometry resolution."""
+    if 'max_x' in tok or 'max_y' in tok:
+        return tok
+    return int(tok)
+
+
+def _fmt_coord(v) -> str:
+    """Serialize a coordinate value. Accepts int (emits decimal) or a
+    symbolic string like "max_x" / "max_y-1" (emits as-is after stripping
+    whitespace so it stays a single space-delimited token)."""
+    if isinstance(v, str):
+        tok = ''.join(v.split())
+        if not tok:
+            raise ValueError("Empty coord token")
+        return tok
+    return str(int(v))
 
 
 def _fmt_float(x: float) -> str:

@@ -7,6 +7,10 @@
 #include <vector>
 #include "interface/LedSink.h"
 #include "interface/TimeSource.h"
+#include "ir/IrRuntime.h"
+// Generated per-build: supplies GRID_WIDTH / GRID_HEIGHT defines and the
+// DEFAULT_IR_BLOB the loader parses at begin(). The fallback 16x16 defines
+// below only fire on hosts that build without a generated header.
 #include "ir/critter_ir.h"
 
 #ifndef GRID_WIDTH
@@ -28,11 +32,14 @@ struct Tile {
 };
 
 // Engine-wide cap across all agent types. Must be >= the sum of per-type
-// `up to N` limits in any .crit script (ants.crit wants 80). Agent is ~40B,
-// so headroom is cheap — Photon 2 has megabytes of RAM. Override with
-// -DMAX_AGENTS=… if a future script needs more.
+// `up to N` limits in any .crit script. Sized to ants.crit's `up to 80`,
+// which is itself tuned to the theoretical peak lit pixels for HH:MM
+// (05:55 = 75 on MEGAFONT_5X6) plus a handful of non-painter agents. Agent
+// is ~28B on-device, so the default costs ~2.2KB — meaningful on OG Photon
+// where WICED wants every spare byte. Override with -DMAX_AGENTS=… in a
+// device header if a future script needs more.
 #ifndef MAX_AGENTS
-#define MAX_AGENTS 128
+#define MAX_AGENTS 80
 #endif
 
 struct Agent {
@@ -71,6 +78,13 @@ public:
     CritterEngine(LedSink& sink, TimeSource& clock);
 
     bool begin();
+    // Re-seat engine state against the *currently loaded* critter_ir tables
+    // (no loadDefault call). Used by the OTA path: after Stra2usClient swaps
+    // the tables via critter_ir::load(), the engine still holds agents that
+    // reference indices in the old behavior/type pool — this clears them
+    // and respawns from the new INITIAL_AGENTS. Returns false on IR version
+    // mismatch (same gate as begin()).
+    bool reinit();
     void seedRng(uint32_t seed) { rng_.seed(seed); }
 
     void tick();
@@ -97,7 +111,15 @@ public:
     // RNG-matched inputs, C++↔Python) traces can diff cleanly.
     std::string dumpStateJsonl() const;
 
-    static constexpr uint8_t SUPPORTED_IR_VERSION = 1;
+    static constexpr uint8_t SUPPORTED_IR_VERSION = 4;
+
+    // Night-mode toggle. When true, resolveColor() consults the night
+    // palette (NIGHT_COLORS / NIGHT_DEFAULT) before falling through to
+    // the day palette. Blobs without a night palette are unaffected —
+    // a missing override just falls through. Default off; platform glue
+    // drives this off the LightSensor via a Schmitt trigger.
+    void setNightMode(bool on) { night_mode_ = on; }
+    bool nightMode() const      { return night_mode_; }
 
 private:
     // ---------- lookup helpers ----------
@@ -111,6 +133,13 @@ private:
     // Guarantees an assignment even on out-of-range idx (writes 255,255,255).
     void resolveColor(int idx, uint32_t frame,
                       uint8_t& r, uint8_t& g, uint8_t& b) const;
+    // Unconditional day-palette resolve — same walker as before, without
+    // the night-mode preempt. Called by resolveColor() when night_mode_
+    // is off, and recursively from the night branch when a night entry
+    // refers back into the day palette (so night → day transitions
+    // terminate cleanly).
+    void resolveDayColor(int idx, uint32_t frame,
+                         uint8_t& r, uint8_t& g, uint8_t& b) const;
     int  landmarkIndex(const char* name) const;
     int  agentTypeIndex(const char* name) const;
     int  behaviorIndex(const char* name) const;
@@ -161,6 +190,7 @@ private:
     int16_t        next_agent_id_ = 1;
     HealthMetrics  metrics_;
     uint32_t       painter_mask_ = 0;   // bit i = agent type i is a painter
+    bool           night_mode_ = false;
     std::mt19937   rng_{0xC0FFEE};
 
     // A* scratch — owned by the engine so each call reuses storage instead

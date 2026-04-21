@@ -40,6 +40,44 @@
 #define MIN_BRIGHTNESS         3            // floor; only consulted when a sensor is present
 #define TIMEZONE_OFFSET_HOURS -5.0f
 
+// --- Night mode Schmitt thresholds ---
+// The engine flips to its night palette (if the loaded blob defines one)
+// when the smoothed sensor brightness is at or below NIGHT_ENTER_BRIGHTNESS,
+// and flips back when it rises at or above NIGHT_EXIT_BRIGHTNESS. The gap
+// is the hysteresis band — keeping it wider than one sensor unit avoids
+// flicker on a flame/shadow edge. Defaults anchor to MIN_BRIGHTNESS so the
+// night swap fires exactly when the NeoPixel floor-clamp starts distorting
+// hues (the very regime the night palette exists to rescue). Devices
+// without an ambient sensor never trip the Schmitt; night mode stays off.
+#ifndef NIGHT_ENTER_BRIGHTNESS
+#define NIGHT_ENTER_BRIGHTNESS (MIN_BRIGHTNESS)
+#endif
+#ifndef NIGHT_EXIT_BRIGHTNESS
+#define NIGHT_EXIT_BRIGHTNESS  (MIN_BRIGHTNESS + 4)
+#endif
+
+// --- Memory / capacity overrides ---
+// All optional. The defaults in the engine and HAL are tuned for a mid-range
+// board (Photon 2). Override here to recover RAM on tighter platforms (OG
+// Photon, see rico_raccoon.h) or to raise ceilings for more ambitious scripts.
+//
+// MAX_AGENTS — engine-wide cap across all agent types. Default 80, sized to
+// ants.crit's `up to 80`. Agent struct is ~28B on-device, so each +1 is ~28B
+// of .bss. Drop to recover memory if you know your scripts stay small; raise
+// if you're authoring something denser than ants.
+// #define MAX_AGENTS          80
+//
+// IR_OTA_BUFFER_BYTES — scratch for OTA-fetched IR blobs. Default 8192 in
+// Stra2usClient.h. Largest body-only blob seen is ~3KB; the SOURCE trailer
+// adds roughly another 1x. Drop on RAM-starved boards (rico is at 6144) at
+// the cost of rejecting OTA of scripts with long source trailers. Raise if
+// scripts grow past ~4KB.
+// #define IR_OTA_BUFFER_BYTES 8192
+//
+// TELEMETRY_STACK_BYTES — stack for the Stra2us telemetry thread. Default
+// 5120. Lower if you've profiled the thread's peak usage and have headroom.
+// #define TELEMETRY_STACK_BYTES 5120
+
 // --- Debug ---
 // Uncomment to override compiled-in defaults during bring-up. Live Stra2us
 // KV overrides these at runtime once polled.

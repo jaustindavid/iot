@@ -6,9 +6,11 @@ import re
 from dataclasses import dataclass, field
 
 # Highest IR schema version this engine can interpret. Bump in lockstep
-# with `compiler.IR_VERSION` when adding new opcodes, fields, or condition
-# kinds. The HAL interpreter will enforce the same bound from its own copy.
-SUPPORTED_IR_VERSION = 1
+# with `compiler.IR_VERSION` when adding new opcodes, fields, condition
+# kinds, or wire-format changes that older parsers would misinterpret.
+# The HAL interpreter enforces the same bound from its own copy so old
+# devices cleanly refuse newer blobs instead of silently mis-parsing.
+SUPPORTED_IR_VERSION = 4
 
 @dataclass
 class Tile:
@@ -61,6 +63,18 @@ class CritterEngine:
         self.grid = [[Tile() for _ in range(height)] for _ in range(width)]
         self.agents = []
         self.tick_count = 0
+        # --trace flag: when true, _process_agent_behavior prints one line
+        # per instruction dispatched + a YIELD/DONE marker on return. Off
+        # by default (cost is a per-instruction `if`, negligible).
+        self.trace = False
+        # Night-mode flag. When true and the IR declares a night palette,
+        # `_resolve_color_at` prefers `night_colors[ref]` → `night_default`
+        # before falling through to the day palette. In the Python sim the
+        # `--night` CLI flag flips this; on hardware the sink flips it via
+        # Schmitt hysteresis on the ambient brightness floor. Always false
+        # for blobs without a night palette — night_colors will be empty
+        # and night_default None, so lookup falls straight through.
+        self.night_mode = False
 
         # Initialize initial agents
         for init_agent in self.ir.get("initial_agents", []):
@@ -107,9 +121,46 @@ class CritterEngine:
         resolved recursively; guard against cycles with a depth limit."""
         return self._resolve_color_at(ref, self.tick_count + phase, default, depth=0)
 
-    def _resolve_color_at(self, ref, frame, default, depth):
+    def _resolve_color_at(self, ref, frame, default, depth, skip_night=False):
         if depth > 4:
             return default
+        # Night palette takes priority when enabled, but only for the
+        # outermost lookup — once we've resolved a night entry to a name
+        # reference (e.g. `night_default: warmwhite`), subsequent recursion
+        # uses the *day* palette to look up that name. Otherwise a night
+        # name-ref to an unmapped day color would bounce back into
+        # night_default and never reach a real RGB tuple.
+        if self.night_mode and not skip_night:
+            night = self.ir.get("night_colors", {}).get(ref)
+            if night is None:
+                night = self.ir.get("night_default")
+            if night is not None:
+                if isinstance(night, tuple):
+                    return night
+                if isinstance(night, list):
+                    return tuple(night)
+                if isinstance(night, str):
+                    # Resolve through day palette from here down.
+                    return self._resolve_color_at(
+                        night, frame, default, depth + 1, skip_night=True,
+                    )
+                if isinstance(night, dict) and night.get("kind") == "cycle":
+                    # Night palette supports cycles too — cheap, costs
+                    # nothing when unused. Entry names resolve via the day
+                    # palette for the same reason as string refs above.
+                    entries = night.get("entries", [])
+                    total = sum(max(1, int(f)) for _, f in entries)
+                    if total > 0:
+                        t = frame % total
+                        for sub_name, frames in entries:
+                            frames = max(1, int(frames))
+                            if t < frames:
+                                return self._resolve_color_at(
+                                    sub_name, frame, default, depth + 1,
+                                    skip_night=True,
+                                )
+                            t -= frames
+                return default
         d = self.ir.get("colors", {}).get(ref)
         if d is None:
             return default
@@ -412,6 +463,21 @@ class CritterEngine:
         }
         return json.dumps(record, separators=(",", ":")) + "\n"
 
+    def _trace_dispatch(self, agent, pc, inst, pre_pos):
+        """Deferred trace emit for movement-capable opcodes.
+
+        Same format as the eager trace print, plus a `→(nx,ny)` suffix when
+        the opcode relocated the agent. Callers pass the pre-execution
+        position so the suffix reflects the actual delta caused by *this*
+        instruction, not cumulative motion from later ticks."""
+        line = (f"[t={self.tick_count}] {agent.name}#{agent.id} "
+                f"@({pre_pos[0]},{pre_pos[1]}) "
+                f"state={getattr(agent, 'state_str', 'none')} "
+                f"pc={pc}  {inst}")
+        if tuple(agent.pos) != pre_pos:
+            line += f"  \u2192({agent.pos[0]},{agent.pos[1]})"
+        print(line)
+
     def _process_agent_behavior(self, agent):
         """Interprets the IR tokens for the given agent."""
         instructions = self.ir.get("behaviors", {}).get(agent.name, [])
@@ -419,16 +485,36 @@ class CritterEngine:
             return
             
         pc = agent.pc
-        
+
         executed = 0
         while pc < len(instructions):
             if executed > 100:
                 agent.glitched = True
                 self.health_metrics["glitches"] += 1
+                if self.trace:
+                    print(f"[t={self.tick_count}] {agent.name}#{agent.id} GLITCH")
                 return
             executed += 1
-            
+
             indent, inst = instructions[pc]
+            dispatch_pc = pc
+            pre_pos = tuple(agent.pos)
+            # Movement-capable opcodes defer their trace print to after
+            # dispatch so we can tack on a `→(nx,ny)` suffix when the
+            # instruction actually relocated the agent. Everything else
+            # prints eagerly — pos/state can't change, so there's nothing
+            # to wait for.
+            is_mover = inst.startswith(("step", "wander", "seek"))
+            if self.trace and not is_mover:
+                # One line per dispatched instruction, tagged with tick, agent
+                # identity, current position, state, and PC. The state and pos
+                # shown are pre-execution of this opcode so you can reason
+                # about what's being evaluated against what the world looked
+                # like when it ran.
+                print(f"[t={self.tick_count}] {agent.name}#{agent.id} "
+                      f"@({pre_pos[0]},{pre_pos[1]}) "
+                      f"state={getattr(agent, 'state_str', 'none')} "
+                      f"pc={dispatch_pc}  {inst}")
             
             if inst.startswith("if "):
                 condition_met = self._evaluate_if(agent, inst)
@@ -531,6 +617,8 @@ class CritterEngine:
                 agent.step_duration = step_rate
                 agent.remaining_ticks = step_rate
                 agent.pc = pc + 1
+                if self.trace:
+                    self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                 return
 
             elif inst.startswith("wander"):
@@ -563,12 +651,17 @@ class CritterEngine:
                     agent.step_duration = 1
                     agent.remaining_ticks = 1
                 agent.pc = pc + 1
+                if self.trace:
+                    self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                 return
-                
+
             elif inst.startswith("seek"):
                 parts = inst.split()
 
-                # Parse: seek [nearest] [agent|landmark] <target> [(on|not on) <filter>] [timeout N]
+                # Parse: seek [nearest] [agent|landmark] <target>
+                #        [with state == <name>]
+                #        [(on|not on) <filter>]
+                #        [timeout N]
                 i = 1
                 if i < len(parts) and parts[i] == "nearest":
                     i += 1
@@ -578,6 +671,14 @@ class CritterEngine:
                     i += 1
                 target_type = parts[i] if i < len(parts) else None
                 i += 1
+
+                # Optional state filter (agent targets only). `with state == X`
+                # narrows the candidate set to agents whose state_str matches X.
+                state_filter = None
+                if (i + 3 < len(parts) and parts[i] == "with"
+                        and parts[i + 1] == "state" and parts[i + 2] == "=="):
+                    state_filter = parts[i + 3]
+                    i += 4
 
                 filter_mode = None
                 filter_kind = None
@@ -605,6 +706,8 @@ class CritterEngine:
                     self.health_metrics["failed_seeks"] += 1
                     agent.seek_ticks = 0
                     pc += 1
+                    if self.trace:
+                        self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                     continue
 
                 candidates = []
@@ -612,6 +715,8 @@ class CritterEngine:
                     candidates = [
                         tuple(a.pos) for a in self.agents
                         if a.name == target_type and a.id != agent.id
+                        and (state_filter is None
+                             or getattr(a, "state_str", "none") == state_filter)
                     ]
                 elif target_kind == "landmark":
                     pts = self.ir.get("landmarks", {}).get(target_type, {}).get("points", [])
@@ -652,10 +757,14 @@ class CritterEngine:
                         agent.step_duration = 1
                         agent.remaining_ticks = 1
                     agent.pc = pc
+                    if self.trace:
+                        self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                     return
 
                 agent.seek_ticks = 0
                 pc += 1
+                if self.trace:
+                    self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                 continue
                 
             pc += 1
@@ -700,18 +809,41 @@ class CritterEngine:
         if m:
             return self._tile_matches((ax, ay), m.group(1))
 
-        # Positional landmark proximity: "if on landmark <name>"
-        m = re.match(r'^if on landmark (\w+)$', body)
+        # Positional landmark proximity: "if (standing )?on landmark <name>"
+        m = re.match(r'^if (?:standing )?on landmark (\w+)$', body)
         if m:
             pts = self.ir.get("landmarks", {}).get(m.group(1), {}).get("points", [])
             return tuple(agent.pos) in pts
 
-        # Positional agent colocation: "if on agent <name>"
-        m = re.match(r'^if on agent (\w+)$', body)
+        # Positional color match: "if standing on color <name>" — true iff
+        # this agent's current tile is lit with exactly the referenced RGB.
+        m = re.match(r'^if standing on color (\w+)$', body)
+        if m:
+            color_def = self.ir.get("colors", {}).get(m.group(1))
+            if color_def is None:
+                return False
+            tile = self.grid[ax][ay]
+            if not tile.state:
+                return False
+            if isinstance(color_def, dict):
+                # cycle colors: match if tile RGB equals any phase's RGB
+                for entry_name, _frames in color_def.get("entries", []):
+                    entry_rgb = self.ir.get("colors", {}).get(entry_name)
+                    if (isinstance(entry_rgb, (tuple, list))
+                            and tuple(tile.color) == tuple(entry_rgb)):
+                        return True
+                return False
+            return tuple(tile.color) == tuple(color_def)
+
+        # Positional agent colocation: "if on agent <name> [with state == <value>]"
+        m = re.match(r'^if on agent (\w+)(?: with state == (\w+))?$', body)
         if m:
             name = m.group(1)
+            want_state = m.group(2)
             return any(
                 a.id != agent.id and a.name == name and tuple(a.pos) == (ax, ay)
+                and (want_state is None
+                     or getattr(a, "state_str", "none") == want_state)
                 for a in self.agents
             )
 

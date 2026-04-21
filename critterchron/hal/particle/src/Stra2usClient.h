@@ -26,6 +26,11 @@
 #if defined(PLATFORM_ID)
 
 #include "Particle.h"
+// creds.h first so device headers can override IR_OTA_BUFFER_BYTES and
+// friends; the override must be visible to every TU that includes this
+// header or ir_ota_buf_'s sizeof diverges between TUs (ODR / class layout
+// mismatch). OG Photon overrides down to reclaim .bss for WICED.
+#include "creds.h"
 #include "interface/Config.h"
 #include "hmac_sha256.h"
 
@@ -60,6 +65,35 @@ public:
 
     size_t cache_size() const { return cache_count_; }
 
+    // ---------- OTA IR ----------
+    //
+    // Two-step fetch: `<app>/<device>/ir` holds a script name (msgpack str);
+    // `<app>/scripts/<name>` holds the text-format IR blob (also msgpack str,
+    // multi-KB). ir_poll() runs on the telemetry thread: it fetches the
+    // pointer and, if it differs from what's currently loaded, fetches the
+    // blob into an internal buffer and marks a pending slot. Does not touch
+    // critter_ir:: tables — that's the main thread's job.
+    //
+    // ir_apply_if_ready() runs on the main thread between ticks: if the
+    // pending slot is populated, it calls critter_ir::load() on the buffer.
+    // Returns true iff a fresh blob was successfully parsed and installed,
+    // so the caller can run engine.reinit() and log the swap.
+    //
+    // Single pending slot: the telemetry thread won't overwrite a blob the
+    // main thread hasn't consumed yet. If consumption is slow, we just miss
+    // a poll cycle — next heartbeat will retry.
+    void ir_poll();
+    bool ir_apply_if_ready();
+
+    // Name of the script currently loaded on this device (empty string until
+    // the first successful apply). Used in the heartbeat payload so the
+    // server can see which script each device thinks it's running.
+    const char* ir_loaded_script() const { return ir_loaded_ptr_; }
+    // 64-char hex src_sha256 of the loaded blob (empty until first apply).
+    // Content-addressed identity: lets us detect re-publishes under the same
+    // name without any server-side version bookkeeping.
+    const char* ir_loaded_sha()    const { return ir_loaded_sha_; }
+
 private:
     static constexpr size_t CACHE_CAP = 32;
     static constexpr size_t KEY_MAX   = 40;
@@ -85,6 +119,16 @@ private:
     // either `out_i` or `out_f`.
     bool kv_fetch_(const char* full_key,
                    bool& is_float, int& out_i, float& out_f);
+
+    // Fetch a fully-qualified key whose msgpack value is a string. The raw
+    // response body is read into `buf`, then the msgpack header is stripped
+    // in place (memmove of payload to buf[0]) and a null terminator is
+    // appended at buf[out_len]. `buf_cap` must include room for that NUL.
+    // Handles fixstr (0xa0-0xbf), str8 (0xd9), str16 (0xda), str32 (0xdb).
+    // Returns false on HTTP error, signature-verify failure, overflow, or
+    // a non-string msgpack prefix.
+    bool kv_fetch_str_(const char* full_key,
+                       char* buf, size_t buf_cap, size_t& out_len);
 
     bool ensure_connected_();
     bool send_all_(const char* data, int len);
@@ -116,6 +160,39 @@ private:
     // initialized entry.
     mutable Entry  cache_[CACHE_CAP];
     mutable size_t cache_count_ = 0;
+
+    // ---------- OTA IR state ----------
+    //
+    // IR_OTA_BUFFER_BYTES sized for ~2x the largest blob we've seen (~4KB
+    // with source trailer). Sits in .bss on the particle build. Override
+    // per-device in hal/devices/<name>.h — rico (OG Photon) drops it to
+    // 6KB to reclaim WICED's heap headroom; Photon 2 / Argon can bump it
+    // back up if scripts grow past 4KB.
+#ifndef IR_OTA_BUFFER_BYTES
+#define IR_OTA_BUFFER_BYTES 8192
+#endif
+#ifndef IR_SCRIPT_NAME_MAX
+#define IR_SCRIPT_NAME_MAX 48
+#endif
+
+    // Pending slot. pending_len_ == 0 means "empty, telemetry may fill".
+    // Non-zero means "full, main thread must consume". Telemetry writes
+    // buffer + name + sha, then length (length last, after memory barriers
+    // implicit in the blocking fetch path); main reads length then the rest
+    // then zeros length. One-slot handoff — no mutex.
+    char           ir_ota_buf_[IR_OTA_BUFFER_BYTES];
+    volatile size_t ir_pending_len_ = 0;
+    char           ir_pending_ptr_[IR_SCRIPT_NAME_MAX] = {0};
+    // 64-char hex + NUL. Extracted from the fetched blob's header *before*
+    // load() mangles the buffer — load flips whitespace to NUL and the sha
+    // line becomes hard to re-find after that.
+    char           ir_pending_sha_[65] = {0};
+
+    // Identity of the currently-loaded script: name for humans, sha for
+    // change detection. Name alone was the old check; it misses re-publishes
+    // under the same name, so the sha is the real source of truth.
+    char           ir_loaded_ptr_[IR_SCRIPT_NAME_MAX] = {0};
+    char           ir_loaded_sha_[65] = {0};
 };
 
 #endif  // PLATFORM_ID

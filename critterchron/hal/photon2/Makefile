@@ -48,7 +48,9 @@ ENGINE_COPIES := \
 	$(SRC_DIR)/CritterEngine.cpp \
 	$(SRC_DIR)/interface/Config.h \
 	$(SRC_DIR)/interface/LedSink.h \
-	$(SRC_DIR)/interface/TimeSource.h
+	$(SRC_DIR)/interface/TimeSource.h \
+	$(SRC_DIR)/ir/IrRuntime.h \
+	$(SRC_DIR)/ir/IrRuntime.cpp
 
 # Particle-common shim copies. Wildcarded so new additions to
 # hal/particle/src/ pick up automatically.
@@ -116,6 +118,10 @@ $(SRC_DIR)/interface/LedSink.h: $(HAL_ROOT)/interface/LedSink.h | $(SRC_DIR)/int
 	cp $< $@
 $(SRC_DIR)/interface/TimeSource.h: $(HAL_ROOT)/interface/TimeSource.h | $(SRC_DIR)/interface
 	cp $< $@
+$(SRC_DIR)/ir/IrRuntime.h: $(HAL_ROOT)/ir/IrRuntime.h | $(SRC_DIR)/ir
+	cp $< $@
+$(SRC_DIR)/ir/IrRuntime.cpp: $(HAL_ROOT)/ir/IrRuntime.cpp | $(SRC_DIR)/ir
+	cp $< $@
 
 # Generic copy rule for every file in hal/particle/src/. Order-only dep on
 # $(SRC_DIR) so the copy rule fires before anything tries to read it.
@@ -143,5 +149,6 @@ $(SRC_DIR)/creds.h: FORCE | $(SRC_DIR)
 
 clean:
 	rm -rf $(SRC_DIR)/CritterEngine.h $(SRC_DIR)/CritterEngine.cpp \
-	       $(SRC_DIR)/interface $(SRC_DIR)/ir $(SRC_DIR)/creds.h \
+	       $(SRC_DIR)/interface $(SRC_DIR)/ir \
+	       $(SRC_DIR)/creds.h \
 	       $(PARTICLE_COPIES) $(FIRMWARE_BIN)

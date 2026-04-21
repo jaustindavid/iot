@@ -1,0 +1,26 @@
+# tests/night.crit — exercise the night palette on the HAL / sim.
+#
+# Day: bug cycles rainbow.
+# Night: bug is a warm-white static, `rainbow` collapses to `warm`.
+#        Unlisted day colors fall through NIGHT_DEFAULT (dim red).
+--- colors ---
+red:     (255, 0, 0)
+green:   (0, 255, 0)
+blue:    (0, 0, 255)
+warm:    (255, 180, 100)
+rainbow: cycle red 2, green 2, blue 2
+bug:     (128, 128, 128)
+night:
+  bug:     warm
+  rainbow: warm
+  default: (32, 0, 0)
+--- agents ---
+bug: state {none}
+bug starts at (8, 4)
+--- simulation ---
+tick rate: 100ms
+--- behavior ---
+bug:
+  set color = rainbow
+  pause 10
+  done

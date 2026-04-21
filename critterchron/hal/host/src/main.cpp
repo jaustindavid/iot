@@ -24,7 +24,7 @@
 static void usage(const char* argv0) {
     std::fprintf(stderr,
         "Usage: %s [--ticks N] [--seed N] [--dump-fake-time YYYY-MM-DDTHH:MM] "
-        "[--dump-state PATH]\n", argv0);
+        "[--dump-state PATH] [--night]\n", argv0);
 }
 
 static time_t parse_fake_time(const char* s) {
@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     bool have_seed = false;
     const char* fake_time_str = nullptr;
     const char* dump_path = nullptr;
+    bool night = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--ticks") && i+1 < argc) {
@@ -57,6 +58,8 @@ int main(int argc, char** argv) {
             fake_time_str = argv[++i];
         } else if (!std::strcmp(argv[i], "--dump-state") && i+1 < argc) {
             dump_path = argv[++i];
+        } else if (!std::strcmp(argv[i], "--night")) {
+            night = true;
         } else {
             usage(argv[0]);
             return 2;
@@ -80,6 +83,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (have_seed) engine.seedRng(seed);
+    engine.setNightMode(night);
 
     std::ofstream dump;
     if (dump_path) {

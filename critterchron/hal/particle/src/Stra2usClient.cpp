@@ -1,6 +1,8 @@
 #if defined(PLATFORM_ID)
 
 #include "Stra2usClient.h"
+#include "ir/IrRuntime.h"
+#include "sha256.h"
 #include <string.h>
 
 Stra2usClient::Stra2usClient(const char* host, int port,
@@ -406,6 +408,289 @@ void Stra2usClient::poll_key(size_t idx) {
 void Stra2usClient::poll_all() {
     size_t n = cache_count_;
     for (size_t i = 0; i < n; ++i) poll_key(i);
+}
+
+// ---------- OTA IR ----------
+
+bool Stra2usClient::kv_fetch_str_(const char* full_key,
+                                  char* buf, size_t buf_cap, size_t& out_len) {
+    out_len = 0;
+    if (!buf || buf_cap < 2) return false;
+
+    char uri[160];
+    snprintf(uri, sizeof(uri), "/kv/%s", full_key);
+
+    uint32_t ts = (uint32_t)Time.now();
+    char sig[65];
+    sign_(uri, nullptr, 0, ts, sig);
+
+    char req[512];
+    int req_len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "X-Client-ID: %s\r\n"
+        "X-Timestamp: %lu\r\n"
+        "X-Signature: %s\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        uri, host_, port_, client_id_, (unsigned long)ts, sig);
+    if (req_len >= (int)sizeof(req)) return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensure_connected_()) { delay(100); continue; }
+        if (send_all_(req, req_len)) break;
+        if (attempt == 1) return false;
+    }
+
+    // read_response_ fills buf with raw body bytes (and null-terminates at
+    // the byte after the last filled byte). For msgpack str we then strip
+    // the header in place.
+    int status = read_response_(uri, buf, buf_cap);
+    if (status != 200) return false;
+
+    uint8_t* b = (uint8_t*)buf;
+    size_t hdr_len = 0;
+    size_t payload_len = 0;
+
+    if ((b[0] & 0xe0) == 0xa0) {                 // fixstr
+        payload_len = b[0] & 0x1f;
+        hdr_len = 1;
+    } else if (b[0] == 0xd9) {                   // str8
+        payload_len = b[1];
+        hdr_len = 2;
+    } else if (b[0] == 0xda) {                   // str16
+        payload_len = ((size_t)b[1] << 8) | b[2];
+        hdr_len = 3;
+    } else if (b[0] == 0xdb) {                   // str32
+        payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
+                      ((size_t)b[3] << 8)  |  b[4];
+        hdr_len = 5;
+    } else {
+        return false;
+    }
+
+    if (hdr_len + payload_len > buf_cap - 1) return false;
+
+    // Shift payload to the start of the buffer, null-terminate.
+    if (hdr_len > 0) memmove(buf, buf + hdr_len, payload_len);
+    buf[payload_len] = '\0';
+    out_len = payload_len;
+    return true;
+}
+
+static inline bool is_hex_(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Compute SHA256 over the blob with wall-clock drift normalized out:
+//   * the `encoded_at <ts>` line value is replaced with `encoded_at <stripped>`
+//   * the trailing `END <fletcher>` line is replaced with `END <stripped>`
+//     (and trailing whitespace consumed, matching Python's `\s*$` greedy).
+//
+// This MUST mirror _normalize_for_hash + _content_sha in tools/publish_ir.py
+// — the device recomputes this on the fetched blob and compares against the
+// sidecar. If the two sides normalize differently, the device either reloads
+// every poll or skips a real update.
+//
+// Writes 64 lowercase hex chars + '\0' to out_hex. Returns false if the blob
+// is malformed (missing encoded_at or END line).
+static bool compute_content_sha_(const char* buf, size_t len, char* out_hex) {
+    const char* bend = buf + len;
+
+    // Find the encoded_at line. Anchor on "\nencoded_at " (always preceded
+    // by "CRIT <ver>\n" so never at position 0).
+    const char* ea_start = nullptr;
+    {
+        const char* needle = "\nencoded_at ";
+        const size_t nlen = 12;
+        size_t scan = len < 1024 ? len : 1024;
+        for (size_t i = 0; i + nlen <= scan; ++i) {
+            if (memcmp(buf + i, needle, nlen) == 0) { ea_start = buf + i + 1; break; }
+        }
+    }
+    if (!ea_start) return false;
+    const char* ea_nl = ea_start;
+    while (ea_nl < bend && *ea_nl != '\n') ++ea_nl;  // exclusive: points at '\n'
+
+    // Find the END line. Scan from buf start to match Python's first-match
+    // semantics; in practice END is the final line so it's at the tail.
+    const char* end_start = nullptr;
+    {
+        const char* needle = "\nEND ";
+        const size_t nlen = 5;
+        for (size_t i = 0; i + nlen <= len; ++i) {
+            if (memcmp(buf + i, needle, nlen) == 0) { end_start = buf + i + 1; break; }
+        }
+    }
+    if (!end_start) return false;
+
+    // Consume "END " + hex + trailing whitespace, matching Python's
+    // `^END [0-9a-fA-F]+\s*$` under MULTILINE + count=1. Subtle: `$` in
+    // MULTILINE matches *before* a `\n` or at EOS, so greedy `\s*` has to
+    // leave `$` a landing spot. For blobs that end at END (body-only), all
+    // trailing whitespace gets consumed up to EOS. For blobs followed by a
+    // SOURCE trailer, the engine backtracks to keep the `\n` between END
+    // and SOURCE — `\s*` matches zero chars and `$` matches before that
+    // newline. We emulate the backtrack: greedy-advance, then if we landed
+    // on non-whitespace (a SOURCE trailer, not EOS), rewind one byte iff
+    // the byte behind us is `\n`. Without this step the device's hash
+    // diverges from publish_ir.py on every with-source blob.
+    const char* p = end_start + 4;
+    while (p < bend && is_hex_(*p)) ++p;
+    while (p < bend && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p < bend && p > end_start && *(p - 1) == '\n') --p;
+    const char* end_stop = p;
+
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t*)buf, (size_t)(ea_start - buf));
+    static const char LIT_EA[]  = "encoded_at <stripped>";
+    sha256_update(&ctx, (const uint8_t*)LIT_EA, sizeof(LIT_EA) - 1);
+    sha256_update(&ctx, (const uint8_t*)ea_nl, (size_t)(end_start - ea_nl));
+    static const char LIT_END[] = "END <stripped>";
+    sha256_update(&ctx, (const uint8_t*)LIT_END, sizeof(LIT_END) - 1);
+    sha256_update(&ctx, (const uint8_t*)end_stop, (size_t)(bend - end_stop));
+
+    uint8_t digest[32];
+    sha256_final(&ctx, digest);
+    static const char HEX[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        out_hex[2*i]   = HEX[(digest[i] >> 4) & 0xf];
+        out_hex[2*i+1] = HEX[digest[i] & 0xf];
+    }
+    out_hex[64] = '\0';
+    return true;
+}
+
+void Stra2usClient::ir_poll() {
+    // Skip if the main thread hasn't consumed the previous fetch yet. Next
+    // poll cycle will retry.
+    if (ir_pending_len_ != 0) return;
+
+    // Pointer key is device-specific with no app-level fallback: every
+    // device should explicitly declare which script it runs. If the key is
+    // unset or empty, we keep whatever's currently loaded.
+    char ptr_key[96];
+    snprintf(ptr_key, sizeof(ptr_key), "%s/%s/ir", app_, device_);
+    char new_ptr[IR_SCRIPT_NAME_MAX];
+    size_t n = 0;
+    if (!kv_fetch_str_(ptr_key, new_ptr, sizeof(new_ptr), n)) return;
+    if (n == 0) return;
+
+    // Two-step fetch. The sidecar `<app>/scripts/<name>/sha` holds the
+    // 64-char hex *content_sha* of the blob (SHA256 over the blob with
+    // encoded_at + trailing END lines normalized out — see
+    // compute_content_sha_ above and _content_sha in publish_ir.py).
+    // Fetching it is ~100 bytes instead of multi-KB. If the sidecar's sha
+    // matches what we've got loaded, we're done for this cycle and skip
+    // the big blob fetch entirely.
+    //
+    // content_sha shifts on source edits AND on encoder behavior changes,
+    // but NOT on pure republishes of the same source with the same encoder
+    // (those only perturb encoded_at + Fletcher). So devices reload iff
+    // there's real content to pull — no missed updates, no needless reloads.
+    //
+    // publish_ir.py writes blob-then-sidecar, so a torn upload leaves the
+    // sidecar pointing at the *old* sha; devices see no change and wait
+    // for the next publish. The verify step below catches the reversed
+    // case (sidecar says new, blob is still old) by recomputing content_sha
+    // on the blob we fetched and checking it against the sidecar.
+    char sha_key[96 + IR_SCRIPT_NAME_MAX + 8];
+    snprintf(sha_key, sizeof(sha_key), "%s/scripts/%s/sha", app_, new_ptr);
+    char sidecar_sha[96] = {0};
+    size_t sha_len = 0;
+    bool have_sidecar = kv_fetch_str_(sha_key, sidecar_sha, sizeof(sidecar_sha), sha_len);
+    if (have_sidecar && sha_len == 64 &&
+        strcmp(sidecar_sha, ir_loaded_sha_) == 0) {
+        // Sidecar matches loaded — no blob fetch this cycle. Fast path.
+        return;
+    }
+
+    char script_key[96 + IR_SCRIPT_NAME_MAX];
+    snprintf(script_key, sizeof(script_key), "%s/scripts/%s", app_, new_ptr);
+    size_t blob_len = 0;
+    if (!kv_fetch_str_(script_key, ir_ota_buf_, sizeof(ir_ota_buf_), blob_len)) {
+        Log.warn("ir_poll: fetch failed for %s", script_key);
+        return;
+    }
+
+    char new_sha[65];
+    if (!compute_content_sha_(ir_ota_buf_, blob_len, new_sha)) {
+        Log.error("ir_poll: malformed blob for %s (no encoded_at/END); ignoring", new_ptr);
+        return;
+    }
+
+    // Torn-upload guard: if we got a sidecar, content_sha(blob) must match
+    // it. Reject the mismatch — a later publish will resolve it. Without a
+    // sidecar (older publisher or transient fetch error), we trust the
+    // blob's own content_sha as the identity.
+    if (have_sidecar && sha_len == 64 && strcmp(new_sha, sidecar_sha) != 0) {
+        Log.error("ir_poll: sidecar/blob content_sha mismatch for %s (sidecar=%.8s blob=%.8s); skipping",
+                  new_ptr, sidecar_sha, new_sha);
+        return;
+    }
+
+    if (strcmp(new_sha, ir_loaded_sha_) == 0) {
+        // Content-identical to what's already loaded. This path only runs
+        // when the sidecar was missing (otherwise the fast path above
+        // already short-circuited).
+        return;
+    }
+    Log.info("ir_poll: staged %s (%u bytes, sha=%.8s…)",
+             new_ptr, (unsigned)blob_len, new_sha);
+
+    // Commit: name + sha first (readers of ir_pending_ptr_/sha only trust
+    // them when len>0), then length last.
+    strncpy(ir_pending_ptr_, new_ptr, sizeof(ir_pending_ptr_) - 1);
+    ir_pending_ptr_[sizeof(ir_pending_ptr_) - 1] = '\0';
+    memcpy(ir_pending_sha_, new_sha, 65);
+    ir_pending_len_ = blob_len;
+}
+
+bool Stra2usClient::ir_apply_if_ready() {
+    size_t len = ir_pending_len_;
+    if (len == 0) return false;
+
+    // critter_ir::load mutates the buffer in place (flips whitespace to NUL)
+    // — the buffer is ours and we're about to zero the pending slot anyway,
+    // so that's fine.
+    // Preview the first line (CRIT N) and the byte count before parse —
+    // catches truncation / msgpack-unwrap bugs that would otherwise look like
+    // a parser problem.
+    {
+        char preview[24] = {0};
+        size_t pv = len < sizeof(preview) - 1 ? len : sizeof(preview) - 1;
+        for (size_t i = 0; i < pv; ++i) {
+            char c = ir_ota_buf_[i];
+            preview[i] = (c == '\n') ? '|' : (c >= 32 && c < 127 ? c : '?');
+        }
+        Log.info("ir_apply: bytes=%u preview=\"%s\"", (unsigned)len, preview);
+    }
+    bool ok = critter_ir::load(ir_ota_buf_, len);
+    if (ok) {
+        strncpy(ir_loaded_ptr_, ir_pending_ptr_, sizeof(ir_loaded_ptr_) - 1);
+        ir_loaded_ptr_[sizeof(ir_loaded_ptr_) - 1] = '\0';
+        memcpy(ir_loaded_sha_, ir_pending_sha_, 65);
+        Log.info("ir_apply: loaded %s (sha=%.8s…) "
+                 "colors=%u landmarks=%u agents=%u spawns=%u behaviors=%u insns=%u tick=%lums",
+                 ir_loaded_ptr_, ir_loaded_sha_,
+                 (unsigned)critter_ir::COLOR_COUNT,
+                 (unsigned)critter_ir::LANDMARK_COUNT,
+                 (unsigned)critter_ir::AGENT_TYPE_COUNT,
+                 (unsigned)critter_ir::SPAWN_RULE_COUNT,
+                 (unsigned)critter_ir::BEHAVIOR_COUNT,
+                 (unsigned)(critter_ir::BEHAVIOR_COUNT > 0
+                            ? critter_ir::BEHAVIORS[0].insn_count : 0),
+                 (unsigned long)critter_ir::RUNTIME_TICK_MS);
+    } else {
+        Log.error("ir_apply: parse failed for %s: %s",
+                  ir_pending_ptr_, critter_ir::lastLoadError());
+    }
+    // Free the slot regardless: a bad blob shouldn't keep us retrying the
+    // same parse on every tick. The server needs to push a new blob (or the
+    // pointer has to change) before we'll try again.
+    ir_pending_len_ = 0;
+    return ok;
 }
 
 #endif  // PLATFORM_ID

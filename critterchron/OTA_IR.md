@@ -47,16 +47,33 @@ either way). At our scale that's a few KB — well within any budget.
 
 Stra2us KV shape (under app `critterchron`):
 
-| Key                              | Value                              |
-|----------------------------------|------------------------------------|
-| `critterchron/scripts/<name>`    | Text blob (format below)           |
-| `critterchron/<device>/ir`       | String — script name, e.g. `thyme` |
+| Key                                 | Value                                             |
+|-------------------------------------|---------------------------------------------------|
+| `critterchron/scripts/<name>`       | Text blob (format below). Multi-KB.               |
+| `critterchron/scripts/<name>/sha`   | 64-char hex `src_sha256` of the blob. Sidecar.    |
+| `critterchron/<device>/ir`          | String — script name, e.g. `thyme`                |
 
-A device polls its pointer key each cycle. On change (or on cold boot if a
-pointer is set), it fetches the named blob, validates, and swaps.
+A device polls its pointer key on its own timer (default 1200s, decoupled
+from the heartbeat cadence so a stalled OTA fetch can't silence telemetry).
+On change (or cold boot with a pointer set), it fetches the sidecar first
+(~100B), compares against the loaded sha, and only pulls the blob if they
+differ. The blob embeds its own `src_sha256` in the metadata header; the
+device verifies blob-sha == sidecar-sha before applying, which catches torn
+uploads (sidecar updated but blob stale).
 
 No pointer → run compiled-in default. Pointer set but blob missing → keep
 running current IR, log `ir_fetch_fail=<name>` in the cloud heartbeat.
+
+### Why the sidecar
+
+The obvious design is to fetch the blob and compare its embedded sha. That
+works, but it pulls multi-KB every poll cycle just to discover "no change"
+99% of the time. The sidecar is a 64-byte fetch that answers the same
+question. Upload order is **blob first, sidecar second** — if the publish
+process dies between writes, the sidecar still points at the previous sha,
+devices see no change, and no stale blob gets applied. The reverse tear
+(sidecar updated but blob stale) is caught by the blob-sha verification on
+the device side.
 
 ## Wire format
 
@@ -221,7 +238,12 @@ every boot, not only when someone pushes OTA.
 Grid dims come from `creds.h` (or `-D` on host builds) and are passed into
 engine init — they're no longer part of the IR.
 
-## Upload tool
+## Tools
+
+Two CLIs sit over Stra2us KV: one publishes blobs, one points devices at
+them. Both share `tools/s2s_client.py` for auth/signing.
+
+### publish_ir
 
 ```
 python3 tools/publish_ir.py agents/thyme.crit [--name thyme]
@@ -232,19 +254,37 @@ python3 tools/publish_ir.py agents/thyme.crit [--name thyme]
 
 Behavior:
 
-1. Read creds from env: `STRA2US_URL`, `STRA2US_CLIENT_ID`, `STRA2US_SECRET_HEX`.
-2. Compute `src_sha256` over the .crit file contents.
-3. `GET /kv/critterchron/scripts/<name>` — if present, parse its metadata
-   block; if `src_sha256` matches, exit no-op (unless `--force`).
-4. Compile .crit → IR dict (reuse `CritCompiler`).
-5. Serialize to wire format (new module: `hal/ir/ir_text.py`).
-6. `PUT /kv/critterchron/scripts/<name>` with the blob as the msgpack
-   string value.
+1. Read creds from env: `STRA2US_HOST`, `STRA2US_CLIENT_ID`, `STRA2US_SECRET_HEX`.
+2. Compile .crit → IR dict, serialize to wire format via `hal/ir/ir_text.py`.
+3. Compute `src_sha256` over the .crit file contents.
+4. `GET /kv/critterchron/scripts/<name>/sha` — if it matches `src_sha256`,
+   exit no-op (unless `--force`). Cheaper than pulling the blob and parsing
+   its metadata.
+5. `PUT /kv/critterchron/scripts/<name>` — the blob.
+6. `PUT /kv/critterchron/scripts/<name>/sha` — the sidecar.
 7. Print a short summary: size, sha, key, server.
 
-The shared auth/sign code currently in `stra2us/backend/test_client.py`
-moves into a small client library (`tools/s2s_client.py`) so publish and
-future CLIs don't duplicate it.
+Step 5 before 6 is intentional: a mid-publish crash leaves the sidecar
+pointing at the previous sha and devices see no change (see "Why the
+sidecar" above).
+
+### set_ir_pointer
+
+```
+python3 tools/set_ir_pointer.py <device> <name> [--clear] [--force]
+```
+
+Writes `critterchron/<device>/ir = <name>` (or empty, with `--clear`).
+
+Before writing, it verifies the target exists by content: the sidecar value
+must be a 64-char hex string, or the blob value must start with `CRIT `.
+Presence-only checks failed open against typo'd names (some missing keys
+come back as empty strings, not nulls); content validation catches them.
+`--force` skips the check.
+
+`--clear` writes an empty string rather than DELETE'ing the key (the server
+has no DELETE). The device sees len==0 on poll and keeps the currently-loaded
+script; a reboot then comes up on the compiled-in default.
 
 ## Interpreter cost — monitoring
 
@@ -287,18 +327,107 @@ encode time, opcode-dispatch table instead of string match, etc. That's
 strictly an optimization; v1 keeps string-level interpretation for
 debuggability.
 
-## Validation strategy
+## Validation
 
 Round-trip test (pure Python): for every script in `agents/`, compile →
 encode → parse → re-encode → compare. Byte-exact on the second encode.
 
-Device-side smoke: flash ricky with `coati` baked in as `DEFAULT_IR_BLOB`.
-Publish `thyme` via the upload tool. Set
-`critterchron/ricky_raccoon/ir = thyme`. Watch:
+## End-to-end walkthrough
 
-- Stra2us heartbeat `s2s=200` and a log line `ir_swap: coati -> thyme`.
-- `interp_overruns` counter stays zero at default tick rate.
-- Revert the pointer, watch it swap back to the default.
+Steps from a clean bench to a script swap observed on a live device.
+
+### 1. Flash
+
+Build and flash the current firmware. The compiled-in `DEFAULT_IR_BLOB` is
+whatever script the Makefile was pointed at (typically `tortoise.crit`) —
+the device will run this until an OTA pointer says otherwise.
+
+```
+make -C hal/particle flash DEVICE=ricky_raccoon
+```
+
+Confirm heartbeats show the expected bootup:
+
+```
+up=12 rssi=… fw=Apr 20 2026 04:48:59 script=default …
+```
+
+`script=default` means no OTA pointer is set (or the pointer is empty) and
+the device is running the baked-in blob. Any other value means it already
+has a pointer and will re-fetch as needed.
+
+### 2. Publish
+
+Push the script you want to run to Stra2us. Idempotent — re-runs with no
+source changes are a no-op.
+
+```
+python3 tools/publish_ir.py agents/ants.crit
+  script:    agents/ants.crit
+  name:      ants
+  key:       critterchron/scripts/ants
+  size:      4812 bytes
+  src_sha:   a1b2c3…
+  ir_ver:    1
+  published: http://…/kv/critterchron/scripts/ants
+  sidecar:   http://…/kv/critterchron/scripts/ants/sha
+```
+
+Re-running immediately:
+
+```
+  up-to-date: remote src_sha matches (use --force to re-upload)
+```
+
+### 3. Point
+
+Point the device at the published script.
+
+```
+python3 tools/set_ir_pointer.py ricky_raccoon ants
+  verified: sidecar critterchron/scripts/ants/sha sha=a1b2c3d4…
+  set: http://…/kv/critterchron/ricky_raccoon/ir → ants
+```
+
+The `verified:` line confirms `set_ir_pointer` reached the sidecar before
+writing. A typo'd name would have aborted with `error: 'antz' not found…`.
+
+### 4. Observe the swap
+
+On the device's next `ir_poll` cycle (≤20 min by default, configurable via
+`ir_poll_interval_s`), the device fetches the sidecar, sees a sha mismatch
+against `ir_loaded_sha_`, pulls the blob, verifies, and calls
+`engine.reinit()`. The subsequent heartbeat reflects the new script:
+
+```
+up=1432 … script=ants@a1b2c3d4 bri=(5<14<128) phys=(… agents=18 …
+```
+
+`script=<name>@<sha8>` is the content-addressed identity — `name` alone
+would miss re-publishes under the same name. Watch for the sha portion to
+update every time you push a new version of the same script.
+
+### 5. Revert
+
+Point the device back at a different script, or clear the pointer:
+
+```
+python3 tools/set_ir_pointer.py ricky_raccoon tortoise
+# or
+python3 tools/set_ir_pointer.py ricky_raccoon --clear
+```
+
+`--clear` keeps the currently-loaded script live (no DELETE on the server,
+empty value = skip), and the next reboot comes up on `DEFAULT_IR_BLOB`.
+
+### What to watch for
+
+- `interp_overruns` stays zero at default tick rate — a nonzero value means
+  the new script is too expensive for the budget (see "Interpreter cost").
+- Heartbeats continue during/after the swap. `ir_poll` runs on a separate
+  timer from heartbeat publish so a stalled fetch can't silence telemetry.
+- `script=` field in the heartbeat flips within one poll cycle of the
+  pointer change. Sha portion flips on re-publish of the same name.
 
 ## Out of scope for v1
 
@@ -328,7 +457,9 @@ Publish `thyme` via the upload tool. Set
    heartbeat paths, add overrun counter, wire to Config budget knob.
 8. **Pointer polling + swap.** Stra2usClient watches `<device>/ir`,
    triggers reload on change.
-9. **End-to-end test** per "Validation strategy" above.
+9. **End-to-end walkthrough** — flash → publish → point → swap → revert,
+   per the section above. Verified on ricky (Photon 2) across multiple
+   script flips.
 
 Steps 1–3 are pure Python and ship the upload tool against today's server
 before any firmware changes.

@@ -40,15 +40,30 @@ SYSTEM_THREAD(ENABLED);
 #error "creds.h must define GRID_WIDTH and GRID_HEIGHT"
 #endif
 
-// Physics tick rate is a property of the .crit script and comes from the
-// generated IR header (critter_ir::TICK_RATE_MS). The device header must
-// not override it — the sim and the hardware share the same contract.
-static constexpr uint32_t PHYSICS_TICK_MS = critter_ir::TICK_RATE_MS;
+// Physics tick rate is a property of the .crit script. Read live from
+// critter_ir::RUNTIME_TICK_MS so an OTA IR swap picks up the new script's
+// TICK line — a constexpr read of the compile-time default would pin us
+// to whatever the baked-in .crit specified. Device header must not
+// override it; the sim and the hardware share the same contract.
+static inline uint32_t physics_tick_ms() { return critter_ir::RUNTIME_TICK_MS; }
 
-// Render tick is firmware-level, not device-level. 20ms = 50Hz; worst-case
-// render ~9ms leaves comfortable headroom. Bump down further if you need
-// smoother smear at the cost of CPU.
-static constexpr uint32_t RENDER_TICK_MS = 20;
+// Render tick: 20ms = 50Hz on capable hardware (Photon 2 / Argon — DMA-based
+// WS2812 driver, no IRQ impact). OG Photon / P1 uses a bit-banged driver
+// that disables interrupts for ~7ms per show(); at 50Hz that's ~35% IRQs-off
+// and the WICED Wi-Fi stack gets starved out of associating. Override per
+// device in hal/devices/<name>.h — rico (P1) sets this to 50ms/20Hz.
+#ifndef RENDER_TICK_MS
+#define RENDER_TICK_MS 20
+#endif
+
+// Telemetry worker stack. The worker does HTTPS-ish TCP + msgpack parse +
+// HMAC-SHA256 signing — deepest call chains measured run ~3KB, so 5KB is
+// 1.5x headroom. Was 10KB historically; dropped for OG Photon's ~80KB
+// user-RAM budget. Bump in a device header if a future consumer (deeper
+// IR-poll, bigger SHA contexts, etc.) pushes the stack harder.
+#ifndef TELEMETRY_STACK_BYTES
+#define TELEMETRY_STACK_BYTES 5120
+#endif
 
 // Brightness is a 0..255 scale factor applied per channel at the sink.
 // Device headers override for their hardware / ambient tuning.
@@ -60,6 +75,17 @@ static constexpr uint32_t RENDER_TICK_MS = 20;
 #endif
 #ifndef TIMEZONE_OFFSET_HOURS
 #define TIMEZONE_OFFSET_HOURS -5.0f
+#endif
+
+// Night-mode Schmitt thresholds. Mirror the defaults in devices/device_name.h
+// so a device header that forgot to supply them still gets reasonable
+// behavior instead of a compile error. Anchored at MIN_BRIGHTNESS — see
+// device_name.h for the design rationale (floor-clamp hue-distortion regime).
+#ifndef NIGHT_ENTER_BRIGHTNESS
+#define NIGHT_ENTER_BRIGHTNESS (MIN_BRIGHTNESS)
+#endif
+#ifndef NIGHT_EXIT_BRIGHTNESS
+#define NIGHT_EXIT_BRIGHTNESS  (MIN_BRIGHTNESS + 4)
 #endif
 
 // Heartbeat cadence in seconds. Compiled-in default when Stra2us has no
@@ -77,6 +103,15 @@ static constexpr uint32_t RENDER_TICK_MS = 20;
 // Particle's 1-event/sec rate limit.
 #ifndef CLOUD_HEARTBEEP_DEFAULT
 #define CLOUD_HEARTBEEP_DEFAULT 300
+#endif
+
+// OTA IR poll cadence in seconds. Decoupled from the heartbeat: pointer
+// changes are human-scale events, and running ir_poll() every heartbeat
+// added 1-2 HTTP round trips to the hot path. Floored at 60s in the worker
+// loop. Default 1200s = 20 min — fresh pointers propagate within that
+// window.
+#ifndef IR_POLL_INTERVAL_DEFAULT
+#define IR_POLL_INTERVAL_DEFAULT 1200
 #endif
 
 // Light sensor pin defaults match the coaticlock hardware layout: a CDS
@@ -150,6 +185,17 @@ static constexpr uint32_t RESCUE_HOLD_MS = 60000;
 static bool          g_rescue_mode       = false;
 static unsigned long g_rescue_start_ms   = 0;
 
+// P1/Photon has a VBAT-backed RTC, so Time.isValid() latches true from the
+// previous boot's time before Wi-Fi has even associated. Without a gate the
+// device would skip the spinner and run the simulation on stale RTC time
+// while still disconnected (white breathe). Hold rendering until we've seen
+// the cloud once and forced a fresh syncTime; if cloud never comes, fall
+// back to RTC after CLOUD_WAIT_FALLBACK_MS so an offline device still shows
+// *something* rather than spinning forever.
+static constexpr uint32_t CLOUD_WAIT_FALLBACK_MS = 60000;
+static bool          g_cloud_seen          = false;
+static unsigned long g_cloud_wait_start_ms = 0;
+
 static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // Local wall-clock minute from a TimeSource. The shim uses this to detect
@@ -197,10 +243,22 @@ static int telemetry_cycle() {
     // Timing fields use (avg<max<budget)us — ordering implies "avg is within
     // max is within budget", so a glance at the numbers tells you both
     // current cost and headroom. Budgets are the nominal tick periods.
-    constexpr uint32_t PHYS_BUDGET_US = (uint32_t)PHYSICS_TICK_MS * 1000UL;
+    const uint32_t PHYS_BUDGET_US = physics_tick_ms() * 1000UL;
     constexpr uint32_t REND_BUDGET_US = (uint32_t)RENDER_TICK_MS  * 1000UL;
+    const char* script = g_cfg.ir_loaded_script();
+    const char* sha    = g_cfg.ir_loaded_sha();
+    char script_tag[IR_SCRIPT_NAME_MAX + 16];
+    if (script && *script && sha && *sha) {
+        // name + first 8 hex of sha (e.g. `script=thyme@ab12cd34`) so the
+        // server can distinguish re-publishes under the same name without
+        // paying for a full 64-char digest in every heartbeat.
+        snprintf(script_tag, sizeof(script_tag), "%.*s@%.8s",
+                 (int)IR_SCRIPT_NAME_MAX, script, sha);
+    } else {
+        snprintf(script_tag, sizeof(script_tag), "default");
+    }
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d mem=%lu rst=%d fw=%s "
+        "up=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s "
         "bri=(%u<%u<%u) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
@@ -210,6 +268,7 @@ static int telemetry_cycle() {
         (unsigned long)System.freeMemory(),
         (int)System.resetReason(),
         APP_VERSION,
+        script_tag,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
@@ -263,12 +322,25 @@ static void telemetry_worker() {
     bool wifi_prev = false;
     bool first     = true;
 
-    // Pre-register heartbeep + cloud_heartbeep so cycle 1's poll_all pulls
-    // them live. Otherwise they'd only be registered by the get_int calls
-    // below (which run AFTER telemetry_cycle) and the live overrides would
-    // take five minutes to kick in.
-    (void)g_cfg.get_int("heartbeep",       HEARTBEEP_DEFAULT);
-    (void)g_cfg.get_int("cloud_heartbeep", CLOUD_HEARTBEEP_DEFAULT);
+    // Pre-register heartbeep + cloud_heartbeep + ir_poll_interval so cycle 1's
+    // poll_all pulls them live. Otherwise they'd only be registered by the
+    // get_int calls below (which run AFTER telemetry_cycle) and the live
+    // overrides would take five minutes to kick in. Night thresholds same
+    // story — registered here so the very first 200ms light-block poll
+    // sees the live value on a freshly-flashed device.
+    (void)g_cfg.get_int("heartbeep",               HEARTBEEP_DEFAULT);
+    (void)g_cfg.get_int("cloud_heartbeep",         CLOUD_HEARTBEEP_DEFAULT);
+    (void)g_cfg.get_int("ir_poll_interval",        IR_POLL_INTERVAL_DEFAULT);
+    (void)g_cfg.get_int("night_enter_brightness",  NIGHT_ENTER_BRIGHTNESS);
+    (void)g_cfg.get_int("night_exit_brightness",   NIGHT_EXIT_BRIGHTNESS);
+
+    // OTA IR poll timer. Separate from the heartbeat cadence because pointer
+    // changes propagate at human scale, not telemetry scale. Initialized so
+    // the first poll fires on the first iteration after startup_delay_ms,
+    // giving the network stack time to settle but still picking up pending
+    // OTA targets promptly on reboot.
+    unsigned long last_ir_poll_ms = 0;
+    bool          ir_first        = true;
 
     while (true) {
         if (millis() < startup_delay_ms) { delay(100); continue; }
@@ -306,6 +378,23 @@ static void telemetry_worker() {
             // Transient failure — exponential backoff, capped at hb.
             next_interval_ms = backoff_ms;
             backoff_ms = (backoff_ms * 2 < hb_ms) ? backoff_ms * 2 : hb_ms;
+        }
+
+        // OTA IR poll, on its own slow cadence. Runs after telemetry_cycle
+        // rather than inside it so a stalled ir_poll can't delay the next
+        // heartbeat — worst case we skip an OTA check, not a heartbeat.
+        // First pass fires immediately on startup so a pointer set while the
+        // device was offline still gets picked up on boot without a 20-min
+        // wait.
+        int ir_int_s = g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
+        if (ir_int_s < 60) ir_int_s = 60;
+        unsigned long ir_int_ms = (unsigned long)ir_int_s * 1000UL;
+        if (ir_first || (now - last_ir_poll_ms >= ir_int_ms)) {
+            g_cfg.connect();
+            g_cfg.ir_poll();
+            g_cfg.close();
+            last_ir_poll_ms = now;
+            ir_first = false;
         }
 
         // Failsafe heartbeat to Particle cloud. Fires at most once per
@@ -371,16 +460,22 @@ void setup() {
     Time.zone(TIMEZONE_OFFSET_HOURS);
     Particle.syncTime();
 
+    // Explicit Wi-Fi kick. AUTOMATIC + SYSTEM_THREAD(ENABLED) is supposed
+    // to do this for us, but calling it explicitly is documented-safe and
+    // cheap — on OG Photon the implicit path has been flaky.
+    WiFi.on();
+    Particle.connect();
+
     if (!g_engine.begin()) {
         Log.error("CritterEngine::begin() failed");
     }
     // RNG seed: bake in something device-ish so two units diverge.
     g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
 
-#if defined(STRA2US_HOST)
-    g_tel_thread = new Thread("telemetry", telemetry_worker,
-                              OS_THREAD_PRIORITY_DEFAULT, 10240);
-#endif
+    // Telemetry thread moved out of setup(): on RAM-tight devices (OG
+    // Photon with ~16KB free at boot) allocating the 10KB stack here
+    // starved WICED of buffers and Wi-Fi never associated. Lazy-started
+    // in loop() once the cloud has actually been seen.
 
     Log.info("CritterChron Initialized. %dx%d rot=%d fw=%s reset=%d",
              GRID_WIDTH, GRID_HEIGHT, GRID_ROTATION, APP_VERSION, reason);
@@ -430,6 +525,37 @@ void loop() {
         g_bri = bri;
         g_bri_min = (uint8_t)min_b;
         g_bri_max = (uint8_t)max_b;
+
+        // Schmitt trigger into night mode. Drive off the smoothed `bri`
+        // (the value that actually reaches the panel) rather than the
+        // instantaneous sensor read, so a single dark sample doesn't
+        // flip the palette. Enter at the sink's floor — the brightness
+        // regime where the NeoPixel floor-clamp starts rounding colors
+        // toward white — and exit a few units above so a candle flicker
+        // doesn't oscillate. Night palette only exists for blobs that
+        // declared one; engine.setNightMode on a bare blob is a no-op
+        // at render time (resolveColor falls through to day palette).
+        //
+        // Both thresholds are Stra2us-tunable (`night_enter_brightness`,
+        // `night_exit_brightness`). Compile-time defaults from the device
+        // header remain the seed. Clamp exit >= enter + 1 on read so a
+        // misconfigured KV (exit <= enter) can't deadlock the trigger
+        // into a single state — minimum 1 LSB of hysteresis is preserved
+        // even under adversarial input.
+        int ne = g_cfg.get_int("night_enter_brightness", NIGHT_ENTER_BRIGHTNESS);
+        int nx = g_cfg.get_int("night_exit_brightness",  NIGHT_EXIT_BRIGHTNESS);
+        if (ne < 0)   ne = 0;
+        if (ne > 255) ne = 255;
+        if (nx < ne + 1) nx = ne + 1;
+        if (nx > 255)    nx = 255;
+        if (!g_engine.nightMode() && bri <= (uint8_t)ne) {
+            g_engine.setNightMode(true);
+            Log.info("night: ON (bri=%u <= %d)", (unsigned)bri, ne);
+        } else if (g_engine.nightMode() && bri >= (uint8_t)nx) {
+            g_engine.setNightMode(false);
+            Log.info("night: OFF (bri=%u >= %d)", (unsigned)bri, nx);
+        }
+
         if (now - last_light_log_ms >= 5000) {
             last_light_log_ms = now;
             Log.info("light raw=%d cal=[%d,%d] target=%u bri=%u range=[%d,%d]",
@@ -454,6 +580,68 @@ void loop() {
         Log.info("Rescue hold elapsed, starting engine");
     }
 
+    // Cloud-first gate — see CLOUD_WAIT_FALLBACK_MS commentary above.
+    // Define CLOUD_WAIT_DEBUG to re-enable the per-5s progress logs and
+    // spinner-draw counter that were used to diagnose the OG Photon
+    // WICED/RAM-starvation bug; off by default to keep serial quiet.
+    if (!g_cloud_seen) {
+        if (g_cloud_wait_start_ms == 0) {
+            g_cloud_wait_start_ms = now;
+#if defined(CLOUD_WAIT_DEBUG)
+            Log.info("cloud-wait gate entered at t=%lums: wifi.ready=%d "
+                     "particle.connected=%d time.valid=%d",
+                     now, (int)WiFi.ready(), (int)Particle.connected(),
+                     (int)Time.isValid());
+#endif
+        }
+        if (Particle.connected()) {
+            g_cloud_seen = true;
+            Particle.syncTime();
+            last_sync_minute = -1;
+            Log.info("cloud first-contact after %lums, forcing syncTime",
+                     now - g_cloud_wait_start_ms);
+#if defined(STRA2US_HOST)
+            if (g_tel_thread == nullptr) {
+                g_tel_thread = new Thread("telemetry", telemetry_worker,
+                                          OS_THREAD_PRIORITY_DEFAULT,
+                                          TELEMETRY_STACK_BYTES);
+                Log.info("telemetry thread started (stack=%u)",
+                         (unsigned)TELEMETRY_STACK_BYTES);
+            }
+#endif
+        } else if (now - g_cloud_wait_start_ms >= CLOUD_WAIT_FALLBACK_MS) {
+            g_cloud_seen = true;
+            Log.warn("cloud wait timeout (%lums); falling back to RTC. "
+                     "final state: wifi.ready=%d time.valid=%d",
+                     (unsigned long)CLOUD_WAIT_FALLBACK_MS,
+                     (int)WiFi.ready(), (int)Time.isValid());
+        } else {
+#if defined(CLOUD_WAIT_DEBUG)
+            static unsigned long last_wait_log_ms = 0;
+            static uint32_t      spinner_draws    = 0;
+            if (now - last_wait_log_ms >= 5000) {
+                last_wait_log_ms = now;
+                Log.info("cloud-wait: t=%lums wifi.ready=%d particle.connected=%d "
+                         "time.valid=%d spinner_draws=%lu",
+                         now, (int)WiFi.ready(), (int)Particle.connected(),
+                         (int)Time.isValid(), (unsigned long)spinner_draws);
+            }
+#endif
+            // Deliberately slower than RENDER_TICK_MS so OG Photon's
+            // bit-banged WS2812 show() doesn't starve WICED Wi-Fi of IRQs
+            // during the initial association window. 100ms = 10Hz = ~7%
+            // IRQ-off duty cycle.
+            if (now - last_render_tick >= 100) {
+                last_render_tick = now;
+                draw_spinner(now);
+#if defined(CLOUD_WAIT_DEBUG)
+                ++spinner_draws;
+#endif
+            }
+            return;
+        }
+    }
+
     // Diagnostic rollup, emitted once per second. Tracks the extremes so a
     // slow outlier tick isn't averaged into invisibility.
     static unsigned long diag_next_ms      = 0;
@@ -468,8 +656,26 @@ void loop() {
     static uint32_t      diag_astar_total  = 0;
     static uint32_t      diag_astar_max    = 0;
 
+#if defined(STRA2US_HOST)
+    // OTA IR swap. Consume a pending blob (if one has been fetched by the
+    // telemetry thread) and re-seat the engine against the new tables.
+    // Runs *before* physics so we never swap mid-tick — processAgent reads
+    // BEHAVIORS[beh_idx].insns[pc] and those pointers must not shift under
+    // it. Parse + reinit cost runs <10ms in practice.
+    if (g_cfg.ir_apply_if_ready()) {
+        if (!g_engine.reinit()) {
+            Log.error("engine.reinit() failed after OTA IR swap");
+        } else {
+            // Fresh RNG entropy for the new script so two simultaneously-
+            // swapped devices diverge rather than move in lockstep.
+            g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
+            last_sync_minute = -1;   // force a syncTime on next physics tick
+        }
+    }
+#endif
+
     // Physics tick
-    if (now - last_physics_tick >= PHYSICS_TICK_MS) {
+    if (now - last_physics_tick >= physics_tick_ms()) {
         last_physics_tick = now;
 
         if (g_clock.valid()) {
@@ -505,7 +711,7 @@ void loop() {
             return;
         }
 
-        float blend = (float)(now - last_physics_tick) / (float)PHYSICS_TICK_MS;
+        float blend = (float)(now - last_physics_tick) / (float)physics_tick_ms();
         if (blend > 1.0f) blend = 1.0f;
         uint32_t t0 = micros();
         g_engine.render(blend);

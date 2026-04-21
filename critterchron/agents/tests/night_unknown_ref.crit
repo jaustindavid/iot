@@ -1,0 +1,18 @@
+# Negative fixture — night override's value is a name reference to a
+# color that doesn't exist in the day palette. Catches the second form
+# of the same footgun (`pulse: warmish` when `warmish` was a typo for
+# `warm`).
+--- colors ---
+red:     (255, 0, 0)
+warm:    (255, 180, 100)
+night:
+  red:    warmish     # <-- typo; no day color 'warmish'
+--- agents ---
+up to 1 red
+red starts at (0, 0)
+--- simulation ---
+tick rate: 50ms
+--- behavior ---
+red:
+  pause 1
+  done

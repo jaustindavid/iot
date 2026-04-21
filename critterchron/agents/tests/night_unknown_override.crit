@@ -1,0 +1,19 @@
+# Negative fixture — night override names a color that doesn't exist in
+# the day palette. This is the swarm.crit `landed:` footgun: the Python
+# sim used to accept it silently, the HAL loader rejected it at boot,
+# and the device went black. The compiler now rejects it up front.
+--- colors ---
+leaf:    (0, 255, 0)
+locust:  (10, 196, 10)
+night:
+  leaf:    (0, 1, 0)
+  landed:  (0, 1, 0)   # <-- no day color named 'landed'
+--- agents ---
+up to 1 locust
+locust starts at (0, 0)
+--- simulation ---
+tick rate: 50ms
+--- behavior ---
+locust:
+  pause 1
+  done

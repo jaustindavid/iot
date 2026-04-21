@@ -9,6 +9,10 @@
 tortoise: (64, 48, 0)   # agent body color
 green:    (0, 255, 0)   # painted-tile color used by `draw green`
 
+night:
+  tortoise: (0, 0, 0)
+  green:    (0, 1, 0)
+
 --- agents ---
 # No `up to N` or `state {}` — the agent type is auto-registered by its
 # `starts at`. No explicit color block entry needed here either; the
@@ -48,5 +52,6 @@ tortoise:
   # `wander avoiding current` keeps the tortoise off cells that are
   # already correct, so it's more likely to bump into work.
   pause 3-5
-  wander avoiding current
+  if random 25%:
+    wander avoiding current
   done
