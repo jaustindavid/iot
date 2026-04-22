@@ -85,6 +85,14 @@ public:
     void ir_poll();
     bool ir_apply_if_ready();
 
+    // True iff the telemetry thread has staged a fetched blob that the
+    // main thread hasn't yet applied. Lets the main thread choose a
+    // delay between "OTA arrived" and "swap tables" — e.g. to paint a
+    // loading indicator on the grid so the operator sees their publish
+    // land before the new script takes over. Read of a volatile size_t,
+    // safe without a lock.
+    bool ir_pending_ready() const { return ir_pending_len_ != 0; }
+
     // Name of the script currently loaded on this device (empty string until
     // the first successful apply). Used in the heartbeat payload so the
     // server can see which script each device thinks it's running.

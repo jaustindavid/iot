@@ -64,27 +64,16 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   visible, doesn't steal grid real estate, matches Particle's own
   system-state conventions); a brief grid fade-to-black-and-back at
   the swap point would be a nice secondary cue.
-- **Publish warns when blob exceeds OTA buffer size.** Current default
-  `IR_OTA_BUFFER_BYTES` is 8192 (see `hal/particle/src/Stra2usClient.h`);
-  RAM-tight device headers can override smaller. If a published blob
-  exceeds that cap, the device's `kv_fetch_str_` rejects the response
-  at `Stra2usClient.cpp:472` and `ir_poll` logs `fetch failed for
-  <key>` on serial only — the publisher has no signal that anything
-  went wrong, the sidecar is correctly updated, and the device just
-  silently stays on the previous blob. From the operator's seat this
-  is indistinguishable from "re-publish doesn't inspire re-OTA" — was
-  actually the root cause of that observation. Add a hard warning in
-  `tools/publish_ir.py` when `size > 8192` (the default) — print to
-  stderr, include the threshold and the overshoot, optionally require
-  `--force-large` to proceed. Extension: once the device-side error
-  channel (heartbeat ring buffer, already in TODO above) is in place,
-  the device can report its actual `IR_OTA_BUFFER_BYTES` through
-  heartbeat telemetry and the publisher can warn against the
-  per-device actual cap rather than a hardcoded threshold. The deeper
-  lesson: the current OTA failure path is entirely serial-only, which
-  is the observability gap the device-side error channel TODO
-  addresses — this publish-side warning is the short-loop fix, the
-  heartbeat channel is the right-sized fix.
+- ~~**Publish warns when blob exceeds OTA buffer size.**~~ Landed
+  2026-04-22. `tools/publish_ir.py` now emits a multi-line stderr
+  warning when the encoded blob exceeds 8192 bytes, naming the
+  overshoot, explaining the failure mode ("devices silently stay on
+  the previous script, visible only as 'ir_poll: fetch failed' on
+  serial"), and suggesting either raising `IR_OTA_BUFFER_BYTES` in the
+  device header or re-running with `--no-source` to drop the SOURCE
+  trailer. The device-side error-channel-on-heartbeat follow-up is
+  still the right-sized fix (see entry above) — this was the
+  short-loop papercut close.
 - **Re-publish doesn't trigger re-OTA.** ~~Investigation open — see
   three-branch diagnostic below.~~ **Root cause identified 2026-04-21**:
   blob size grew past `IR_OTA_BUFFER_BYTES` (8192), device rejected
@@ -395,17 +384,14 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   color palettes (fire, rainbow-standard) if any script wants them without
   redefining.
 
-- **Fix `light=(...)` heartbeat ordering.** `critterchron_particle.cpp:320`
-  prints the triplet as `(raw<cal_bright<cal_dark)` — i.e.
-  `(actual, low_bound, high_bound)`. Every other heartbeat triplet
-  (`bri`, `phys`, `rend`, `interp`, `astar`) puts current/actual in the
-  *middle* so the `<` symbols read correctly at a glance
-  (`min<actual<max`). Current light output looks like
-  `light=(4029<2000<4045)` which parses as a bug even when it isn't.
-  Swap to `(cal_bright<raw<cal_dark)` so the format matches the visual
-  contract, and update the comment at `:313-317` that explains the
-  ordering. Trivial change; the existing comment even notes the
-  cleverness of the current layout — just retire it.
+- ~~**Fix `light=(...)` heartbeat ordering.**~~ Landed 2026-04-22. Now
+  prints `light=(cal_bright<raw<cal_dark)` to match the `min<cur<max`
+  convention every other heartbeat triplet uses, so the `<` symbols
+  read correctly at a glance. Old order `(raw<cb<cd)` and the
+  "low-to-high in the mapping's sense" justification retired.
+  Observation: an `<` violation in the output (e.g. `(2000<187<1500)`
+  where raw is *below* cal_bright) now visibly indicates "raw outside
+  learned range — widen incoming," which the old ordering obscured.
 
 - **(low priority / for science) Reproduce the stuck-sensor bug.** On
   2026-04-21 rachel booted with raw=505 in a dark room and held it for

@@ -310,16 +310,16 @@ static int telemetry_cycle() {
     // inputs — the live raw ADC read and the learned [cal_bright, cal_dark]
     // pair — to tell "raw tracking fine, mapping is wrong" apart from
     // "raw is stuck between a collapsed pair" apart from a scenario I
-    // haven't thought of. Format: `light=(raw<cb<cd)` — same ordering
-    // convention as bri (low-to-high in the mapping's sense: cal_bright
-    // is the *low* raw value, cal_dark is the *high* one), so a glance
-    // tells you whether raw is outside the learned range (good — instant
-    // widen incoming) or inside it (mapping is doing what it was told).
+    // haven't thought of. Format: `light=(cb<raw<cd)` — matches the
+    // `min<cur<max` convention every other heartbeat triplet uses, so a
+    // glance tells you whether raw is outside the learned range (numeric
+    // ordering of the `<` symbols breaks — widen incoming) or inside it
+    // (ordering holds — mapping is doing what it was told).
     if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
         int extra = snprintf(report + rlen, sizeof(report) - rlen,
                              " light=(%d<%d<%d)",
-                             g_light.last_raw,
                              g_light.cal_bright,
+                             g_light.last_raw,
                              g_light.cal_dark);
         if (extra > 0 && rlen + extra < (int)sizeof(report)) {
             rlen += extra;
@@ -600,6 +600,48 @@ static void draw_spinner(unsigned long now) {
     g_sink.show();
 }
 
+// OTA loading streamer — drawn directly into the sink while the main
+// loop holds off applying a staged IR blob. Visual: ~Matrix-rain, 4-px
+// green tails flowing top-to-bottom in evenly-spaced columns. Chosen
+// to be clearly distinct from the pre-sync spinner (full-grid vs.
+// centered, green vs. blue, downward motion vs. orbit) so an operator
+// watching the grid can tell "this is a new script arriving" apart
+// from "this is a boot / reset."
+static void draw_ota_streamer(unsigned long now) {
+    g_sink.clear();
+    // Column step: one streamer every 4 cols, starting at col 1 so the
+    // leftmost column stays dark and the pattern reads as "sparse" at a
+    // glance even on narrow grids. rachel (32x8) → 8 streamers;
+    // elk (16x16) → 4; rico (8x8) → 2.
+    constexpr int COL_STEP   = 4;
+    constexpr int TAIL_LEN   = 4;      // pixels
+    constexpr int STEP_MS    = 120;    // head advances 1 row per 120ms
+    // Cycle length > GRID_HEIGHT so there's a gap between the tail of
+    // one pass and the head of the next.
+    int cycle = GRID_HEIGHT + TAIL_LEN + 2;
+    unsigned long base_phase = now / STEP_MS;
+    for (int col = 1; col < GRID_WIDTH; col += COL_STEP) {
+        // Stagger streamers with a per-column phase offset so they
+        // don't all march in lockstep. Small prime hash is plenty of
+        // visual variety for realistic grid widths.
+        int col_phase = (col * 7) % cycle;
+        int head_y    = (int)((base_phase + col_phase) % cycle);
+        for (int t = 0; t < TAIL_LEN; ++t) {
+            int y = head_y - t;
+            if (y < 0 || y >= GRID_HEIGHT) continue;
+            // Head bright, tail fading. 48 at head leaves headroom for
+            // the sink's brightness multiplier without clipping; color
+            // ramp is pure green so it can't be confused with any
+            // script's intended palette (cycle colors tend to span hue,
+            // but "pure-green vertical streamers" isn't a shape any
+            // deployed script uses).
+            uint8_t g = (uint8_t)(48 - t * 12);
+            g_sink.set(col, y, 0, g, 0);
+        }
+    }
+    g_sink.show();
+}
+
 void loop() {
     unsigned long now = millis();
 
@@ -771,19 +813,54 @@ void loop() {
     static uint32_t      diag_astar_max    = 0;
 
 #if defined(STRA2US_HOST)
-    // OTA IR swap. Consume a pending blob (if one has been fetched by the
-    // telemetry thread) and re-seat the engine against the new tables.
-    // Runs *before* physics so we never swap mid-tick — processAgent reads
-    // BEHAVIORS[beh_idx].insns[pc] and those pointers must not shift under
-    // it. Parse + reinit cost runs <10ms in practice.
-    if (g_cfg.ir_apply_if_ready()) {
-        if (!g_engine.reinit()) {
-            Log.error("engine.reinit() failed after OTA IR swap");
+    // OTA IR swap, with a visual-delay loading screen.
+    //
+    // Flow: the telemetry thread fetches a new blob and stages it in
+    // ir_pending_*. Main thread detects `ir_pending_ready()`, enters
+    // the OTA loading state for OTA_LOADING_MS, pauses physics, and
+    // renders the streamer over the grid. When the window elapses,
+    // `ir_apply_if_ready()` swaps tables and `engine.reinit()` reseats
+    // the engine. Parse + reinit cost runs <10ms in practice — the
+    // user-visible delay is the loading window itself, added
+    // deliberately so operators watching the grid after a publish see
+    // a clear "incoming" cue before the new script takes over.
+    //
+    // Runs *before* physics so we never swap mid-tick — processAgent
+    // reads BEHAVIORS[beh_idx].insns[pc] and those pointers must not
+    // shift under it. Physics is also skipped during the window
+    // (render is fully overridden; ticking would only heat the CPU).
+    constexpr unsigned long OTA_LOADING_MS = 5000;
+    static bool          g_ota_loading          = false;
+    static unsigned long g_ota_loading_start_ms = 0;
+
+    if (!g_ota_loading && g_cfg.ir_pending_ready()) {
+        g_ota_loading          = true;
+        g_ota_loading_start_ms = now;
+        Log.info("ota_loading: entered (pending blob ready)");
+    }
+
+    if (g_ota_loading) {
+        if (now - g_ota_loading_start_ms >= OTA_LOADING_MS) {
+            if (g_cfg.ir_apply_if_ready()) {
+                if (!g_engine.reinit()) {
+                    Log.error("engine.reinit() failed after OTA IR swap");
+                } else {
+                    // Fresh RNG entropy for the new script so two
+                    // simultaneously-swapped devices diverge rather
+                    // than move in lockstep.
+                    g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
+                    last_sync_minute = -1; // force syncTime next tick
+                }
+            }
+            g_ota_loading = false;
         } else {
-            // Fresh RNG entropy for the new script so two simultaneously-
-            // swapped devices diverge rather than move in lockstep.
-            g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
-            last_sync_minute = -1;   // force a syncTime on next physics tick
+            // Hold here: render streamer at normal render cadence,
+            // skip physics, short-circuit the rest of the loop.
+            if (now - last_render_tick >= RENDER_TICK_MS) {
+                last_render_tick = now;
+                draw_ota_streamer(now);
+            }
+            return;
         }
     }
 #endif
