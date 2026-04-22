@@ -395,6 +395,36 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   color palettes (fire, rainbow-standard) if any script wants them without
   redefining.
 
+- **Fix `light=(...)` heartbeat ordering.** `critterchron_particle.cpp:320`
+  prints the triplet as `(raw<cal_bright<cal_dark)` — i.e.
+  `(actual, low_bound, high_bound)`. Every other heartbeat triplet
+  (`bri`, `phys`, `rend`, `interp`, `astar`) puts current/actual in the
+  *middle* so the `<` symbols read correctly at a glance
+  (`min<actual<max`). Current light output looks like
+  `light=(4029<2000<4045)` which parses as a bug even when it isn't.
+  Swap to `(cal_bright<raw<cal_dark)` so the format matches the visual
+  contract, and update the comment at `:313-317` that explains the
+  ordering. Trivial change; the existing comment even notes the
+  cleverness of the current layout — just retire it.
+
+- **(low priority / for science) Reproduce the stuck-sensor bug.** On
+  2026-04-21 rachel booted with raw=505 in a dark room and held it for
+  minutes; a reflash unstuck her. We shipped a drain+settle in setup()
+  (`critterchron_particle.cpp:538-547`) plus a boot_light OOB telemetry
+  (one-shot publish of the first 30 raw reads, ~6s into boot) on the
+  same day. First post-fix boot showed 30 raws flat at 4030±9, which is
+  consistent with "fix worked" AND "there was never anything to fix" —
+  we can't distinguish without a repro. When time permits, temporarily
+  revert the drain+settle block (keep the boot_light publish so we get
+  diagnostic data either way) and see if the stuck state comes back in
+  normal use. If it does, the boot_light shape tells us whether it's
+  hardware (RC curve) or software (flat at a wrong value, pointing at
+  LightSensor auto-cal or config-cache poisoning — see the
+  `light=(4029<2000<4045)` heartbeat triplet where the middle value
+  didn't match the raw range, prime suspect for a persisted cal
+  value). Not worth chasing while devices are behaving; revisit if
+  another device shows the symptom or during a quiet period.
+
 ## Phase 2+ (per HAL_SPEC)
 
 - ~~**Phase 2 — Environmental polish:**~~ light sensor + brightness

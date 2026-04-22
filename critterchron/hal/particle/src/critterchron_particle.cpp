@@ -146,6 +146,27 @@ static critterchron::CritterEngine g_engine(g_sink, g_clock);
 
 #if defined(LIGHT_SENSOR_TYPE)
 static LightSensor          g_light(g_cfg);
+
+// Boot-time sensor diagnostic. The 5Hz light block in loop() stashes the
+// first BOOT_LIGHT_SAMPLES raw reads into this buffer; the telemetry
+// worker fires a one-shot OOB publish with the samples once the buffer
+// fills. Goal is to see directly whether the drain+settle put us in a
+// good place, whether there's still a slow exponential rise (cap theory)
+// or a stuck value (something else). ~60 bytes of RAM, ~200-byte payload
+// on the wire, fires once per boot.
+//
+// Ordering: main loop writes the array + increments the count, sets
+// g_boot_light_ready after the final write. The telemetry thread reads
+// ready, then the array. On single-core Cortex-M under FreeRTOS the
+// `volatile` + write-order-before-flag is the idiomatic fence; strict
+// C++ memory model wants std::atomic but the risk here is cosmetic
+// (a partially-formed report) and the fix would have to travel to
+// g_bri et al. above first.
+constexpr int        BOOT_LIGHT_SAMPLES = 30;   // 6s at 5Hz
+static uint16_t      g_boot_light_raws[BOOT_LIGHT_SAMPLES];
+static int           g_boot_light_count = 0;
+static volatile bool g_boot_light_ready = false;
+static bool          g_boot_light_sent  = false;  // tel-thread-only
 #endif
 
 // Telemetry-visible state. The worker thread reads these as snapshots;
@@ -392,6 +413,39 @@ static void telemetry_worker() {
         first = false;
         int status = telemetry_cycle();
 
+#if defined(LIGHT_SENSOR_TYPE)
+        // OOB boot-light diagnostic. One-shot per boot, fires once the main
+        // loop has captured its first BOOT_LIGHT_SAMPLES raw readings.
+        // Purpose is distributed-console observability of the post-drain
+        // settling curve — "is the cap-discharge hypothesis right?" becomes
+        // answerable from telemetry alone. Format is free-form, matches the
+        // heartbeat's grep-friendly k=v style. Not gated on telemetry_cycle
+        // success: if the regular heartbeat failed, this cycle will retry
+        // both next time — connect/close are per-block.
+        if (g_boot_light_ready && !g_boot_light_sent) {
+            // Static, not stack: the tel worker has a modest stack and 512B
+            // of locals plus the snprintf frames was enough to SOS on the
+            // Photon 2. Safe to reuse as static since this block is
+            // one-shot per boot (gated by g_boot_light_sent).
+            static char msg[512];
+            int n = snprintf(msg, sizeof(msg),
+                             "boot_light up=%lu n=%d raws=",
+                             (unsigned long)System.uptime(),
+                             BOOT_LIGHT_SAMPLES);
+            for (int i = 0; i < BOOT_LIGHT_SAMPLES && n < (int)sizeof(msg) - 8; ++i) {
+                n += snprintf(msg + n, sizeof(msg) - n,
+                              "%s%u", i ? "," : "",
+                              (unsigned)g_boot_light_raws[i]);
+            }
+            msg[sizeof(msg) - 1] = '\0';
+            g_cfg.connect();
+            int bs = g_cfg.publish(STRA2US_APP, msg);
+            g_cfg.close();
+            Log.info("boot_light publish=%d %s", bs, msg);
+            g_boot_light_sent = true;
+        }
+#endif
+
         // Read heartbeep AFTER the cycle so we benefit from any override
         // pulled down in this cycle's poll_all. Otherwise a fresh boot with
         // an empty cache uses HEARTBEEP_DEFAULT to schedule the next fire,
@@ -472,11 +526,29 @@ void setup() {
 
 #if defined(LIGHT_SENSOR_TYPE)
     // CDS voltage divider: power HIGH, ground LOW, signal on an analog pin.
+    //
+    // Drain-then-power sequence. The previous "just set the pins" form
+    // was vulnerable to a persistent-cap failure: a bypass cap on the
+    // sensor breakout (between SIG↔GND, or a decoupling cap between
+    // PWR↔GND) left partially charged by the bootloader would bias the
+    // first samples, and the auto-calibrator would latch onto that
+    // wrong value and hold it for minutes (dark-CDS RC is slow). Across
+    // a reflash we saw raw stuck at 505 in a dark room that reads ~4030
+    // on a clean boot. The fix is to collapse every cap in the divider
+    // to a known 0V before we power it up: drive all three pins LOW for
+    // a millisecond, then release SIG to high-Z input, bring PWR up,
+    // and wait long enough for the cap to recharge through R_series
+    // (tens of ms for reasonable cap values with a ~10k series resistor).
     pinMode(LIGHT_SENSOR_PWR_PIN, OUTPUT);
-    digitalWrite(LIGHT_SENSOR_PWR_PIN, HIGH);
+    pinMode(LIGHT_SENSOR_SIG_PIN, OUTPUT);
     pinMode(LIGHT_SENSOR_GND_PIN, OUTPUT);
+    digitalWrite(LIGHT_SENSOR_PWR_PIN, LOW);
+    digitalWrite(LIGHT_SENSOR_SIG_PIN, LOW);
     digitalWrite(LIGHT_SENSOR_GND_PIN, LOW);
-    pinMode(LIGHT_SENSOR_SIG_PIN, INPUT);
+    delay(1);                                  // collapse caps
+    pinMode(LIGHT_SENSOR_SIG_PIN, INPUT);      // release to high-Z
+    digitalWrite(LIGHT_SENSOR_PWR_PIN, HIGH);  // sensor powered
+    delay(200);                                // divider settles
 #endif
 
     int reason = System.resetReason();
@@ -542,6 +614,18 @@ void loop() {
     if (now - last_light_ms >= 200) {
         last_light_ms = now;
         int raw = analogRead(LIGHT_SENSOR_SIG_PIN);
+
+        // Boot-time capture: stash the first BOOT_LIGHT_SAMPLES raws for the
+        // one-shot OOB publish. Keep the writes before the ready-flag set so
+        // the tel-thread never reads a half-populated array.
+        if (g_boot_light_count < BOOT_LIGHT_SAMPLES) {
+            g_boot_light_raws[g_boot_light_count] = (uint16_t)raw;
+            g_boot_light_count++;
+            if (g_boot_light_count == BOOT_LIGHT_SAMPLES) {
+                g_boot_light_ready = true;
+            }
+        }
+
         int min_b = g_cfg.get_int("min_brightness", MIN_BRIGHTNESS);
         int max_b = g_cfg.get_int("max_brightness", MAX_BRIGHTNESS);
         if (min_b < 0)   min_b = 0;
