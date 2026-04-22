@@ -125,6 +125,99 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   coverage over the OTA path (load + reinit + first-tick) so a
   future-class hang resets the device with a clear panic code rather
   than wedging silently.
+
+- **OTA crash — oversize blob kills the device hard.** Distinct from
+  the "OTA freeze" entry above: this one takes the *system thread*
+  down too, not just physics. Clean repro 2026-04-22: published
+  doozer3 at 8408 bytes (216 bytes over the default
+  `IR_OTA_BUFFER_BYTES=8192`, publish warning fired as designed);
+  rachel promptly went dark — grid frozen, cloud presence gone, no
+  SOS visible. Recovery required a physical reboot. Republishing the
+  same script with `--no-source` (smaller blob) pulled cleanly after
+  the reboot, confirming the blob *size* is the trigger rather than
+  its content.
+
+  Expected behavior per `Stra2usClient.cpp:472`: the msgpack unpacker
+  sees `hdr_len + payload_len > buf_cap - 1` and returns false —
+  nothing crashed, ir_poll logs `fetch failed for <key>` on serial
+  and life goes on. Observed behavior: the device dies. So either
+  (a) the rejection path itself has a bug (buffer overflow before the
+  size check, stack blow in the oversize response handling, msgpack
+  header parse reading past valid bytes), (b) the HTTP layer below
+  msgpack is allocating on the telemetry thread's stack and an
+  oversized response blows it, or (c) an interaction with the new
+  OTA loading screen — unlikely since `ir_pending_ready()` only
+  flips true on a *successful* stage, and the streamer code doesn't
+  run on a fetch failure.
+
+  Investigation priorities:
+  1. Reproduce with serial monitor attached — capture the last
+     `Log.*` line before the freeze. That localizes the death to
+     msgpack / HTTP / post-rejection codepath.
+  2. Add explicit logging around `Stra2usClient.cpp:472`
+     ("rejecting oversized blob: hdr=%zu payload=%zu cap=%zu") so
+     the rejection path is *observably* the rejection path and not
+     a silent crash misattributed to rejection.
+  3. Audit the fetch buffer sizing: if the HTTP client accepts more
+     bytes than `ir_ota_buf_` can hold, there's an OOB write before
+     the msgpack check ever runs. The size check at :472 is checking
+     the *parsed* header+payload, not the raw bytes received.
+  4. ~~Consider a pre-fetch size probe.~~ Landed 2026-04-22 as
+     sidecar-extension: sidecar now reads `<sha>:<size>`, device
+     parses size and bails before the blob fetch when
+     `size > sizeof(ir_ota_buf_) - 1`. Closes the oversize-crash
+     trigger via the sidecar path. Doesn't fix the underlying
+     vulnerability (a device-OS bug pushing > buffer bytes, or a
+     non-oversize path into the same failure mode, would still
+     crash) — investigation priorities 1-3 above still stand,
+     but the common-case trigger is defanged.
+
+  Interim operator defense: `publish_ir.py` warning already fires
+  (landed earlier today), and the sidecar size gate now stops the
+  fetch device-side even if a warning is ignored. A device still
+  shouldn't crash on a bad blob — the OTA path needs to be crashproof
+  so one bad publish doesn't require a truck roll to every device.
+
+  Related to: "Device-side error channel on the heartbeat" (would
+  have let us see the fetch-failed log remotely), "Publish warns
+  when blob exceeds OTA buffer size" (prevention landed, doesn't
+  fix the device-side vulnerability).
+
+- **Device registers loaded sha back to Stra2us on successful OTA.**
+  Today the only fleet-visibility signal for "what sha is this device
+  actually running" is the heartbeat (`script=<name>@<sha_prefix>`)
+  which fires every heartbeep interval (tens of seconds to minutes).
+  After a publish, the operator has to wait a full heartbeat to see
+  confirmation that a given device picked up the new sha — and
+  distinguishes "still on old sha" from "applied new sha, parse
+  failed, fell back" only by diffing two heartbeats.
+
+  Proposal: on successful `ir_apply_if_ready()` → `engine.reinit()`,
+  have the device write an explicit acknowledgment back to Stra2us,
+  e.g. `<app>/<device>/ir/loaded` containing `<sha>:<uptime_ms>` or
+  similar. Operator tooling can diff `<app>/scripts/<name>/sha`
+  (what was published) against every device's `ir/loaded` (what each
+  device is running) to get fleet-wide OTA confirmation without
+  waiting on heartbeat cadence. Cost: one KV write per OTA event —
+  negligible.
+
+  Open design choices:
+  - Key shape: per-device (`<app>/<device>/ir/loaded`) vs. a
+    publish-time poll endpoint (`<app>/devices/<sha>`) — per-device
+    probably wins for a small fleet.
+  - Payload: just sha, or sha + timestamp + size + last error? Start
+    minimal, extend if needed.
+  - When to write: only on successful apply, or also on
+    parse-failure with an error tag so we can see "fetched but
+    rejected"? Latter is more informative; overlaps with the
+    device-side-error-channel TODO above.
+  - Failure mode: if the Stra2us write itself fails, do we retry,
+    or fire-and-forget? Fire-and-forget is simpler; the next
+    heartbeat will still carry the sha and paper over a missed
+    register.
+
+  Not urgent — heartbeat works for now — but cheap once the need
+  to watch a fleet-wide OTA rollout arises.
 - **Light-sensor calibration poisons itself; only reflash recovers.**
   Observed 2026-04-21: rachel sat at `bri=(1<125<128)` in a room the
   operator describes as "very dark, for hours" — a state the current

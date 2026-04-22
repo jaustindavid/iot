@@ -597,12 +597,62 @@ void Stra2usClient::ir_poll() {
     // on the blob we fetched and checking it against the sidecar.
     char sha_key[96 + IR_SCRIPT_NAME_MAX + 8];
     snprintf(sha_key, sizeof(sha_key), "%s/scripts/%s/sha", app_, new_ptr);
-    char sidecar_sha[96] = {0};
-    size_t sha_len = 0;
-    bool have_sidecar = kv_fetch_str_(sha_key, sidecar_sha, sizeof(sidecar_sha), sha_len);
-    if (have_sidecar && sha_len == 64 &&
-        strcmp(sidecar_sha, ir_loaded_sha_) == 0) {
+    // Sidecar format:
+    //   <64-char hex content_sha>                         (legacy, pre-2026-04-22)
+    //   <64-char hex content_sha>:<decimal size_bytes>    (current)
+    // The size suffix lets us skip the blob fetch entirely when the blob
+    // would overrun ir_ota_buf_ — closing the oversize-crash path (see
+    // TODO.md "OTA crash — oversize blob kills the device hard"). 64 hex
+    // + ':' + 10-digit size leaves ample headroom in a 96-byte scratch.
+    char   sidecar_raw[96] = {0};
+    size_t raw_len = 0;
+    bool   have_sidecar = kv_fetch_str_(sha_key, sidecar_raw, sizeof(sidecar_raw), raw_len);
+
+    char   sidecar_sha[65] = {0};
+    size_t sidecar_size    = 0;
+    bool   have_size       = false;
+    if (have_sidecar) {
+        if (raw_len == 64) {
+            // Legacy format — sha only, size unknown.
+            memcpy(sidecar_sha, sidecar_raw, 64);
+        } else if (raw_len > 65 && sidecar_raw[64] == ':') {
+            // Extended format — parse decimal size after the colon.
+            memcpy(sidecar_sha, sidecar_raw, 64);
+            size_t n = 0;
+            bool   ok = true;
+            for (size_t i = 65; i < raw_len; ++i) {
+                char c = sidecar_raw[i];
+                if (c < '0' || c > '9') { ok = false; break; }
+                n = n * 10 + (size_t)(c - '0');
+            }
+            if (ok) {
+                sidecar_size = n;
+                have_size    = true;
+            }
+            // Size parse failure: still have a valid sha, just no size.
+            // Proceed as if legacy — we'll learn the size the hard way
+            // (fetch succeeds or buffer rejects).
+        } else {
+            // Malformed sidecar. Treat as missing.
+            have_sidecar = false;
+        }
+    }
+
+    if (have_sidecar && strcmp(sidecar_sha, ir_loaded_sha_) == 0) {
         // Sidecar matches loaded — no blob fetch this cycle. Fast path.
+        return;
+    }
+
+    // Pre-fetch size gate. If the sidecar tells us the blob won't fit,
+    // don't attempt the fetch — it would either silently fail at the
+    // msgpack unwrap (`hdr_len + payload_len > buf_cap - 1`) or, worse,
+    // hit the oversize-crash path. -1 leaves room for the NUL the
+    // msgpack unwrap appends after the payload.
+    if (have_size && sidecar_size > sizeof(ir_ota_buf_) - 1) {
+        Log.warn("ir_poll: %s size=%u exceeds buffer=%u; skipping fetch",
+                 new_ptr,
+                 (unsigned)sidecar_size,
+                 (unsigned)(sizeof(ir_ota_buf_) - 1));
         return;
     }
 
@@ -624,7 +674,7 @@ void Stra2usClient::ir_poll() {
     // it. Reject the mismatch — a later publish will resolve it. Without a
     // sidecar (older publisher or transient fetch error), we trust the
     // blob's own content_sha as the identity.
-    if (have_sidecar && sha_len == 64 && strcmp(new_sha, sidecar_sha) != 0) {
+    if (have_sidecar && strcmp(new_sha, sidecar_sha) != 0) {
         Log.error("ir_poll: sidecar/blob content_sha mismatch for %s (sidecar=%.8s blob=%.8s); skipping",
                   new_ptr, sidecar_sha, new_sha);
         return;

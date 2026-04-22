@@ -205,13 +205,23 @@ def main() -> int:
     # recomputes content_sha on the fetched blob and checks it matches the
     # sidecar, catching the reversed tear (sidecar updated but blob stale)
     # by refusing to apply.
+    #
+    # Sidecar format: "<64-char content_sha>:<size_bytes>". The size suffix
+    # lets the device skip the big blob fetch entirely when the blob would
+    # overrun IR_OTA_BUFFER_BYTES, avoiding the oversize-crash path (see
+    # TODO.md "OTA crash — oversize blob kills the device hard"). Legacy
+    # devices that expect bare sha get a 64-hex prefix and will ignore the
+    # suffix (the `sha_len == 64` gate in older Stra2usClient.cpp fails
+    # closed on any length != 64, which degrades to "miss this poll, retry
+    # next cycle" — fail-safe for rollout).
+    sidecar_value = f"{content_sha}:{size}"
     try:
         client.put(key, blob)
     except Stra2usError as e:
         print(f"error: {e}", file=sys.stderr)
         return 3
     try:
-        client.put(sha_key, content_sha)
+        client.put(sha_key, sidecar_value)
     except Stra2usError as e:
         print(f"error: blob uploaded but sidecar sha upload failed: {e}",
               file=sys.stderr)
