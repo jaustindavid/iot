@@ -30,3 +30,5 @@ else
     source venv/bin/activate
     echo "Venv Active: $(python3 --version)"
 fi
+
+[ -f .env.local ] && source .env.local

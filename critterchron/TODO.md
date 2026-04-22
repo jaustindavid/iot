@@ -447,6 +447,42 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   value). Not worth chasing while devices are behaving; revisit if
   another device shows the symptom or during a quiet period.
 
+- **Night-mode disable sentinel (`night_enter_brightness=0`).** Today
+  the Schmitt trigger at `critterchron_particle.cpp:793-805` does a
+  plain `bri <= ne` compare; writing `0` clamps to `ne=0, nx=1` and
+  produces a rapid floor oscillator rather than disabling night mode.
+  Desired: `0` means "disable the night palette entirely, force day."
+  Change is an early-out in the Schmitt block:
+  ```cpp
+  if (ne <= 0) {
+      if (g_engine.nightMode()) {
+          g_engine.setNightMode(false);
+          Log.info("night: OFF (disabled, night_enter_brightness=0)");
+      }
+  } else {
+      // existing clamp + Schmitt
+  }
+  ```
+  Why `0` and not `-1`: `get_int` round-trips through `uint8_t` in
+  adjacent brightness code, and `-1` aliases `255` there — a
+  legitimate max-brightness value. `0` is safe because sink brightness
+  `0` is unreachable in practice (`min_brightness` range is `[1, 255]`
+  per catalog as of 2026-04-22). Also update the `night_enter_brightness`
+  help in `critterchron.s2s.yaml` to document the sentinel.
+  Pair with the `min_brightness` HAL floor entry below when the next
+  HAL pass lands — both are small Schmitt/clamp tweaks in the same
+  ~30-line block.
+
+- **(low priority) Belt-and-suspenders `min_brightness` floor in HAL.**
+  Catalog range tightened to `[1, 255]` on 2026-04-22 so `tools/s2s.py
+  set` can't write 0, but the HAL still clamps `min_b < 0 → 0` at
+  `critterchron_particle.cpp:765`. A direct KV write bypassing the
+  catalog tool could still land a zero and, combined with the
+  `night_enter_brightness=0` sentinel, produce a stuck-in-night state
+  at the floor. Cheap to harden: change to `min_b < 1 → 1`. Two
+  separate trust boundaries (tool vs. HAL) policing the same invariant
+  is fine; HAL is the one that actually runs on-device.
+
 ## Phase 2+ (per HAL_SPEC)
 
 - ~~**Phase 2 — Environmental polish:**~~ light sensor + brightness
