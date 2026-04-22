@@ -2,11 +2,29 @@ import re
 import sys
 import json
 
-IR_VERSION = 4
+# IR_VERSION 5 adds tile markers: `--- colors ---` accepts
+# `<name>: ramp (r,g,b) decay K/T`; new opcodes `incr`/`decr`; new
+# condition forms `if <marker> [op N] [on ...]` and sugar; new seek
+# primitives `seek highest|lowest <marker> [op N] [on landmark X]`.
+# See MARKERS_SPEC.md for full grammar.
+#
+# IR_VERSION 6 adds night-mode marker ramps: inside a `night:` block
+# under `--- colors ---`, a line `<name>: ramp (r,g,b)` overrides the
+# per-unit ramp coefficient while night_mode_ is engaged. Decay K/T is
+# shared with the day marker (that's a scheduler property, not a visual
+# one); names must match an existing day marker. Wire format adds a
+# NIGHT_MARKERS section (4 tokens per entry: name r g b).
+IR_VERSION = 6
 
 # Tile-predicate tokens that can appear after `if on` / `seek [nearest]`.
 # These are NOT landmark or agent names — they describe cell state.
 _TILE_PREDICATES = {"current", "extra", "missing"}
+
+# Hard cap on distinct marker names per program. Keeps the per-tile
+# footprint at MAX_MARKERS bytes and matches the HAL's fixed-size array.
+# Bump in lockstep with `CritterEngine.MAX_MARKERS` and the HAL's
+# TileFields::count[] width when raising it.
+MAX_MARKERS = 4
 
 
 class CritCompiler:
@@ -35,6 +53,25 @@ class CritCompiler:
             # night_colors. Tuple or name reference. None = unlisted colors
             # stay at their day value at night (the user's chosen default).
             "night_default": None,
+            # Marker declarations (tile-scalar-field layer). Populated from
+            # `--- colors ---` lines of the form
+            #   name: ramp (r, g, b) decay K/T
+            # Each entry: {"rgb": (r, g, b),          # floats
+            #              "decay_k": int, "decay_t": int,
+            #              "index": int}              # 0-based declaration order
+            # Index is the wire/runtime ID — stable across recompiles as long
+            # as declaration order doesn't change. See MARKERS_SPEC.md §2.1.
+            "markers": {},
+            # Night-mode marker coefficient overrides. Sparse — only markers
+            # that need a different coefficient at night appear here. Each
+            # entry: {"rgb": (r, g, b)}. Decay (K/T) is NOT overrideable per
+            # night — decay is a dynamics property of the marker, not a
+            # visual one, so it's inherited from the day declaration. At
+            # render time the engine picks NIGHT_MARKERS for a marker that
+            # has an entry here and night_mode_ is on, falling through to
+            # the day MARKERS coefficient otherwise. Empty = night mode is
+            # a no-op for markers (pre-v6 behavior).
+            "night_markers": {},
             "landmarks": {},
             "agents": {},
             "behaviors": {},
@@ -89,8 +126,16 @@ class CritCompiler:
                     f"Indent .crit files with spaces only."
                 )
 
-        # Split by sections, ignoring the header/comment block
-        sections = re.split(r'--- (.*?) ---', content)
+        # Split by sections. Anchor the regex to start-of-line so a
+        # comment like `# --- returning ---` (a prose divider) inside
+        # a behavior body doesn't get eaten as a section header and
+        # silently truncate the behavior. Section headers occupy the
+        # whole line; nothing else is allowed on the row.
+        sections = re.split(
+            r'^--- (.*?) ---\s*$',
+            content,
+            flags=re.MULTILINE,
+        )
 
         for i in range(1, len(sections), 2):
             header = sections[i].strip()
@@ -101,11 +146,21 @@ class CritCompiler:
         # resolution has the full landmark + agent declaration set in
         # scope.
         self._validate_name_collisions()
+        # Marker canonicalization MUST run before the general name
+        # resolver. It rewrites sugared marker conditions and seeks
+        # (e.g. `if trail`, `seek highest trail < 5`) into their fully
+        # disambiguated form (`if marker trail > 0`, `seek highest marker
+        # trail < 5`). After this pass, all marker references carry the
+        # `marker` keyword, so the general resolver can safely skip them
+        # the same way it skips `landmark`-prefixed references.
+        self._canonicalize_markers_in_behaviors()
         self._resolve_names_in_behaviors()
         self._validate_instructions()
+        self._validate_markers()
         self._validate_pathfinding()
         self._validate_loops()
         self._validate_night_palette()
+        self._validate_night_markers()
 
         # Validate agent colors
         for agent_name in self.ir["agents"]:
@@ -287,6 +342,13 @@ class CritCompiler:
                         )
                     in_night = True
                     continue
+                # Markers share the colors section syntactically but live
+                # in ir["markers"] — they are a scalar field per tile, not a
+                # paintable color. Divert before the general color parser so
+                # `ramp (r,g,b) decay K/T` doesn't try to eval() as a tuple.
+                if val.startswith('ramp '):
+                    self._parse_ramp_declaration(name, val)
+                    continue
                 self.ir["colors"][name] = self._parse_color_value(
                     name, val, allow_name_ref=False,
                 )
@@ -298,6 +360,15 @@ class CritCompiler:
                         f"block. Only 'night:' introduces a nested block "
                         f"in the colors section."
                     )
+                # Ramp entry inside night: — overrides a day marker's RGB
+                # coefficient when night mode is active. Decay (K/T) is
+                # NOT overrideable; rejected here so authors don't get
+                # surprise "my night decay didn't do anything" bugs.
+                # `_validate_night_markers` cross-checks that the name
+                # matches a declared day marker.
+                if val.startswith('ramp '):
+                    self._parse_night_ramp_declaration(name, val)
+                    continue
                 parsed = self._parse_color_value(
                     name, val, allow_name_ref=True,
                 )
@@ -354,6 +425,113 @@ class CritCompiler:
             f"tuple literal, a cycle, or "
             f"{'a color name reference' if allow_name_ref else 'a recognized form'}."
         )
+
+    # Matches `ramp (r, g, b) decay K/T`. RGB entries are floats (ints
+    # are accepted by Python's float()); decay integers must be
+    # non-negative. Extra whitespace is tolerated; the overall shape is
+    # strict to avoid silently accepting malformed forms.
+    # Night-marker variant: ramp-only, no decay suffix. Decay is a dynamics
+    # property of the marker and doesn't vary day vs night, so night entries
+    # override only the RGB coefficient. Matches `ramp (r, g, b)` with no
+    # trailing `decay ...`. An authored night ramp that tries to include a
+    # decay clause is rejected with a pointed message so authors don't think
+    # night mode can change their marker's decay rate.
+    _NIGHT_RAMP_RE = re.compile(
+        r'^ramp\s*\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)\s*$'
+    )
+    _RAMP_RE = re.compile(
+        r'^ramp\s*\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)'
+        r'\s+decay\s+(\d+)\s*/\s*(\d+)\s*$'
+    )
+
+    def _parse_ramp_declaration(self, name, val):
+        """Parse `ramp (r,g,b) decay K/T` into ir["markers"][name].
+
+        Enforces at parse time:
+          - shape matches the grammar,
+          - declaration count <= MAX_MARKERS (HAL fixed-size array),
+          - marker name does not duplicate an existing marker.
+        Zero-ramp (all of r/g/b == 0) is NOT rejected here — it's a
+        semantic footgun, not a parse error, and the validator in
+        `_validate_markers` issues a soft warning. `decay K/0` likewise
+        passes here and is rejected by the validator so error messages
+        can refer to the whole program context, not the raw line."""
+        m = self._RAMP_RE.match(val)
+        if not m:
+            raise ValueError(
+                f"Compilation Failed: marker {name!r} declaration "
+                f"{val!r} is malformed. Expected "
+                f"'ramp (r, g, b) decay K/T' (three floats, two ints)."
+            )
+        try:
+            r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        except ValueError:
+            raise ValueError(
+                f"Compilation Failed: marker {name!r} has non-numeric "
+                f"ramp components in {val!r}."
+            )
+        decay_k = int(m.group(4))
+        decay_t = int(m.group(5))
+        if name in self.ir["markers"]:
+            raise ValueError(
+                f"Compilation Failed: marker {name!r} is declared twice "
+                f"in the colors section."
+            )
+        if len(self.ir["markers"]) >= MAX_MARKERS:
+            raise ValueError(
+                f"Compilation Failed: too many markers declared "
+                f"({len(self.ir['markers']) + 1} > max {MAX_MARKERS}). "
+                f"The HAL backs each tile with a fixed-size count[] "
+                f"array — adding more markers requires bumping the "
+                f"array width on the device side."
+            )
+        self.ir["markers"][name] = {
+            "rgb": (r, g, b),
+            "decay_k": decay_k,
+            "decay_t": decay_t,
+            "index": len(self.ir["markers"]),
+        }
+
+    def _parse_night_ramp_declaration(self, name, val):
+        """Parse a `ramp (r, g, b)` entry inside the `night:` block.
+
+        Stores `{"rgb": (r, g, b)}` in `ir["night_markers"][name]`. The
+        name-matches-day-marker check is deferred to `_validate_night_markers`
+        so the error can name the whole set of declared markers for context.
+        Decay is NOT overrideable per-night — detection happens via regex
+        split (the day `_RAMP_RE` requires a trailing `decay K/T`, the night
+        `_NIGHT_RAMP_RE` rejects it). An authored `decay` clause gets a
+        pointed error rather than a generic parse failure."""
+        if self._RAMP_RE.match(val):
+            raise ValueError(
+                f"Compilation Failed: night ramp for marker {name!r} "
+                f"includes a 'decay K/T' clause: {val!r}. Decay is a "
+                f"dynamics property and is inherited from the day "
+                f"declaration — night entries override only the RGB "
+                f"coefficient. Remove the decay clause."
+            )
+        m = self._NIGHT_RAMP_RE.match(val)
+        if not m:
+            raise ValueError(
+                f"Compilation Failed: night marker {name!r} declaration "
+                f"{val!r} is malformed. Expected 'ramp (r, g, b)' with "
+                f"three numeric components and no trailing clauses."
+            )
+        try:
+            r, g, b = (float(m.group(1)),
+                       float(m.group(2)),
+                       float(m.group(3)))
+        except ValueError:
+            raise ValueError(
+                f"Compilation Failed: night marker {name!r} has "
+                f"non-numeric ramp components in {val!r}."
+            )
+        if name in self.ir["night_markers"]:
+            raise ValueError(
+                f"Compilation Failed: night marker {name!r} is declared "
+                f"twice in the night: block."
+            )
+        self.ir["night_markers"][name] = {"rgb": (r, g, b)}
 
     # Map authored pathfinding keys (as they appear in .crit source) to the
     # canonical IR key names used by the engine. Keep spelling stable — the
@@ -479,11 +657,19 @@ class CritCompiler:
         colors = set(self.ir["colors"].keys())
         landmarks = set(self.ir["landmarks"].keys())
         agents = set(self.ir["agents"].keys())
+        markers = set(self.ir.get("markers", {}).keys())
         for ia in self.ir["initial_agents"]:
             agents.add(ia["name"])
+        # Markers occupy the same namespace as colors (they're declared
+        # in the `--- colors ---` section) and as landmarks/agents at
+        # reference sites. Check all three pair collisions — reusing a
+        # marker name as a landmark would make `if pile > 0` ambiguous.
         pairs = (
             ("color", colors, "landmark", landmarks),
             ("landmark", landmarks, "agent", agents),
+            ("marker", markers, "landmark", landmarks),
+            ("marker", markers, "agent", agents),
+            ("marker", markers, "color", colors),
         )
         for kind_a, set_a, kind_b, set_b in pairs:
             overlap = sorted(set_a & set_b)
@@ -493,6 +679,197 @@ class CritCompiler:
                     f"as both a {kind_a} and a {kind_b}. Pick distinct "
                     f"names."
                 )
+
+    # Pattern catalog for _canonicalize_markers_in_behaviors. Each entry
+    # is (pattern, rewrite-template). Templates use str.format with named
+    # groups from the match. Order matters: more specific forms (with
+    # `on landmark X` suffixes) come first so the shorter forms don't
+    # match greedily and swallow the tail.
+    _MARKER_IF_PATTERNS = [
+        # --- board / landmark scope ---
+        (re.compile(r'^if no (?P<m>\w+) on landmark (?P<l>\w+)$'),
+         'if no marker {m} on landmark {l}'),
+        (re.compile(r'^if no (?P<m>\w+)$'),
+         'if no marker {m}'),
+        # `== 0` is a readability alias for the `no` predicate. Accepting
+        # it keeps the `> N` / `== 0` pair symmetric for authors — `no`
+        # is the canonical form, but `== 0` reads more naturally next to
+        # an adjacent `> N` test. Only `0` is supported on the RHS;
+        # general `== N` would need engine-level equality, which the
+        # runtime doesn't carry (only `<` / `>`).
+        (re.compile(r'^if (?P<m>\w+)\s*==\s*0 on landmark (?P<l>\w+)$'),
+         'if no marker {m} on landmark {l}'),
+        (re.compile(r'^if (?P<m>\w+)\s*==\s*0$'),
+         'if no marker {m}'),
+        (re.compile(r'^if (?P<m>\w+)\s*(?P<op>[<>])\s*(?P<n>\d+) on landmark (?P<l>\w+)$'),
+         'if marker {m} {op} {n} on landmark {l}'),
+        (re.compile(r'^if (?P<m>\w+)\s*(?P<op>[<>])\s*(?P<n>\d+)$'),
+         'if marker {m} {op} {n}'),
+        (re.compile(r'^if (?P<m>\w+) on landmark (?P<l>\w+)$'),
+         'if marker {m} > 0 on landmark {l}'),
+        # --- self-cell scope (`if on ...`) ---
+        (re.compile(r'^if on no (?P<m>\w+)$'),
+         'if on no marker {m}'),
+        # Self-cell inverses: `not on <m>` and `not standing on <m>`
+        # both mean "this cell's count is zero". `standing on` is a
+        # legal alias for `on` elsewhere in the grammar, and authors
+        # reach for both spellings; treat them identically. Same
+        # `== 0` alias reasoning as the board-scope case above.
+        (re.compile(r'^if not on (?P<m>\w+)$'),
+         'if on no marker {m}'),
+        (re.compile(r'^if not standing on (?P<m>\w+)$'),
+         'if on no marker {m}'),
+        (re.compile(r'^if on (?P<m>\w+)\s*==\s*0$'),
+         'if on no marker {m}'),
+        (re.compile(r'^if on (?P<m>\w+)\s*(?P<op>[<>])\s*(?P<n>\d+)$'),
+         'if on marker {m} {op} {n}'),
+        # The bare `if on <m>` and `if <m>` sugar forms are handled
+        # specially below (they overlap with landmark/agent references,
+        # so the marker guard has to dispatch per-name).
+    ]
+
+    _MARKER_SEEK_PATTERNS = [
+        # seek highest|lowest <m> [op N] [on landmark X] [timeout N]
+        (re.compile(
+            r'^seek\s+(?P<dir>highest|lowest)\s+(?P<m>\w+)'
+            r'(?:\s+(?P<op>[<>])\s*(?P<n>\d+))?'
+            r'(?:\s+on\s+landmark\s+(?P<l>\w+))?'
+            r'(?:\s+timeout\s+(?P<t>\d+))?$'),
+         None),  # Special-cased: assembled by helper below.
+        # Existing: `seek landmark X on <m> [op N]` — marker-as-filter,
+        # target stays a landmark. Need to disambiguate the filter so the
+        # engine knows it's a marker, not a tile-predicate.
+        (re.compile(
+            r'^seek\s+(landmark|agent)\s+(?P<tname>\w+)'
+            r'(?:\s+with\s+state\s*==\s*(?P<st>\w+))?'
+            r'\s+on\s+(?P<m>\w+)'
+            r'(?:\s*(?P<op>[<>])\s*(?P<n>\d+))?'
+            r'(?:\s+timeout\s+(?P<t>\d+))?$'),
+         None),  # Special-cased: see helper below.
+    ]
+
+    def _canonicalize_markers_in_behaviors(self):
+        """First-pass marker canonicalization.
+
+        Rewrites sugared marker references in `if` / `seek` / `incr` /
+        `decr` instructions to their fully-disambiguated `marker <name>`
+        form. After this pass, any instruction containing a marker name
+        wears the `marker` keyword, and the general name resolver
+        (`_resolve_names_in_behaviors`) can skip it the same way it
+        skips `landmark <name>` / `agent <name>`.
+
+        A rewrite only fires when the captured identifier is a declared
+        marker. Bare forms like `if pile` (pile being a landmark) are
+        left for the general resolver to classify. This keeps marker
+        sugar from accidentally claiming landmark/agent references.
+        """
+        markers = set(self.ir.get("markers", {}).keys())
+        if not markers:
+            # Nothing to canonicalize — skip the whole pass. Cheap guard
+            # for programs that don't use markers at all.
+            return
+
+        for agent, insts in self.ir.get("behaviors", {}).items():
+            for idx, (indent, inst) in enumerate(insts):
+                # Separate the optional trailing colon — the `if` forms
+                # have one, the seek/incr/decr forms don't.
+                colon = ':' if inst.endswith(':') else ''
+                body = inst[:-1].rstrip() if colon else inst
+
+                new_body = self._canonicalize_marker_body(body, markers, inst)
+                if new_body is not None and new_body != body:
+                    insts[idx] = (indent, new_body + colon)
+
+    def _canonicalize_marker_body(self, body, markers, full_inst):
+        """Return the canonical rewrite of `body` for marker forms, or
+        None / body unchanged if no rewrite applies.
+
+        `full_inst` is only used for error messages so the author sees
+        the instruction they actually wrote (colon and all)."""
+        # --- incr / decr: opcode unambiguously takes a marker name ---
+        m = re.match(r'^(incr|decr)\s+(\w+)(?:\s+(\d+))?$', body)
+        if m:
+            opcode, name, n = m.group(1), m.group(2), m.group(3)
+            if name not in markers:
+                raise ValueError(
+                    f"Compilation Failed: {opcode} references unknown "
+                    f"marker {name!r}. Declare it in the colors section "
+                    f"as 'ramp (r,g,b) decay K/T'. Instruction: "
+                    f"{full_inst!r}"
+                )
+            tail = f" {n}" if n else ""
+            return f"{opcode} marker {name}{tail}"
+
+        # --- if forms from the pattern catalog ---
+        for pat, template in self._MARKER_IF_PATTERNS:
+            pm = pat.match(body)
+            if pm:
+                if pm.group('m') not in markers:
+                    # Template assumes the captured name is a marker.
+                    # `if no pile` with pile=landmark is a semantic error
+                    # today — landmarks don't have a "no" predicate — but
+                    # catching it cleanly here would require threading the
+                    # landmarks set in. Leave it to the opcode validator.
+                    return None
+                return template.format(**pm.groupdict())
+
+        # --- bare sugar: `if on <m>` (self-cell, count > 0) and
+        # `if <m>` (board, count > 0). Overlap with landmark/agent
+        # existence checks, so we only rewrite when <m> is a marker. ---
+        m = re.match(r'^if on (\w+)$', body)
+        if m and m.group(1) in markers:
+            return f"if on marker {m.group(1)} > 0"
+        m = re.match(r'^if (\w+)$', body)
+        if m and m.group(1) in markers:
+            return f"if marker {m.group(1)} > 0"
+
+        # --- seek forms ---
+        # seek highest|lowest <m> [op N] [on landmark X] [timeout N]
+        m = re.match(
+            r'^seek\s+(?P<dir>highest|lowest)\s+(?P<m>\w+)'
+            r'(?:\s+(?P<op>[<>])\s*(?P<n>\d+))?'
+            r'(?:\s+on\s+landmark\s+(?P<l>\w+))?'
+            r'(?:\s+timeout\s+(?P<t>\d+))?$',
+            body,
+        )
+        if m:
+            name = m.group('m')
+            if name not in markers:
+                raise ValueError(
+                    f"Compilation Failed: 'seek {m.group('dir')} {name}' "
+                    f"references unknown marker {name!r}. Declare it in "
+                    f"the colors section as 'ramp (r,g,b) decay K/T'. "
+                    f"Instruction: {full_inst!r}"
+                )
+            out = f"seek {m.group('dir')} marker {name}"
+            if m.group('op'):
+                out += f" {m.group('op')} {m.group('n')}"
+            if m.group('l'):
+                out += f" on landmark {m.group('l')}"
+            if m.group('t'):
+                out += f" timeout {m.group('t')}"
+            return out
+
+        # seek [landmark|agent] <tname> [with state==X] on <m> [op N] [timeout N]
+        # — marker-as-filter on an otherwise normal seek. Only the filter
+        # part needs canonicalization; leave the rest alone.
+        m = re.match(
+            r'^(?P<head>seek(?:\s+nearest)?(?:\s+(?:landmark|agent))?\s+\w+'
+            r'(?:\s+with\s+state\s*==\s*\w+)?)'
+            r'\s+on\s+(?P<m>\w+)'
+            r'(?:\s*(?P<op>[<>])\s*(?P<n>\d+))?'
+            r'(?P<tail>(?:\s+timeout\s+\d+)?)$',
+            body,
+        )
+        if m and m.group('m') in markers:
+            head = m.group('head')
+            op = m.group('op')
+            n = m.group('n')
+            tail = m.group('tail') or ''
+            threshold = f" {op} {n}" if op else " > 0"
+            return f"{head} on marker {m.group('m')}{threshold}{tail}"
+
+        return None
 
     def _resolve_names_in_behaviors(self):
         """Rewrite bare names in `if on` / `seek` instructions into disambiguated
@@ -539,10 +916,19 @@ class CritCompiler:
                     colon = ':'
                     body = body[:-1]
 
+                # Marker forms are already canonicalized with the
+                # `marker` keyword — the classifier doesn't know about
+                # markers, so skipping them here is both necessary and
+                # safe. `no` likewise: `if no marker X` / `if on no
+                # marker X` are produced by the marker pre-pass.
+                if body.startswith(("if marker ", "if on marker ",
+                                     "if no marker ", "if on no marker ")):
+                    continue
+
                 m = if_on_re.match(body)
                 if m:
                     prefix, name, rest = m.group(1), m.group(2), m.group(3) or ''
-                    if name in _TILE_PREDICATES or name in ("landmark", "agent"):
+                    if name in _TILE_PREDICATES or name in ("landmark", "agent", "marker", "no"):
                         continue
                     kind = classify(name, inst)
                     insts[idx] = (indent, f"{prefix}{kind} {name}{rest}{colon}")
@@ -573,7 +959,7 @@ class CritCompiler:
                 m = if_exist_re.match(body)
                 if m:
                     prefix, name = m.group(1), m.group(2)
-                    if name in _TILE_PREDICATES or name in ("landmark", "agent"):
+                    if name in _TILE_PREDICATES or name in ("landmark", "agent", "marker"):
                         continue
                     kind = classify(name, inst)
                     insts[idx] = (indent, f"{prefix}{kind} {name}{colon}")
@@ -585,7 +971,13 @@ class CritCompiler:
                     nearest = m.group(2) or ''
                     name = m.group(3)
                     rest = m.group(4) or ''
-                    if name in _TILE_PREDICATES or name in ("landmark", "agent"):
+                    # `seek highest|lowest marker X` and `seek landmark
+                    # X on marker Y` are already canonicalized by the
+                    # marker pre-pass; classify() has no concept of
+                    # markers, so skip.
+                    if name in _TILE_PREDICATES or name in (
+                        "landmark", "agent", "marker", "highest", "lowest",
+                    ):
                         continue
                     kind = classify(name, inst)
                     insts[idx] = (
@@ -627,10 +1019,27 @@ class CritCompiler:
         re.compile(r'despawn(\s+agent\s+\w+)?'),
         re.compile(r'wander(\s+avoiding\s+(current|any))?'),
         re.compile(r'step\s*\(\s*-?\d+\s*,\s*-?\d+\s*\)'),
+        # Marker deposit/withdraw. Always carry the `marker` keyword at
+        # this stage — the pre-pass canonicalized any bare form.
+        re.compile(r'(incr|decr)\s+marker\s+\w+(\s+\d+)?'),
         re.compile(
+            # Existing target-first seek, with optional marker-as-filter
+            # tail: `seek [nearest] [agent|landmark] <name> [with state]`
+            # followed optionally by `[not] on <pred> [op N]` and
+            # `timeout N`. Marker filters look like `on marker X [op N]`.
             r'seek(\s+nearest)?(\s+(agent|landmark))?\s+\w+'
             r'(\s+with\s+state\s*==\s*\w+)?'
-            r'(\s+(not\s+)?on\s+\w+)?(\s+timeout\s+\d+)?'
+            r'(\s+(not\s+)?on\s+(marker\s+\w+(\s*[<>]\s*\d+)?|\w+))?'
+            r'(\s+timeout\s+\d+)?'
+        ),
+        # Gradient seek primitives. `on landmark X` is the ONLY filter
+        # allowed on these — the comparison op is fused into the target
+        # description, not expressed as a separate `on marker ...`.
+        re.compile(
+            r'seek\s+(highest|lowest)\s+marker\s+\w+'
+            r'(\s*[<>]\s*\d+)?'
+            r'(\s+on\s+landmark\s+\w+)?'
+            r'(\s+timeout\s+\d+)?'
         ),
     ]
 
@@ -741,6 +1150,88 @@ class CritCompiler:
                     f"hitting a 'done' or bare 'despawn'."
                 )
 
+    def _validate_markers(self):
+        """Semantic checks over ir["markers"] and behavior usage.
+
+        Runs AFTER `_canonicalize_markers_in_behaviors`, so every marker
+        reference in the behaviors table carries the `marker` keyword
+        and has already been checked against the declared set (unknown
+        references raise during canonicalization). This pass covers the
+        remaining classes of programmer error that can't be caught at
+        rewrite time:
+
+          1. `decay K/T` with T == 0 — would divide by zero at
+             render/sim time.
+          2. All-zero ramp RGB — marker renders nothing, so the script
+             can't visually show what it's doing. Warn, don't fail
+             (might be useful for headless accumulation).
+          3. `draw <marker>` / `set color = <marker>` — ramp colors
+             can't paint a tile, the operation is a semantic no-op and
+             almost certainly a typo.
+        """
+        markers = self.ir.get("markers", {})
+        for name, spec in markers.items():
+            if spec["decay_t"] <= 0:
+                raise ValueError(
+                    f"Compilation Failed: marker {name!r} has decay "
+                    f"period T={spec['decay_t']}; T must be a positive "
+                    f"integer. Use '0/1' to mean 'never decays'."
+                )
+            if spec["decay_k"] < 0:
+                raise ValueError(
+                    f"Compilation Failed: marker {name!r} has decay "
+                    f"amount K={spec['decay_k']}; K must be non-negative."
+                )
+            r, g, b = spec["rgb"]
+            if r == 0 and g == 0 and b == 0:
+                # Not a hard error — a headless accumulator marker is
+                # conceivable. Emit to stderr so the author notices.
+                print(
+                    f"warning: marker {name!r} has all-zero ramp RGB; "
+                    f"it will never render visibly.",
+                    file=sys.stderr,
+                )
+            # Sub-unit coefficient footgun. On device, ramp coefficients
+            # are stored as uint8_t (IrRuntime.h Marker struct), decoded
+            # via (uint8_t)atof(...), which truncates 0.25 to 0. That makes
+            # "dim version of a bright marker" (the natural first
+            # intuition, especially for night overrides) render invisible.
+            # Warn on any non-zero component below 1 so the author isn't
+            # surprised when the pixels don't show up. Skip fully-zero
+            # ramps — they already got the all-zero warning above.
+            if not (r == 0 and g == 0 and b == 0):
+                for ch_name, v in (("r", r), ("g", g), ("b", b)):
+                    if 0 < v < 1:
+                        print(
+                            f"warning: marker {name!r} ramp component "
+                            f"{ch_name}={v} is between 0 and 1; it will "
+                            f"truncate to 0 on device (uint8_t storage). "
+                            f"Use 1 for the dimmest visible step.",
+                            file=sys.stderr,
+                        )
+                        break  # one warning per marker is enough
+
+        # `draw <marker>` / `set color = <marker>` — ramp colors don't
+        # paint, so the engine would silently fall through. Better to
+        # reject at compile time than hunt a no-op on hardware.
+        for agent, insts in self.ir.get("behaviors", {}).items():
+            for indent, inst in insts:
+                m = re.match(r'^draw\s+(\w+)$', inst)
+                if m and m.group(1) in markers:
+                    raise ValueError(
+                        f"Compilation Failed: 'draw {m.group(1)}' in "
+                        f"agent {agent!r} — {m.group(1)!r} is a ramp "
+                        f"marker, not a paintable color. Use 'incr "
+                        f"{m.group(1)}' to deposit a marker unit."
+                    )
+                m = re.match(r'^set\s+color\s*=\s*(\w+)$', inst)
+                if m and m.group(1) in markers:
+                    raise ValueError(
+                        f"Compilation Failed: 'set color = {m.group(1)}'"
+                        f" in agent {agent!r} — {m.group(1)!r} is a "
+                        f"ramp marker, not an agent-paintable color."
+                    )
+
     def _validate_night_palette(self):
         """Cross-check the night palette against the day palette.
 
@@ -803,6 +1294,52 @@ class CritCompiler:
         night_default = self.ir.get("night_default")
         if night_default is not None:
             _check_value(night_default, "night default")
+
+    def _validate_night_markers(self):
+        """Cross-check ir["night_markers"] against the day markers table.
+
+        Each night marker entry must name a day marker that actually
+        exists. Same rationale as `_validate_night_palette`: catch name
+        mismatches on the laptop instead of letting the device silently
+        drop the override (or worse, fail to load the blob).
+
+        Also re-applies the sub-unit coefficient warning — a night
+        author is likely to try `heap: ramp (0.25, 0, 0)` as "dim red
+        for night," and the uint8_t truncation footgun bites the same
+        way as it does for day ramps.
+        """
+        day_markers = self.ir.get("markers", {})
+        for name, spec in self.ir.get("night_markers", {}).items():
+            if name not in day_markers:
+                raise ValueError(
+                    f"Compilation Failed: night marker override "
+                    f"{name!r} has no matching day marker. Each entry "
+                    f"in the 'night:' block that uses 'ramp (...)' must "
+                    f"override a marker declared at the top level of "
+                    f"the colors section. Known day markers: "
+                    f"{', '.join(sorted(day_markers)) or '(none)'}."
+                )
+            r, g, b = spec["rgb"]
+            if r == 0 and g == 0 and b == 0:
+                # Same semantic as day: a zero-ramp night override
+                # makes the marker invisible at night. Warn, don't fail
+                # — could be intentional ("this marker is day-only").
+                print(
+                    f"warning: night marker {name!r} has all-zero ramp "
+                    f"RGB; it will render invisible at night.",
+                    file=sys.stderr,
+                )
+            else:
+                for ch_name, v in (("r", r), ("g", g), ("b", b)):
+                    if 0 < v < 1:
+                        print(
+                            f"warning: night marker {name!r} ramp "
+                            f"component {ch_name}={v} is between 0 and "
+                            f"1; it will truncate to 0 on device. Use "
+                            f"1 for the dimmest visible step.",
+                            file=sys.stderr,
+                        )
+                        break
 
 
 if __name__ == "__main__":

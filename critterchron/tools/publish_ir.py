@@ -41,6 +41,18 @@ from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
 
 ENCODER_VERSION = "publish_ir/1"
 
+# Mirrors the default `IR_OTA_BUFFER_BYTES` in
+# `hal/particle/src/Stra2usClient.h`. Devices at that default silently
+# reject blobs whose HTTP body exceeds this cap (the rejection at
+# `kv_fetch_str_` line 472 only surfaces via serial as "ir_poll: fetch
+# failed"). Blobs over this threshold get a loud stderr warning here so
+# the operator at least sees it publisher-side — see TODO.md "Publish
+# warns when blob exceeds OTA buffer size". Device headers can override
+# IR_OTA_BUFFER_BYTES smaller or larger; without device-reported
+# telemetry we can't know per-device, so we warn against the default and
+# let the operator judge. Keep in lockstep with the device header.
+DEFAULT_OTA_BUFFER_BYTES = 8192
+
 # `encoded_at` is a publish-time timestamp and `END <hex>` is the Fletcher
 # checksum over all bytes before it (so it drifts whenever encoded_at
 # drifts). Neither carries semantic content — strip both before hashing
@@ -135,6 +147,21 @@ def main() -> int:
     print(f"src_sha:    {src_sha}")
     print(f"content_sha:{content_sha}")
     print(f"ir_ver:     {ir_ver}")
+
+    if size > DEFAULT_OTA_BUFFER_BYTES:
+        overshoot = size - DEFAULT_OTA_BUFFER_BYTES
+        print(
+            f"\nWARNING: size exceeds default OTA buffer "
+            f"({DEFAULT_OTA_BUFFER_BYTES} bytes) by {overshoot} bytes.\n"
+            f"         Devices running the default IR_OTA_BUFFER_BYTES will\n"
+            f"         reject this blob at fetch time and silently stay on\n"
+            f"         the previously-loaded script (visible on serial only\n"
+            f"         as 'ir_poll: fetch failed'). Either raise\n"
+            f"         IR_OTA_BUFFER_BYTES in the relevant device header, or\n"
+            f"         re-run with --no-source to drop the SOURCE trailer\n"
+            f"         (~halves blob size for most scripts).\n",
+            file=sys.stderr,
+        )
 
     if args.dry_run:
         print("dry-run: not uploading")

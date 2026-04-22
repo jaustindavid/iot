@@ -1,0 +1,86 @@
+# hw_incr_trail.crit — visual smoke test for `incr` + ramp rendering.
+#
+# Ant starts at (0, 0), steps down column 0, depositing an increasing
+# number of units at each cell: 1 at (0,0), 2 at (0,1), ... 6 at (0,5).
+# After the last deposit, the ant parks so the final state holds on
+# screen indefinitely. Marker has no decay — bricks stay put.
+#
+# Expected visual on leftmost column (screen rooted top-left):
+#   (0,0): dim    (1 unit)
+#   (0,1):        (2 units)
+#   (0,2):        (3 units)
+#   (0,3):        (4 units)
+#   (0,4):        (5 units)
+#   (0,5): bright (6 units)
+# Gradient should be unambiguous — each step noticeably brighter
+# than the previous. Ant pixel parked on the bottom cell.
+#
+# Fits any grid >= 1×6. Targets 8×8 minimum, rooted at (0,0).
+
+--- colors ---
+ant:   (200, 200, 255)
+trail: ramp (20.0, 5.0, 0.0) decay 0/1
+
+--- agents ---
+up to 1 ant
+ant: state { s0, s1, s2, s3, s4, s5, done }
+ant starts at (0, 0), state = s0
+
+--- simulation ---
+tick rate: 200ms
+
+--- behavior ---
+ant:
+  if state == s0:
+    incr trail
+    pause 1
+    step (0, 1)
+    set state = s1
+    done
+  if state == s1:
+    incr trail
+    incr trail
+    pause 1
+    step (0, 1)
+    set state = s2
+    done
+  if state == s2:
+    incr trail
+    incr trail
+    incr trail
+    pause 1
+    step (0, 1)
+    set state = s3
+    done
+  if state == s3:
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    pause 1
+    step (0, 1)
+    set state = s4
+    done
+  if state == s4:
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    pause 1
+    step (0, 1)
+    set state = s5
+    done
+  if state == s5:
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    incr trail
+    pause 1
+    set state = done
+    done
+  # Parked — hold the pattern on screen.
+  pause
+  done

@@ -58,6 +58,16 @@
 #ifndef IR_MAX_INSNS
 #define IR_MAX_INSNS 384
 #endif
+// Tile-marker cap (IR v5). Matches the compiler's MAX_MARKERS=4 by
+// default; also used to size Tile::count[] on the engine side, so
+// bumping it here costs MAX_MARKERS × (grid cells) bytes of RAM.
+// Override with -DIR_MAX_MARKERS=0 in a device header to compile
+// markers out entirely — the engine gates all marker paths on the
+// cap, so v4-era blobs still load unchanged on an IR_MAX_MARKERS=0
+// build.
+#ifndef IR_MAX_MARKERS
+#define IR_MAX_MARKERS 4
+#endif
 // Night palette caps — sparse override keyed by day color index. Cap at
 // IR_MAX_COLORS so every day color can have a per-color night override;
 // cycle entries live in their own small pool. Blobs without a night
@@ -154,6 +164,22 @@ struct PFConfig {
 
 struct Insn { uint8_t indent; const char* text; };
 
+// Tile-marker metadata (IR v5). One entry per `name: ramp (r, g, b)
+// decay K/T` declaration in the script. `index` is the slot into
+// Tile::count[] on the engine side — preserved from the compiler's
+// assignment so dumps and HAL state align. The ramp RGB is a
+// per-unit contribution (not a final color): render() adds
+// `count × rgb` to the tile's composite channel sum before clamp.
+// Decay: every `decay_t` ticks, subtract `decay_k` from every
+// non-zero cell. Both zero disables decay (marker persists).
+struct Marker {
+    const char* name;
+    uint16_t    index;
+    uint8_t     r, g, b;     // ramp coefficient, truncated from wire floats
+    uint8_t     decay_k;
+    uint16_t    decay_t;
+};
+
 struct Behavior {
     const char* agent_name;
     const Insn* insns;
@@ -200,6 +226,24 @@ extern uint16_t      PF_CONFIG_COUNT;
 
 extern Behavior      BEHAVIORS[IR_MAX_BEHAVIORS];
 extern uint16_t      BEHAVIOR_COUNT;
+
+// Markers (IR v5) — populated only from blobs that carry a MARKERS
+// section. Pre-v5 blobs leave MARKER_COUNT == 0 and every tile's
+// count[] array zeroed, so v4-era scripts run unchanged.
+extern Marker        MARKERS[IR_MAX_MARKERS];
+extern uint16_t      MARKER_COUNT;
+
+// Night-mode per-unit ramp override (IR v6). Sparse: one entry per day
+// marker the script re-paints under night mode. Each entry's `index`
+// field is copied from the matching day marker so the render loop can
+// index Tile::count[] with it directly — NIGHT_MARKERS[i].index is a
+// tile-slot, not a position within this table. The decay_k / decay_t
+// fields are unused for night entries (decay is a scheduler property
+// shared with the day marker — one counter ticks either way) and left
+// zeroed. The render loop consults this table only while night_mode_
+// is true; markers without a night entry fall through to the day ramp.
+extern Marker        NIGHT_MARKERS[IR_MAX_MARKERS];
+extern uint16_t      NIGHT_MARKER_COUNT;
 
 // Top-level pathfinding (engine consults this when no per-agent override
 // matches). Same semantics as the old constexpr slots.

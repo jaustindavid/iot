@@ -1,0 +1,23 @@
+# tests/markers_unknown.crit — negative fixture.
+#
+# `incr` targets a marker that was never declared. The compiler must
+# reject this with a message listing the declared markers (or noting
+# there are none). Mirror of night_unknown_ref.crit / no_yield.crit —
+# the language has a precedent for "unknown reference" errors pointing
+# at the name and the site.
+
+--- colors ---
+ant:     (255, 180, 80)
+real:    ramp (1.0, 1.0, 1.0) decay 0/1
+
+--- agents ---
+ant starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  incr typo                 # <-- `typo` is not a declared marker
+  pause 1
+  done

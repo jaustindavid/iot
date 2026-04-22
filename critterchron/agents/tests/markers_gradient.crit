@@ -1,0 +1,46 @@
+# tests/markers_gradient.crit — verify `seek highest <marker>` follows
+# the gradient.
+#
+# A "beacon" agent sits still on one cell and pumps its marker count.
+# A "follower" starts at the far corner and must converge on the
+# beacon via seek-highest. After ~30 ticks the follower should be
+# adjacent to or on top of the beacon.
+#
+# Exercises: seek highest marker, read-only `if trail > 0`, quiet
+# coexistence (two agent types sharing the board).
+
+--- colors ---
+beacon:   (255, 255, 255)
+follower: (80, 200, 255)
+trail:    ramp (5.0, 2.0, 0.0) decay 1/8
+
+--- agents ---
+up to 1 beacon
+up to 1 follower
+beacon   starts at (8, 8)
+follower starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- pathfinding ---
+follower:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+beacon:
+  incr trail 4
+  pause 1
+  done
+
+follower:
+  if trail > 0:
+    seek highest trail timeout 5
+    pause 1
+    done
+  wander
+  pause 1
+  done

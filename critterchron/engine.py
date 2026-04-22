@@ -10,7 +10,14 @@ from dataclasses import dataclass, field
 # kinds, or wire-format changes that older parsers would misinterpret.
 # The HAL interpreter enforces the same bound from its own copy so old
 # devices cleanly refuse newer blobs instead of silently mis-parsing.
-SUPPORTED_IR_VERSION = 4
+# v5: tile markers layer (MARKERS_SPEC.md).
+# v6: night-mode per-marker ramp overrides (compiler.py IR_VERSION=6 comment).
+SUPPORTED_IR_VERSION = 6
+
+# Fixed-width per-tile marker array. Matches compiler.MAX_MARKERS and
+# the HAL's TileFields::count[] width. Counts are uint8 semantically —
+# clamped to [0, 255] on incr/decr/decay.
+MAX_MARKERS = 4
 
 @dataclass
 class Tile:
@@ -18,6 +25,13 @@ class Tile:
     intended: bool = False  # The 'oracle' state from the clock
     color: tuple = (0, 0, 0)
     claimant_id: int = None  # Semaphore for logical locks
+    # Per-tile marker counts, indexed by marker declaration order
+    # (see compiler's ir["markers"][name]["index"]). Default zero —
+    # untouched tiles show no marker. Field is always sized
+    # MAX_MARKERS even if the program declares fewer, so a lookup by
+    # index never IndexErrors on a Tile initialized before the IR
+    # was loaded.
+    count: list = field(default_factory=lambda: [0] * MAX_MARKERS)
 
 @dataclass
 class Agent:
@@ -108,6 +122,42 @@ class CritterEngine:
         for agent_name, insts in self.ir.get("behaviors", {}).items():
             if any(i[1].startswith("draw") or i[1].startswith("erase") for i in insts):
                 self.painters.add(agent_name)
+
+        # Cache marker decl → (index, rgb, decay_k, decay_t). The
+        # index is the authoritative mapping into Tile.count[]. This
+        # cache is populated once at engine init; the IR is immutable
+        # post-compile, so no need to rebuild per tick.
+        self._markers = {}
+        for name, spec in self.ir.get("markers", {}).items():
+            self._markers[name] = {
+                "index": spec["index"],
+                "rgb": tuple(spec["rgb"]),
+                "decay_k": spec["decay_k"],
+                "decay_t": spec["decay_t"],
+            }
+
+        # Night-mode per-unit ramp override. Keyed by day-marker name;
+        # values hold the night rgb only (decay K/T is a scheduler property
+        # and stays on the day entry — see IR_VERSION 6 comment in
+        # compiler.py). Absent entry => night renders fall back to the day
+        # ramp. The renderer (renderer.py) consults this when
+        # `self.night_mode` is true.
+        self._night_markers = {}
+        for name, spec in self.ir.get("night_markers", {}).items():
+            self._night_markers[name] = {
+                "rgb": tuple(spec["rgb"]),
+            }
+
+    def marker_ramp(self, name):
+        """Return the (r, g, b) per-unit ramp coefficient for marker `name`,
+        honoring the current night-mode state. Night override falls through
+        to the day ramp when the script defines no per-marker night entry."""
+        if self.night_mode:
+            night = self._night_markers.get(name)
+            if night is not None:
+                return night["rgb"]
+        spec = self._markers.get(name)
+        return spec["rgb"] if spec else (0.0, 0.0, 0.0)
 
     def _resolve_color(self, ref, default=(255, 255, 255), phase=0):
         """Resolve a color reference (name) to an (r,g,b) tuple.
@@ -398,6 +448,26 @@ class CritterEngine:
         # 3. Conflict Resolution (Lower ID Wins)
         self.agents.sort(key=lambda a: a.id)
 
+        # 3.5. Eager marker decay. For each declared marker with
+        # decay_k > 0, decrement every cell's count by K every T ticks.
+        # K/0 is invalid (rejected at compile time). 0/T is "never
+        # decay" — matching any K=0 — so we short-circuit. Decay runs
+        # AFTER agent action so deposits land before they bleed off.
+        for name, spec in self._markers.items():
+            k = spec["decay_k"]
+            t = spec["decay_t"]
+            if k <= 0 or t <= 0:
+                continue
+            if self.tick_count % t != 0:
+                continue
+            idx = spec["index"]
+            for x in range(self.width):
+                col = self.grid[x]
+                for y in range(self.height):
+                    cnt = col[y].count[idx]
+                    if cnt:
+                        col[y].count[idx] = max(0, cnt - k)
+
         # 4. Convergence Check
         matches = 0
         total = self.width * self.height
@@ -439,6 +509,15 @@ class CritterEngine:
         state_bits = []
         intended_bits = []
         colors = []
+        # Sparse marker-count records. One entry per (cell, marker)
+        # with a non-zero count — most tiles are at zero, so a dense
+        # W*H*M array would blow up the record size on big boards.
+        # Each entry: [x, y, marker_index, count]. Marker names are
+        # carried in the `markers` header so the reader can resolve
+        # indices back to declared names.
+        markers_sparse = []
+        active_marker_indices = [spec["index"]
+                                 for spec in self._markers.values()]
         for x in range(self.width):
             for y in range(self.height):
                 t = self.grid[x][y]
@@ -446,11 +525,22 @@ class CritterEngine:
                 intended_bits.append(1 if t.intended else 0)
                 if t.state and t.color != (0, 0, 0):
                     colors.append([x, y, list(t.color)])
+                for idx in active_marker_indices:
+                    if t.count[idx]:
+                        markers_sparse.append([x, y, idx, t.count[idx]])
         agents = [
             {"id": a.id, "name": a.name, "pos": list(a.pos),
              "color": list(self._agent_color(a)), "glitched": a.glitched}
             for a in sorted(self.agents, key=lambda a: a.id)
         ]
+        # Marker declarations (name -> index) so consumers can interpret
+        # the sparse list. Kept compact; omitted if no markers declared
+        # so pre-v5 consumers diffing against pre-v5 dumps don't see an
+        # unexpected key.
+        marker_header = (
+            {name: spec["index"] for name, spec in self._markers.items()}
+            if self._markers else None
+        )
         record = {
             "tick": self.tick_count,
             "w": self.width,
@@ -461,6 +551,9 @@ class CritterEngine:
             "agents": agents,
             "metrics": dict(self.health_metrics),
         }
+        if marker_header is not None:
+            record["markers"] = marker_header
+            record["tile_markers"] = markers_sparse
         return json.dumps(record, separators=(",", ":")) + "\n"
 
     def _trace_dispatch(self, agent, pc, inst, pre_pos):
@@ -563,6 +656,29 @@ class CritterEngine:
                 pc += 1
                 continue
 
+            elif inst.startswith("incr marker ") or inst.startswith("decr marker "):
+                # `incr marker <name> [N]` / `decr marker <name> [N]`
+                # Target is the agent's current cell. N defaults to 1.
+                # Count is clamped uint8 (0..255). Matches `draw`/`erase`
+                # in that this does not yield and does not terminate.
+                parts = inst.split()
+                opcode = parts[0]  # incr | decr
+                mname = parts[2]
+                n = int(parts[3]) if len(parts) > 3 else 1
+                marker = self._markers.get(mname)
+                if marker is not None:
+                    idx = marker["index"]
+                    tile = self.grid[agent.pos[0]][agent.pos[1]]
+                    # Tile.count is a shared default factory? No — @dataclass
+                    # with default_factory gives each instance its own list.
+                    # Safe to mutate in place.
+                    if opcode == "incr":
+                        tile.count[idx] = min(255, tile.count[idx] + n)
+                    else:
+                        tile.count[idx] = max(0, tile.count[idx] - n)
+                pc += 1
+                continue
+
             elif inst.startswith("set color ="):
                 cname = inst.split("=", 1)[1].strip()
                 if cname in self.ir.get("colors", {}):
@@ -656,52 +772,18 @@ class CritterEngine:
                 return
 
             elif inst.startswith("seek"):
-                parts = inst.split()
-
-                # Parse: seek [nearest] [agent|landmark] <target>
-                #        [with state == <name>]
-                #        [(on|not on) <filter>]
-                #        [timeout N]
-                i = 1
-                if i < len(parts) and parts[i] == "nearest":
-                    i += 1
-                target_kind = None  # "agent" | "landmark" | None (tile predicate)
-                if i < len(parts) and parts[i] in ("agent", "landmark"):
-                    target_kind = parts[i]
-                    i += 1
-                target_type = parts[i] if i < len(parts) else None
-                i += 1
-
-                # Optional state filter (agent targets only). `with state == X`
-                # narrows the candidate set to agents whose state_str matches X.
-                state_filter = None
-                if (i + 3 < len(parts) and parts[i] == "with"
-                        and parts[i + 1] == "state" and parts[i + 2] == "=="):
-                    state_filter = parts[i + 3]
-                    i += 4
-
-                filter_mode = None
-                filter_kind = None
-                if i < len(parts) and parts[i] == "on" and i + 1 < len(parts):
-                    filter_mode = "on"
-                    filter_kind = parts[i + 1]
-                    i += 2
-                elif i + 2 < len(parts) and parts[i] == "not" and parts[i + 1] == "on":
-                    filter_mode = "not on"
-                    filter_kind = parts[i + 2]
-                    i += 3
-
-                timeout = None
-                if i + 1 < len(parts) and parts[i] == "timeout":
-                    try:
-                        timeout = int(parts[i + 1])
-                    except ValueError:
-                        pass
-
+                parsed = self._parse_seek(inst)
+                # Timeout bookkeeping: the per-agent seek_ticks counter
+                # resets when we land on a different seek PC (started
+                # fresh), accumulates on every re-entry for the SAME pc
+                # (blocked on the same seek). When the timeout is
+                # exceeded, advance past the seek — a failed seek does
+                # NOT yield, the caller must post-check.
                 if pc != agent.pc:
                     agent.seek_ticks = 0
                 agent.seek_ticks += 1
 
+                timeout = parsed["timeout"]
                 if timeout is not None and agent.seek_ticks > timeout:
                     self.health_metrics["failed_seeks"] += 1
                     agent.seek_ticks = 0
@@ -710,43 +792,24 @@ class CritterEngine:
                         self._trace_dispatch(agent, dispatch_pc, inst, pre_pos)
                     continue
 
-                candidates = []
-                if target_kind == "agent":
-                    candidates = [
-                        tuple(a.pos) for a in self.agents
-                        if a.name == target_type and a.id != agent.id
-                        and (state_filter is None
-                             or getattr(a, "state_str", "none") == state_filter)
-                    ]
-                elif target_kind == "landmark":
-                    pts = self.ir.get("landmarks", {}).get(target_type, {}).get("points", [])
-                    candidates = [tuple(p) for p in pts]
-                elif target_type in ("missing", "extra", "current"):
-                    for x in range(self.width):
-                        for y in range(self.height):
-                            tile = self.grid[x][y]
-                            if tile.claimant_id is not None:
-                                continue
-                            if target_type == "missing" and tile.intended and not tile.state:
-                                candidates.append((x, y))
-                            elif target_type == "extra" and not tile.intended and tile.state:
-                                candidates.append((x, y))
-                            elif target_type == "current" and tile.intended and tile.state:
-                                candidates.append((x, y))
-
-                if filter_mode and filter_kind:
-                    candidates = [c for c in candidates if self._tile_matches(c, filter_kind) == (filter_mode == "on")]
-
-                target = min(candidates, key=lambda t: abs(t[0]-agent.pos[0]) + abs(t[1]-agent.pos[1])) if candidates else None
+                candidates = self._build_seek_candidates(agent, parsed)
+                target = self._pick_seek_target(agent, candidates, parsed)
 
                 if target and tuple(target) != tuple(agent.pos):
-                    if target_type in ["missing", "extra"]:
+                    # `missing` / `extra` tile-predicate seeks claim the
+                    # target cell so multiple agents don't converge on
+                    # the same doomed tile. Gradient seeks don't claim —
+                    # pheromone following has no exclusive-access
+                    # semantics, and brief overshoot on the cap is
+                    # handled by the script (see MARKERS_SPEC §2.4).
+                    if parsed["kind"] == "classic" and parsed["target_type"] in (
+                        "missing", "extra",
+                    ):
                         self.grid[target[0]][target[1]].claimant_id = agent.id
                     path = self._get_a_star_path(agent.pos, target, agent.name)
                     if path:
                         agent.prev_pos = list(agent.pos)
                         agent.pos = list(path[0])
-                        # Update occupied positions cache if non-painter
                         if agent.name not in self.painters:
                             self._occupied_positions.discard(tuple(agent.prev_pos))
                             self._occupied_positions.add(tuple(agent.pos))
@@ -774,6 +837,258 @@ class CritterEngine:
         agent.step_duration = 1
         agent.prev_pos = list(agent.pos)
         agent.pc = 0
+
+    # ---- Seek parsing / candidate building (markers + classic) ----
+
+    # Match a canonical gradient seek:
+    #   seek highest|lowest marker <m> [op N] [on landmark <l>] [timeout N]
+    _SEEK_GRADIENT_RE = re.compile(
+        r'^seek\s+(?P<dir>highest|lowest)\s+marker\s+(?P<m>\w+)'
+        r'(?:\s+(?P<op>[<>])\s*(?P<n>\d+))?'
+        r'(?:\s+on\s+landmark\s+(?P<l>\w+))?'
+        r'(?:\s+timeout\s+(?P<t>\d+))?$'
+    )
+
+    def _parse_seek(self, inst):
+        """Parse a seek instruction into a dict of fields.
+
+        Two top-level shapes:
+          - kind='gradient' (seek highest/lowest marker): dir, marker_name,
+            marker_op, marker_n, landmark, timeout.
+          - kind='classic' (target-first seek): target_kind (agent/landmark/
+            None), target_type (name or tile-predicate), state_filter,
+            filter_mode (on/not on/None), filter_kind (a predicate OR
+            'marker'), filter_marker_name, filter_marker_op,
+            filter_marker_n, timeout.
+
+        The caller does NOT need to handle malformed instructions —
+        validation happened at compile time. Fields that don't apply for
+        a given shape are present and set to None, so dispatch code can
+        always read them.
+        """
+        m = self._SEEK_GRADIENT_RE.match(inst)
+        if m:
+            return {
+                "kind": "gradient",
+                "dir": m.group("dir"),
+                "marker_name": m.group("m"),
+                "marker_op": m.group("op"),
+                "marker_n": int(m.group("n")) if m.group("n") is not None else None,
+                "landmark": m.group("l"),
+                "timeout": int(m.group("t")) if m.group("t") is not None else None,
+                # unused in gradient shape but present for uniform dispatch
+                "target_kind": None, "target_type": None,
+                "state_filter": None, "filter_mode": None, "filter_kind": None,
+                "filter_marker_name": None, "filter_marker_op": None,
+                "filter_marker_n": None,
+            }
+
+        # Classic path. Tokenize and walk the grammar; tolerant to the
+        # marker-as-filter suffix inserted by the compiler's canonical-
+        # ization pass.
+        parts = inst.split()
+        i = 1
+        if i < len(parts) and parts[i] == "nearest":
+            i += 1
+        target_kind = None
+        if i < len(parts) and parts[i] in ("agent", "landmark"):
+            target_kind = parts[i]
+            i += 1
+        target_type = parts[i] if i < len(parts) else None
+        i += 1
+
+        state_filter = None
+        if (i + 3 < len(parts) and parts[i] == "with"
+                and parts[i + 1] == "state" and parts[i + 2] == "=="):
+            state_filter = parts[i + 3]
+            i += 4
+
+        filter_mode = None
+        filter_kind = None
+        filter_marker_name = None
+        filter_marker_op = None
+        filter_marker_n = None
+        if i < len(parts) and parts[i] == "on":
+            filter_mode = "on"
+            i += 1
+        elif i + 1 < len(parts) and parts[i] == "not" and parts[i + 1] == "on":
+            filter_mode = "not on"
+            i += 2
+
+        if filter_mode is not None and i < len(parts):
+            if parts[i] == "marker" and i + 1 < len(parts):
+                filter_kind = "marker"
+                filter_marker_name = parts[i + 1]
+                i += 2
+                # Optional comparison tail: `> N` or `< N`.
+                if i + 1 < len(parts) and parts[i] in (">", "<"):
+                    filter_marker_op = parts[i]
+                    try:
+                        filter_marker_n = int(parts[i + 1])
+                        i += 2
+                    except ValueError:
+                        pass
+            else:
+                filter_kind = parts[i]
+                i += 1
+
+        timeout = None
+        if i + 1 < len(parts) and parts[i] == "timeout":
+            try:
+                timeout = int(parts[i + 1])
+            except ValueError:
+                pass
+
+        return {
+            "kind": "classic",
+            "target_kind": target_kind,
+            "target_type": target_type,
+            "state_filter": state_filter,
+            "filter_mode": filter_mode,
+            "filter_kind": filter_kind,
+            "filter_marker_name": filter_marker_name,
+            "filter_marker_op": filter_marker_op,
+            "filter_marker_n": filter_marker_n,
+            "timeout": timeout,
+            # gradient-only fields, unused:
+            "dir": None, "marker_name": None, "marker_op": None,
+            "marker_n": None, "landmark": None,
+        }
+
+    def _marker_filter_pass(self, tile, op, n):
+        """Apply a marker count filter to a count value. `tile` is the
+        pre-read count for a single cell (already indexed into). Returns
+        True if the filter admits this cell."""
+        if op is None:
+            # Bare `on marker X` sugar — resolver rewrote it to `> 0`, so
+            # this branch should not fire; included for defensiveness.
+            return tile > 0
+        if op == ">":
+            return tile > n
+        if op == "<":
+            return tile < n
+        return False
+
+    def _build_seek_candidates(self, agent, parsed):
+        """Build the candidate cell list for a parsed seek."""
+        if parsed["kind"] == "gradient":
+            marker = self._markers.get(parsed["marker_name"])
+            if marker is None:
+                return []
+            idx = marker["index"]
+            # Scope cells to the landmark if given, else whole board.
+            if parsed["landmark"] is not None:
+                pts = self.ir.get("landmarks", {}).get(
+                    parsed["landmark"], {}
+                ).get("points", [])
+                cells = [(p[0], p[1]) for p in pts]
+            else:
+                cells = [(x, y) for x in range(self.width)
+                         for y in range(self.height)]
+            op = parsed["marker_op"]
+            n = parsed["marker_n"]
+            if op is None:
+                # Bare `seek highest marker X` — EXCLUDES zero-count
+                # cells (no gradient to follow on empty board). This
+                # is the pheromone-follower semantic per MARKERS_SPEC
+                # §2.4.
+                return [(x, y) for (x, y) in cells
+                        if self.grid[x][y].count[idx] > 0]
+            # With filter: candidate set is cells satisfying the
+            # comparison. `< N` INCLUDES zero-count cells — that's the
+            # soft-cap deposit primitive (MARKERS_SPEC §2.4).
+            if op == ">":
+                return [(x, y) for (x, y) in cells
+                        if self.grid[x][y].count[idx] > n]
+            if op == "<":
+                return [(x, y) for (x, y) in cells
+                        if self.grid[x][y].count[idx] < n]
+            return []
+
+        # Classic path — target-first, optional on/not-on filter.
+        target_kind = parsed["target_kind"]
+        target_type = parsed["target_type"]
+        state_filter = parsed["state_filter"]
+
+        candidates = []
+        if target_kind == "agent":
+            candidates = [
+                tuple(a.pos) for a in self.agents
+                if a.name == target_type and a.id != agent.id
+                and (state_filter is None
+                     or getattr(a, "state_str", "none") == state_filter)
+            ]
+        elif target_kind == "landmark":
+            pts = self.ir.get("landmarks", {}).get(target_type, {}).get("points", [])
+            candidates = [tuple(p) for p in pts]
+        elif target_type in ("missing", "extra", "current"):
+            for x in range(self.width):
+                for y in range(self.height):
+                    tile = self.grid[x][y]
+                    if tile.claimant_id is not None:
+                        continue
+                    if target_type == "missing" and tile.intended and not tile.state:
+                        candidates.append((x, y))
+                    elif target_type == "extra" and not tile.intended and tile.state:
+                        candidates.append((x, y))
+                    elif target_type == "current" and tile.intended and tile.state:
+                        candidates.append((x, y))
+
+        filter_mode = parsed["filter_mode"]
+        filter_kind = parsed["filter_kind"]
+        if filter_mode and filter_kind:
+            if filter_kind == "marker":
+                marker = self._markers.get(parsed["filter_marker_name"])
+                if marker is None:
+                    return []
+                idx = marker["index"]
+                op = parsed["filter_marker_op"]
+                n = parsed["filter_marker_n"]
+                want_on = filter_mode == "on"
+                candidates = [
+                    c for c in candidates
+                    if self._marker_filter_pass(
+                        self.grid[c[0]][c[1]].count[idx], op, n,
+                    ) == want_on
+                ]
+            else:
+                want_on = filter_mode == "on"
+                candidates = [
+                    c for c in candidates
+                    if self._tile_matches(c, filter_kind) == want_on
+                ]
+        return candidates
+
+    def _pick_seek_target(self, agent, candidates, parsed):
+        """Choose the winning target from a candidate list.
+
+        Classic seeks use Manhattan-nearest, matching historical
+        behavior. Gradient seeks sort primarily by count (descending for
+        `highest`, ascending for `lowest`) and break ties by Manhattan
+        distance — so a tied pile of count-0 cells reliably resolves to
+        the nearest one.
+        """
+        if not candidates:
+            return None
+        ax, ay = agent.pos[0], agent.pos[1]
+        if parsed["kind"] != "gradient":
+            return min(candidates, key=lambda t: abs(t[0] - ax) + abs(t[1] - ay))
+        marker = self._markers.get(parsed["marker_name"])
+        if marker is None:
+            return None
+        idx = marker["index"]
+        if parsed["dir"] == "highest":
+            # key: (-count, distance) → highest count, tie-break nearest
+            key = lambda t: (
+                -self.grid[t[0]][t[1]].count[idx],
+                abs(t[0] - ax) + abs(t[1] - ay),
+            )
+        else:
+            key = lambda t: (
+                self.grid[t[0]][t[1]].count[idx],
+                abs(t[0] - ax) + abs(t[1] - ay),
+            )
+        return min(candidates, key=key)
 
     def _check_condition(self, condition):
         """Checks the global grid state for triggers."""
@@ -863,6 +1178,80 @@ class CritterEngine:
         if m:
             return m.group(1) in self.ir.get("landmarks", {})
 
+        # --- Marker predicates. Canonical forms only; the compiler
+        # pre-pass has already desugared `if trail > 0` etc. ---
+
+        # Board or landmark-scoped boolean negation:
+        #   if no marker <m>                 — all cells == 0
+        #   if no marker <m> on landmark <l> — all landmark cells == 0
+        m = re.match(r'^if no marker (\w+)(?: on landmark (\w+))?$', body)
+        if m:
+            return self._eval_marker_scope(
+                m.group(1), op="no", n=0, landmark=m.group(2),
+            )
+
+        # Board or landmark-scoped comparison:
+        #   if marker <m> (>|<) N [on landmark <l>]
+        m = re.match(
+            r'^if marker (\w+)\s*([<>])\s*(\d+)'
+            r'(?:\s+on\s+landmark\s+(\w+))?$',
+            body,
+        )
+        if m:
+            return self._eval_marker_scope(
+                m.group(1), op=m.group(2), n=int(m.group(3)),
+                landmark=m.group(4),
+            )
+
+        # Self-cell scope:
+        #   if on marker <m> (>|<) N
+        #   if on no marker <m>
+        m = re.match(r'^if on no marker (\w+)$', body)
+        if m:
+            marker = self._markers.get(m.group(1))
+            if marker is None:
+                return False
+            return self.grid[ax][ay].count[marker["index"]] == 0
+        m = re.match(r'^if on marker (\w+)\s*([<>])\s*(\d+)$', body)
+        if m:
+            marker = self._markers.get(m.group(1))
+            if marker is None:
+                return False
+            cnt = self.grid[ax][ay].count[marker["index"]]
+            n = int(m.group(3))
+            return (cnt > n) if m.group(2) == ">" else (cnt < n)
+
+        return False
+
+    def _eval_marker_scope(self, mname, op, n, landmark):
+        """Evaluate a scoped marker predicate.
+
+        `op` is one of '>', '<', 'no'. 'no' means "all cells in scope
+        have count == 0" (a universal predicate); '>' and '<' mean
+        "ANY cell in scope satisfies the strict comparison" (existential).
+        `landmark` is a landmark name to restrict scope to, or None for
+        board-wide.
+
+        Unknown markers evaluate to False — matches the existing
+        "unrecognized → False" posture of _evaluate_if, and the
+        compiler's canonicalization already rejects unknown marker
+        references, so this branch is defensive only.
+        """
+        marker = self._markers.get(mname)
+        if marker is None:
+            return False
+        idx = marker["index"]
+        if landmark is not None:
+            pts = self.ir.get("landmarks", {}).get(landmark, {}).get("points", [])
+            cells = [(p[0], p[1]) for p in pts]
+        else:
+            cells = [(x, y) for x in range(self.width) for y in range(self.height)]
+        if op == "no":
+            return all(self.grid[x][y].count[idx] == 0 for x, y in cells)
+        if op == ">":
+            return any(self.grid[x][y].count[idx] > n for x, y in cells)
+        if op == "<":
+            return any(self.grid[x][y].count[idx] < n for x, y in cells)
         return False
 
     def _tile_matches(self, pos, kind):

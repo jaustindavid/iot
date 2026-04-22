@@ -35,6 +35,23 @@ REJECTION_CATEGORIES = {
     "standing_on_name":    "'standing on' only accepts tile predicates",
     "diagonal":            "diagonal",
     "missing_color":       "has no color defined",
+    # Markers (v5) positive fixtures are named `markers_<case>.crit` — they
+    # must compile cleanly. Two negatives have dedicated categories so the
+    # rejection message is checked, same pattern as the other negatives.
+    "markers_unknown":     "unknown marker",
+    "markers_decay_div_zero": "decay period T=0",
+    # Night-palette negatives. Both fixtures (`night_unknown_override.crit`,
+    # `night_unknown_ref.crit`) hit the same validator branch and share the
+    # substring "night override" in the error, so one category catches both.
+    "night_unknown":       "night override",
+}
+
+# Positive-fixture prefixes. Files matching these compile cleanly; they don't
+# carry a rejection expectation. Kept separate from REJECTION_CATEGORIES so the
+# runner can dispatch the two classes without special-casing each name.
+POSITIVE_PREFIXES = {
+    "markers":  None,  # all `markers_<name>.crit` not in REJECTION_CATEGORIES
+    "night":    None,  # existing `night_*` positives that currently SKIP
 }
 
 # Longest-first so e.g. "despawn_landmark" wins over a hypothetical "despawn".
@@ -46,12 +63,19 @@ def classify(path):
     stem = path.stem
     if stem == "ok" or stem.startswith("ok_"):
         return "ok", None
+    # Rejection categories checked first so e.g. `markers_unknown.crit` wins
+    # over the general `markers_*` positive bucket.
     for prefix in _PREFIXES_SORTED:
         if stem == prefix or stem.startswith(prefix + "_"):
             return prefix, REJECTION_CATEGORIES[prefix]
+    # Positive prefix fallthrough — the file must compile cleanly.
+    for prefix in POSITIVE_PREFIXES:
+        if stem == prefix or stem.startswith(prefix + "_"):
+            return prefix, None
     raise ValueError(
         f"Unrecognized test-filename prefix in {path.name!r}. Expected 'ok_' "
-        f"or one of: {sorted(REJECTION_CATEGORIES)}. See agents/tests/README.md."
+        f"or one of: {sorted(REJECTION_CATEGORIES) + sorted(POSITIVE_PREFIXES)}. "
+        f"See agents/tests/README.md."
     )
 
 

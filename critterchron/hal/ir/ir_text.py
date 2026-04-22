@@ -116,6 +116,46 @@ def encode(ir: dict, meta: dict) -> str:
         emit(f"NIGHT_DEFAULT {_fmt_night_body(night_default, None)}")
         emit("")
 
+    # ---- MARKERS (optional) ----
+    # Tile-marker declarations (IR v5). Each entry: name, assigned index
+    # (0..MAX_MARKERS-1), ramp RGB floats, decay K/T (integers). The index
+    # is emitted explicitly so the device can map count-array slots without
+    # rederiving the assignment from declaration order — keeps the host
+    # compiler authoritative. Ramp values stay floats on the wire; device
+    # loader converts to Q8 fixed-point at materialize time. Omitted entirely
+    # when the script has no markers, so v4-era blobs stay byte-identical.
+    markers = ir.get("markers", OrderedDict())
+    if markers:
+        emit(f"MARKERS {len(markers)}")
+        for name, spec in markers.items():
+            _check_token(name, "marker name")
+            r, g, b = spec["rgb"]
+            emit(
+                f"{name} {int(spec['index'])} "
+                f"{_fmt_float(r)} {_fmt_float(g)} {_fmt_float(b)} "
+                f"{int(spec['decay_k'])} {int(spec['decay_t'])}"
+            )
+        emit("")
+
+    # ---- NIGHT_MARKERS (optional, IR v6) ----
+    # Sparse override of marker ramp coefficients for night mode. Each entry
+    # names a day marker to swap coefficients on; decay is NOT overrideable
+    # per-night (inherited from the day declaration). Lines carry just the
+    # name and RGB — no index, no K/T — so the device can look up the slot
+    # from the day MARKERS table on load. Omitted entirely when no night
+    # markers are declared; pre-v6 blobs stay byte-identical to v5.
+    night_markers = ir.get("night_markers", OrderedDict())
+    if night_markers:
+        emit(f"NIGHT_MARKERS {len(night_markers)}")
+        for name, spec in night_markers.items():
+            _check_token(name, "night marker name")
+            r, g, b = spec["rgb"]
+            emit(
+                f"{name} "
+                f"{_fmt_float(r)} {_fmt_float(g)} {_fmt_float(b)}"
+            )
+        emit("")
+
     # ---- LANDMARKS ----
     # Coords may be plain ints or symbolic tokens ("max_x", "max_y-1").
     # The device-side parser resolves symbolic tokens against its own
@@ -317,6 +357,8 @@ def decode(text: str) -> tuple[dict, dict]:
         "colors": OrderedDict(),
         "night_colors": OrderedDict(),
         "night_default": None,
+        "markers": OrderedDict(),
+        "night_markers": OrderedDict(),
         "landmarks": OrderedDict(),
         "agents": OrderedDict(),
         "behaviors": OrderedDict(),
@@ -369,6 +411,35 @@ def decode(text: str) -> tuple[dict, dict]:
             # the section keyword to the shared body parser.
             _, val = _parse_night_body(toks[1:], with_name=False)
             ir["night_default"] = val
+
+        elif kind == "MARKERS":
+            n = int(toks[1])
+            for _ in range(n):
+                parts = cur.next().split()
+                # name index r g b decay_k decay_t  (7 tokens)
+                if len(parts) != 7:
+                    raise DecodeError(f"MARKERS entry malformed: {parts!r}")
+                name = parts[0]
+                ir["markers"][name] = {
+                    "index":   int(parts[1]),
+                    "rgb":     [float(parts[2]), float(parts[3]), float(parts[4])],
+                    "decay_k": int(parts[5]),
+                    "decay_t": int(parts[6]),
+                }
+
+        elif kind == "NIGHT_MARKERS":
+            n = int(toks[1])
+            for _ in range(n):
+                parts = cur.next().split()
+                # name r g b  (4 tokens — no index, no decay)
+                if len(parts) != 4:
+                    raise DecodeError(
+                        f"NIGHT_MARKERS entry malformed: {parts!r}"
+                    )
+                name = parts[0]
+                ir["night_markers"][name] = {
+                    "rgb": [float(parts[1]), float(parts[2]), float(parts[3])],
+                }
 
         elif kind == "LANDMARKS":
             n = int(toks[1])

@@ -134,9 +134,12 @@ int manhattan(Point a, Point b) {
 
 CritterEngine::CritterEngine(LedSink& sink, TimeSource& clock)
     : sink_(sink), clock_(clock) {
+    // Value-init the whole grid so every field (including count[]) is zero.
+    // Bit-fields + an array member rule out the Tile{...} aggregate init we
+    // used pre-v5.
     for (int x = 0; x < GRID_WIDTH; ++x)
         for (int y = 0; y < GRID_HEIGHT; ++y)
-            grid_[x][y] = Tile{0, 0, -1, 0, 0, 0};
+            grid_[x][y] = Tile{};
 }
 
 int CritterEngine::colorIndex(const char* name) const {
@@ -262,6 +265,21 @@ int CritterEngine::behaviorIndex(const char* name) const {
 int CritterEngine::pfConfigIndex(const char* name) const {
     for (uint16_t i = 0; i < critter_ir::PF_CONFIG_COUNT; ++i)
         if (strEq(critter_ir::PF_CONFIGS[i].agent_name, name)) return i;
+    return -1;
+}
+
+int CritterEngine::markerSlot(const char* name) const {
+#if IR_MAX_MARKERS > 0
+    for (uint16_t i = 0; i < critter_ir::MARKER_COUNT; ++i) {
+        if (strEq(critter_ir::MARKERS[i].name, name)) {
+            uint16_t slot = critter_ir::MARKERS[i].index;
+            if (slot >= IR_MAX_MARKERS) return -1;
+            return (int)slot;
+        }
+    }
+#else
+    (void)name;
+#endif
     return -1;
 }
 
@@ -543,6 +561,28 @@ void CritterEngine::tick() {
     std::sort(agents_, agents_ + agent_count_,
               [](const Agent& x, const Agent& y) { return x.id < y.id; });
 
+#if IR_MAX_MARKERS > 0
+    // Eager marker decay. For each declared marker with decay_k > 0 and
+    // decay_t > 0, subtract K from every non-zero count every T ticks.
+    // Runs after agent action so the tick's deposits land before they
+    // bleed off (parity with engine.py). Zero decay_k or decay_t → no
+    // decay, same short-circuit.
+    for (uint16_t m = 0; m < critter_ir::MARKER_COUNT; ++m) {
+        const critter_ir::Marker& M = critter_ir::MARKERS[m];
+        if (M.decay_k == 0 || M.decay_t == 0) continue;
+        if (tick_count_ % M.decay_t != 0) continue;
+        uint16_t slot = M.index;
+        if (slot >= IR_MAX_MARKERS) continue;
+        for (int x = 0; x < GRID_WIDTH; ++x)
+            for (int y = 0; y < GRID_HEIGHT; ++y) {
+                uint8_t c = grid_[x][y].count[slot];
+                if (!c) continue;
+                grid_[x][y].count[slot] =
+                    (c > M.decay_k) ? (uint8_t)(c - M.decay_k) : 0;
+            }
+    }
+#endif
+
     computeConvergence();
 }
 
@@ -710,6 +750,88 @@ bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
     // landmark <name> — defined-ness test
     if (n == 2 && strEq(tok[0], "landmark"))
         return landmarkIndex(tok[1]) >= 0;
+
+#if IR_MAX_MARKERS > 0
+    // --- Marker predicates. Compiler canonicalizes sugared forms
+    //     (`if trail > 0`, `if on trail`, `if no trail`) into these
+    //     `marker`-keyed shapes, so the HAL only has to handle canon.
+    //     All evaluate to false when the named marker is unknown —
+    //     matches the engine.py "unrecognized → false" posture.
+
+    // Self-cell: "on marker <m> (>|<) N"  (5 tokens)
+    if (n == 5 && strEq(tok[0], "on") && strEq(tok[1], "marker")
+            && (strEq(tok[3], ">") || strEq(tok[3], "<"))) {
+        int slot = markerSlot(tok[2]);
+        if (slot < 0) return false;
+        int nn = parseIntOr(tok[4], 0);
+        int cnt = grid_[a.pos.x][a.pos.y].count[slot];
+        return strEq(tok[3], ">") ? (cnt > nn) : (cnt < nn);
+    }
+    // Self-cell: "on no marker <m>"  (4 tokens)
+    if (n == 4 && strEq(tok[0], "on") && strEq(tok[1], "no")
+            && strEq(tok[2], "marker")) {
+        int slot = markerSlot(tok[3]);
+        if (slot < 0) return false;
+        return grid_[a.pos.x][a.pos.y].count[slot] == 0;
+    }
+
+    // Scoped predicate helpers: evaluate over all grid cells, or only
+    // cells belonging to a given landmark. `op`: '>', '<', or 0 for
+    // the `no` form (universal: all cells must be zero).
+    auto eval_marker_scope = [&](int slot, char op, int nn,
+                                 const char* landmark) -> bool {
+        if (slot < 0) return false;
+        if (landmark) {
+            int lm = landmarkIndex(landmark);
+            if (lm < 0) return false;
+            const auto& L = critter_ir::LANDMARKS[lm];
+            if (op == 0) {
+                for (uint16_t i = 0; i < L.point_count; ++i)
+                    if (grid_[L.points[i].x][L.points[i].y].count[slot] != 0)
+                        return false;
+                return true;
+            }
+            for (uint16_t i = 0; i < L.point_count; ++i) {
+                int c = grid_[L.points[i].x][L.points[i].y].count[slot];
+                if (op == '>' ? (c > nn) : (c < nn)) return true;
+            }
+            return false;
+        }
+        // Board-wide scan.
+        if (op == 0) {
+            for (int x = 0; x < GRID_WIDTH; ++x)
+                for (int y = 0; y < GRID_HEIGHT; ++y)
+                    if (grid_[x][y].count[slot] != 0) return false;
+            return true;
+        }
+        for (int x = 0; x < GRID_WIDTH; ++x)
+            for (int y = 0; y < GRID_HEIGHT; ++y) {
+                int c = grid_[x][y].count[slot];
+                if (op == '>' ? (c > nn) : (c < nn)) return true;
+            }
+        return false;
+    };
+
+    // Scoped: "no marker <m>"                 (3 tokens)
+    //         "no marker <m> on landmark <l>" (6 tokens)
+    if ((n == 3 || n == 6) && strEq(tok[0], "no") && strEq(tok[1], "marker")) {
+        if (n == 6 && !(strEq(tok[3], "on") && strEq(tok[4], "landmark")))
+            return false;
+        const char* lm = (n == 6) ? tok[5] : nullptr;
+        return eval_marker_scope(markerSlot(tok[2]), 0, 0, lm);
+    }
+    // Scoped: "marker <m> (>|<) N"                    (4 tokens)
+    //         "marker <m> (>|<) N on landmark <l>"    (7 tokens)
+    if ((n == 4 || n == 7) && strEq(tok[0], "marker")
+            && (strEq(tok[2], ">") || strEq(tok[2], "<"))) {
+        if (n == 7 && !(strEq(tok[4], "on") && strEq(tok[5], "landmark")))
+            return false;
+        int nn = parseIntOr(tok[3], 0);
+        char op = tok[2][0];
+        const char* lm = (n == 7) ? tok[6] : nullptr;
+        return eval_marker_scope(markerSlot(tok[1]), op, nn, lm);
+    }
+#endif
 
     return false;
 }
@@ -918,6 +1040,42 @@ void CritterEngine::processAgent(Agent& a) {
             continue;
         }
 
+#if IR_MAX_MARKERS > 0
+        // ---- incr / decr marker <name> [N] ----
+        // Wire form post-compiler canonicalization: `incr marker trail [N]`
+        // (default N=1). Clamped to [0, 255] like the sim — overflow just
+        // saturates at the cap rather than wrapping. Unknown marker names
+        // are silently skipped; the compiler rejects them up front, so
+        // reaching this branch with a bad name means a hand-rolled blob
+        // and we prefer "no effect" over crashing the tick.
+        if (startsWith(inst, "incr marker") || startsWith(inst, "decr marker")) {
+            bool is_incr = (inst[0] == 'i');
+            char buf[64];
+            std::strncpy(buf, inst, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            const char* tok[8]; int t = tokenize(buf, tok, 8);
+            if (t >= 3) {
+                int slot = markerSlot(tok[2]);
+                if (slot >= 0) {
+                    int n = (t >= 4) ? parseIntOr(tok[3], 1) : 1;
+                    if (n < 0) n = 0;
+                    uint8_t& c = grid_[a.pos.x][a.pos.y].count[slot];
+                    if (is_incr) {
+                        int nc = (int)c + n;
+                        if (nc > 255) nc = 255;
+                        c = (uint8_t)nc;
+                    } else {
+                        int nc = (int)c - n;
+                        if (nc < 0) nc = 0;
+                        c = (uint8_t)nc;
+                    }
+                }
+            }
+            ++pc;
+            continue;
+        }
+#endif
+
         // ---- draw [color] ----
         if (startsWith(inst, "draw")) {
             grid_[a.pos.x][a.pos.y].state = 1;
@@ -1048,11 +1206,143 @@ void CritterEngine::processAgent(Agent& a) {
         //           [with state == <name>]
         //           [(on|not on) <k>]
         //           [timeout N] ----
+        //   OR gradient form:
+        //       seek (highest|lowest) marker <m> [(>|<) N]
+        //                                        [on landmark <l>]
+        //                                        [timeout N]
         if (startsWith(inst, "seek")) {
             char buf[128];
             std::strncpy(buf, inst, sizeof(buf) - 1);
             buf[sizeof(buf) - 1] = 0;
             const char* tok[16]; int t = tokenize(buf, tok, 16);
+
+#if IR_MAX_MARKERS > 0
+            // Gradient-seek branch. Detect by the second token; classic
+            // seeks never use highest/lowest. Walks the marker field on
+            // the current grid, selects best cell by count (+ Manhattan
+            // tie-break), then reuses the same A*+step machinery the
+            // classic path uses below.
+            if (t >= 4 && (strEq(tok[1], "highest") || strEq(tok[1], "lowest"))
+                    && strEq(tok[2], "marker")) {
+                const bool want_high = strEq(tok[1], "highest");
+                int slot = markerSlot(tok[3]);
+                int gi = 4;
+                char gop = 0;
+                int  gn  = 0;
+                if (gi + 1 < t && (strEq(tok[gi], ">") || strEq(tok[gi], "<"))) {
+                    gop = tok[gi][0];
+                    gn  = parseIntOr(tok[gi + 1], 0);
+                    gi += 2;
+                }
+                const char* glandmark = nullptr;
+                if (gi + 2 < t && strEq(tok[gi], "on") && strEq(tok[gi + 1], "landmark")) {
+                    glandmark = tok[gi + 2];
+                    gi += 3;
+                }
+                int gtimeout = -1;
+                if (gi + 1 < t && strEq(tok[gi], "timeout"))
+                    gtimeout = parseIntOr(tok[gi + 1], -1);
+
+                if (pc != original_pc) a.seek_ticks = 0;
+                ++a.seek_ticks;
+                if (gtimeout >= 0 && a.seek_ticks > gtimeout) {
+                    ++metrics_.failed_seeks;
+                    a.seek_ticks = 0;
+                    ++pc;
+                    continue;
+                }
+
+                // Resolve scope: either a landmark's points or the whole grid.
+                const critter_ir::Point* lpts = nullptr;
+                uint16_t lnpts = 0;
+                if (glandmark) {
+                    int lm = landmarkIndex(glandmark);
+                    if (lm >= 0) {
+                        lpts = critter_ir::LANDMARKS[lm].points;
+                        lnpts = critter_ir::LANDMARKS[lm].point_count;
+                    } else {
+                        // Landmark unresolved: no candidates, fail the seek
+                        // cleanly so the caller's else/timeout path runs.
+                        a.seek_ticks = 0;
+                        ++pc;
+                        continue;
+                    }
+                }
+
+                // Visit candidates and track the best. Inline the
+                // filter+select instead of materializing a list so we
+                // don't need a grid-sized scratch buffer here.
+                bool have = false;
+                Point best{0, 0};
+                int best_cnt = 0, best_d = 0;
+
+                auto consider = [&](int x, int y) {
+                    if (slot < 0) return;
+                    int c = grid_[x][y].count[slot];
+                    // Bare "highest/lowest marker X" excludes zero-count
+                    // cells — can't follow a gradient across flat zero.
+                    // `< N` INCLUDES zero-count (the soft-cap deposit
+                    // primitive). `> N` is strict.
+                    if (gop == 0) {
+                        if (c == 0) return;
+                    } else if (gop == '>') {
+                        if (!(c > gn)) return;
+                    } else {
+                        if (!(c < gn)) return;
+                    }
+                    int d = manhattan(a.pos, Point{(int8_t)x, (int8_t)y});
+                    bool better;
+                    if (!have) better = true;
+                    else if (want_high) {
+                        if (c != best_cnt) better = (c > best_cnt);
+                        else               better = (d < best_d);
+                    } else {
+                        if (c != best_cnt) better = (c < best_cnt);
+                        else               better = (d < best_d);
+                    }
+                    if (better) {
+                        best = {(int8_t)x, (int8_t)y};
+                        best_cnt = c; best_d = d;
+                        have = true;
+                    }
+                };
+
+                if (lpts) {
+                    for (uint16_t k = 0; k < lnpts; ++k)
+                        consider(lpts[k].x, lpts[k].y);
+                } else {
+                    for (int x = 0; x < GRID_WIDTH; ++x)
+                        for (int y = 0; y < GRID_HEIGHT; ++y)
+                            consider(x, y);
+                }
+
+                if (have && !(best.x == a.pos.x && best.y == a.pos.y)) {
+                    Point step;
+                    uint32_t astar_t0 = now_us();
+                    bool moved = aStarFirstStep(a.pos, best, a.type_idx, step);
+                    astar_us_ += now_us() - astar_t0;
+                    if (moved) {
+                        a.prev_pos = a.pos;
+                        a.pos = {static_cast<int8_t>(a.pos.x + step.x),
+                                 static_cast<int8_t>(a.pos.y + step.y)};
+                        int32_t sr = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
+                        a.step_duration   = (int16_t)sr;
+                        a.remaining_ticks = (int16_t)sr;
+                    } else {
+                        a.step_duration   = 1;
+                        a.remaining_ticks = 1;
+                    }
+                    a.pc = pc;   // stay on this seek
+                    return;
+                }
+
+                // Already at the peak (or no candidates): advance past
+                // the seek. Matches the classic-seek arrival semantics.
+                a.seek_ticks = 0;
+                ++pc;
+                continue;
+            }
+#endif
 
             int i = 1;
             if (i < t && strEq(tok[i], "nearest")) ++i;
@@ -1239,6 +1529,53 @@ void CritterEngine::render(float blend) {
         }
     }
 
+#if IR_MAX_MARKERS > 0
+    // --- Marker ramp composite (additive over tile/landmark layer) ---
+    // Per MARKERS_SPEC §5: each marker contributes `count × rgb_coef` to
+    // the tile's per-channel sum, then clamp. Stacks with prior layers
+    // and with other markers on the same cell. Agents paint on top of
+    // this in the next pass.
+    if (critter_ir::MARKER_COUNT > 0) {
+        for (uint16_t mi = 0; mi < critter_ir::MARKER_COUNT; ++mi) {
+            const auto& M = critter_ir::MARKERS[mi];
+            if (M.index >= IR_MAX_MARKERS) continue;
+
+            // Night-mode ramp override (IR v6). NIGHT_MARKERS is
+            // indexed sparsely by tile-slot (`.index` mirrors the day
+            // marker it replaces), so a linear scan of at most
+            // IR_MAX_MARKERS entries is cheap and lets us fall through
+            // to the day ramp when no night override is declared for
+            // this marker. Decay stays on the day counter regardless —
+            // we only swap the per-unit RGB here.
+            uint8_t rr = M.r, gg = M.g, bb = M.b;
+            if (night_mode_ && critter_ir::NIGHT_MARKER_COUNT > 0) {
+                for (uint16_t ni = 0; ni < critter_ir::NIGHT_MARKER_COUNT; ++ni) {
+                    const auto& N = critter_ir::NIGHT_MARKERS[ni];
+                    if (N.index == M.index) {
+                        rr = N.r; gg = N.g; bb = N.b;
+                        break;
+                    }
+                }
+            }
+            if (rr == 0 && gg == 0 && bb == 0) continue;  // no-op ramp
+
+            for (int x = 0; x < GRID_WIDTH; ++x) {
+                for (int y = 0; y < GRID_HEIGHT; ++y) {
+                    uint8_t c = grid_[x][y].count[M.index];
+                    if (!c) continue;
+                    uint8_t* p = &fb_[(y * GRID_WIDTH + x) * 3];
+                    int r = (int)p[0] + (int)c * (int)rr;
+                    int g = (int)p[1] + (int)c * (int)gg;
+                    int b = (int)p[2] + (int)c * (int)bb;
+                    p[0] = (uint8_t)(r > 255 ? 255 : r);
+                    p[1] = (uint8_t)(g > 255 ? 255 : g);
+                    p[2] = (uint8_t)(b > 255 ? 255 : b);
+                }
+            }
+        }
+    }
+#endif
+
     // --- Agents (overwrite, with lerp on active steps) ---
     // Clamp blend outside the loop; repeat this many times per frame otherwise.
     if (blend < 0.0f) blend = 0.0f;
@@ -1358,9 +1695,45 @@ std::string CritterEngine::dumpStateJsonl() const {
                       a.glitched ? "true" : "false");
         out += buf;
     }
+    out += "]";
+
+#if IR_MAX_MARKERS > 0
+    // Marker header + sparse per-tile counts. Gated on MARKER_COUNT so
+    // blobs without markers leave no key at all — pre-v5 diff consumers
+    // stay byte-identical to the pre-v5 format.
+    if (critter_ir::MARKER_COUNT > 0) {
+        out += ",\"markers\":{";
+        for (uint16_t i = 0; i < critter_ir::MARKER_COUNT; ++i) {
+            if (i) out += ',';
+            std::snprintf(buf, sizeof(buf), "\"%s\":%u",
+                          critter_ir::MARKERS[i].name,
+                          (unsigned)critter_ir::MARKERS[i].index);
+            out += buf;
+        }
+        out += "},\"tile_markers\":[";
+        bool mfirst = true;
+        for (int x = 0; x < GRID_WIDTH; ++x)
+            for (int y = 0; y < GRID_HEIGHT; ++y) {
+                const Tile& t = grid_[x][y];
+                for (uint16_t i = 0; i < critter_ir::MARKER_COUNT; ++i) {
+                    uint16_t slot = critter_ir::MARKERS[i].index;
+                    if (slot >= IR_MAX_MARKERS) continue;
+                    uint8_t c = t.count[slot];
+                    if (!c) continue;
+                    if (!mfirst) out += ',';
+                    mfirst = false;
+                    std::snprintf(buf, sizeof(buf), "[%d,%d,%u,%u]",
+                                  x, y, (unsigned)slot, (unsigned)c);
+                    out += buf;
+                }
+            }
+        out += "]";
+    }
+#endif
+
     char bigbuf[256];
     std::snprintf(bigbuf, sizeof(bigbuf),
-                  "],\"metrics\":{\"convergences\":%u,\"glitches\":%u,"
+                  ",\"metrics\":{\"convergences\":%u,\"glitches\":%u,"
                   "\"step_contests\":%u,\"failed_seeks\":%u,"
                   "\"total_intended\":%u,\"total_lit_intended\":%u}}\n",
                   metrics_.convergences, metrics_.glitches,

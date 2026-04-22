@@ -1,0 +1,46 @@
+# ants_pheromone.crit — stigmergic foraging via marker trails
+#
+# Reference program for the `seek highest <marker>` primitive. Ants
+# drop a decaying `trail` marker wherever they walk; peers follow
+# the gradient. No landmark, no explicit coordination — the
+# environment itself carries the signal.
+#
+# Sizing: 16x16 default. 12 ants, trail decays 1 unit per 15 ticks
+# (at 100ms/tick that's a ~1.5s half-life at count=1). Ramp color is
+# a dim amber that brightens into warm orange at high traffic.
+#
+# This is the "pheromone" test case for MARKERS_SPEC.md §3.2.
+
+--- colors ---
+ant:     (255, 180, 80)
+trail:   ramp (0.2, 0.1, 0.0) decay 1/15
+
+--- agents ---
+up to 12 ant
+
+--- spawning ---
+spawn ant at (0, 0) every 3 ticks when missing
+
+--- simulation ---
+tick rate: 100ms
+
+--- pathfinding ---
+ant:
+  max nodes: 128
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+ant:
+  incr trail 2
+
+  # if a trail exists somewhere, walk toward it; otherwise wander
+  if trail > 0:
+    seek highest trail timeout 5
+    pause 1
+    done
+
+  wander
+  pause 1
+  done

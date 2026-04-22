@@ -1,0 +1,21 @@
+# tests/markers_decay_div_zero.crit — negative fixture.
+#
+# `decay K/T` with T == 0 is a compile error (division by zero in the
+# decay schedule; there's no sensible interpretation). The compiler
+# must reject this at the colors-block parse, not at load time.
+
+--- colors ---
+ant:   (255, 180, 80)
+trail: ramp (1.0, 1.0, 1.0) decay 1/0    # <-- T == 0 is invalid
+
+--- agents ---
+ant starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  incr trail
+  pause 1
+  done

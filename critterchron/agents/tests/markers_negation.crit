@@ -1,0 +1,50 @@
+### tests/markers_negation.crit — exercise the `not on <m>` / `<m> == 0`
+### sugar forms. All four new spellings desugar to the canonical
+### `if on no marker <m>` / `if no marker <m>` the engine already
+### handles — this fixture just proves the grammar compiles. Semantic
+### identity with the canonical form is covered by the existing marker
+### fixtures.
+###
+### Pass criterion: compiles clean. (Rejection test harness: absence of
+### a `markers_*` rejection category => clean compile required.)
+
+--- colors ---
+ant:   (0, 255, 255)
+trail: ramp (3.0, 3.0, 3.0) decay 0/1
+
+--- landmarks ---
+zone: trail
+  (4, 4)
+  (5, 4)
+  (6, 4)
+
+--- agents ---
+up to 1 ant
+ant starts at (5, 4)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  # Self-cell inverses — both mean "this cell has no trail".
+  if not on trail:
+    pause 1
+    done
+  if not standing on trail:
+    pause 1
+    done
+
+  # `== 0` aliases for `no`.
+  if on trail == 0:
+    pause 1
+    done
+  if trail == 0:
+    pause 1
+    done
+  if trail == 0 on landmark zone:
+    pause 1
+    done
+
+  pause 1
+  done

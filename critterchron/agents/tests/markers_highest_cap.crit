@@ -1,0 +1,106 @@
+# tests/markers_highest_cap.crit — combined coverage for
+# `seek highest <marker> < N on landmark <name>`.
+#
+# Verifies three properties at once:
+#   1. `seek highest` prefers the HIGHEST-count cell, not the nearest.
+#   2. The `< N` filter EXCLUDES cells at or above the cap.
+#   3. `on landmark X` restricts the candidate set to that landmark.
+#
+# Setup: three pile cells along row y=8, pre-loaded to counts 1, 4,
+# and 5. A main `ant` starts at (0, 0) — closer to the count=1 cell
+# than to the count=4 cell. With bare `seek highest`, the ant would
+# land on the count=4 cell. With the `< 5` filter, the count=5 cell
+# is excluded regardless. The predicted landing site is (8, 8).
+#
+# A wrong implementation would show one of these failure signatures:
+#   - Ant lands on (4, 8): forgot to sort by count (fell back to
+#     nearest).
+#   - Ant lands on (12, 8): forgot to apply the cap filter (went to
+#     absolute highest).
+#   - Ant lands on some non-pile cell: forgot to scope to landmark.
+#
+# Prefillers `despawn` after hitting their target counts so they
+# don't block the ant's arrival tile via occupancy penalties.
+
+--- colors ---
+pre_a: (255, 0, 0)
+pre_b: (0, 255, 0)
+pre_c: (0, 0, 255)
+ant:   (255, 255, 0)
+stack: ramp (10.0, 10.0, 10.0) decay 0/1
+
+--- landmarks ---
+pile: stack
+  (4, 8)
+  (8, 8)
+  (12, 8)
+
+--- agents ---
+up to 1 pre_a
+up to 1 pre_b
+up to 1 pre_c
+up to 1 ant
+pre_a starts at (4, 8)
+pre_b starts at (8, 8)
+pre_c starts at (12, 8)
+ant:  state { arming, seeking }
+ant   starts at (0, 0), state = arming
+
+--- simulation ---
+tick rate: 100ms
+
+--- pathfinding ---
+ant:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+# Prefiller A: one brick, then leave.
+pre_a:
+  incr stack
+  pause 1
+  despawn
+
+# Prefiller B: four bricks on the same cell via the self-cell cap
+# check, then leave. `if on stack < 4` drives the loop; fallthrough
+# runs on tick 5+.
+pre_b:
+  if on stack < 4:
+    incr stack
+    pause 1
+    done
+  despawn
+
+# Prefiller C: fill to the cap (5), then leave. Same pattern.
+pre_c:
+  if on stack < 5:
+    incr stack
+    pause 1
+    done
+  despawn
+
+# Ant: wait for prefillers to finish (pre_c needs 5 ticks + despawn
+# + engine cleanup — `pause 8` is conservative), then seek the
+# best-available sub-cap pile cell. Park on arrival so dumps show
+# the final position clearly.
+ant:
+  if state == arming:
+    pause 8
+    set state = seeking
+    done
+
+  if state == seeking:
+    seek highest stack < 5 on landmark pile timeout 30
+    if on landmark pile:
+      incr stack
+      pause 30
+      done
+    pause 1
+    done
+
+  # Unreachable (state is one of {arming, seeking}), but the compiler
+  # can't prove the enum is exhaustive — give every path a terminator.
+  pause 1
+  done

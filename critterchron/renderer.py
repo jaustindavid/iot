@@ -67,10 +67,30 @@ class CritterRenderer:
                 elif self.tile_alphas[x][y] > target_alpha:
                     self.tile_alphas[x][y] = max(target_alpha, self.tile_alphas[x][y] - alpha_step)
                 
-                # Start with grid color
+                # Start with grid color (lit-tile RGB, faded by alpha)
                 tile_r = tile.color[0] * self.tile_alphas[x][y]
                 tile_g = tile.color[1] * self.tile_alphas[x][y]
                 tile_b = tile.color[2] * self.tile_alphas[x][y]
+
+                # Additively composite any marker ramp on top. Each
+                # marker contributes `count * rgb_floats` to the tile
+                # channel sum (pre-clamp). Markers stack additively
+                # with each other and with the lit color — e.g. a lit
+                # tile at (r,g,b) with a 5-unit trail at (1.0,0.5,0.0)
+                # reads as (r+5, g+2.5, b). Clamp happens below after
+                # the agent composite.
+                for name, spec in self.engine._markers.items():
+                    c = tile.count[spec["index"]]
+                    if c:
+                        # Night overrides the per-unit ramp via
+                        # engine.marker_ramp(), which falls through to the
+                        # day ramp when no night entry is declared for
+                        # this marker. Decay K/T isn't consulted here —
+                        # this is the visual coefficient only.
+                        rr, gg, bb = self.engine.marker_ramp(name)
+                        tile_r += rr * c
+                        tile_g += gg * c
+                        tile_b += bb * c
 
                 # Agent dominates — pick the highest-presence agent on this tile
                 presence = 0.0

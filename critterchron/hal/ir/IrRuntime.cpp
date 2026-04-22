@@ -48,6 +48,12 @@ uint16_t      PF_CONFIG_COUNT = 0;
 Behavior      BEHAVIORS[IR_MAX_BEHAVIORS];
 uint16_t      BEHAVIOR_COUNT = 0;
 
+Marker        MARKERS[IR_MAX_MARKERS];
+uint16_t      MARKER_COUNT = 0;
+
+Marker        NIGHT_MARKERS[IR_MAX_MARKERS];
+uint16_t      NIGHT_MARKER_COUNT = 0;
+
 uint8_t       PF_TOP_DIAGONAL          = 0;
 float         PF_TOP_DIAGONAL_COST     = 0.0f;
 uint8_t       PF_TOP_HAS_DIAGONAL_COST = 0;
@@ -206,6 +212,8 @@ static void reset_tables() {
     LANDMARK_COUNT = AGENT_TYPE_COUNT = 0;
     INITIAL_AGENT_COUNT = SPAWN_RULE_COUNT = 0;
     PF_CONFIG_COUNT = BEHAVIOR_COUNT = 0;
+    MARKER_COUNT = 0;
+    NIGHT_MARKER_COUNT = 0;
     PF_TOP_DIAGONAL = 0;
     PF_TOP_DIAGONAL_COST = 0.0f;
     PF_TOP_HAS_DIAGONAL_COST = 0;
@@ -343,7 +351,14 @@ bool load(char* buf, size_t len) {
     }
 
     // --- line-cursor parse over [0, end_pos] ---
-    LineCursor cur{buf, buf + end_pos};
+    // Include the trailing '\n' at end_pos in the cursor range so the last
+    // content line gets null-terminated like every other line. Without this
+    // +1, a section that immediately precedes END with no blank line (e.g.
+    // BEHAVIORS, whose encoder emits the END line right after the last
+    // instruction) would leave its last line un-NUL'd, and the stored
+    // const char* would contain the rest of the buffer as a suffix —
+    // breaking every strEq/startsWith lookup against that line's opcode.
+    LineCursor cur{buf, buf + end_pos + 1};
 
     // 1. Magic
     char* ln = cur.next_nonempty();
@@ -478,6 +493,84 @@ bool load(char* buf, size_t len) {
                 return false;
             }
             HAS_NIGHT_DEFAULT = 1;
+
+        } else if (strcmp(kind, "NIGHT_MARKERS") == 0) {
+            // v6 section. Format per entry: `<name> <r> <g> <b>`. Index
+            // and decay K/T are inherited from the day MARKERS entry with
+            // the matching name (a single counter governs decay in both
+            // modes — see IrRuntime.h NIGHT_MARKERS comment). We require
+            // MARKERS to have been parsed first so the name→index lookup
+            // works; the encoder emits MARKERS before NIGHT_MARKERS, so
+            // that ordering is guaranteed by the wire format.
+            if (nt < 2) { set_err("NIGHT_MARKERS missing count"); return false; }
+            int n = atoi(toks[1]);
+            for (int i = 0; i < n; ++i) {
+                char* body = cur.next_nonempty();
+                if (!body) { set_err("NIGHT_MARKERS truncated"); return false; }
+                if (NIGHT_MARKER_COUNT >= IR_MAX_MARKERS) {
+                    set_err("IR_MAX_MARKERS exceeded (night)"); return false;
+                }
+                char* ntok[5];
+                int ncnt = tokenize(body, ntok, 5);
+                if (ncnt < 4) { set_err("night marker malformed"); return false; }
+                // Resolve against day markers so the engine can index
+                // Tile::count[] without a name lookup per cell.
+                uint16_t day_idx = 0xFFFF;
+                for (uint16_t j = 0; j < MARKER_COUNT; ++j) {
+                    if (strcmp(MARKERS[j].name, ntok[0]) == 0) {
+                        day_idx = MARKERS[j].index;
+                        break;
+                    }
+                }
+                if (day_idx == 0xFFFF) {
+                    set_errf("night marker '%s' has no day counterpart",
+                             ntok[0]);
+                    return false;
+                }
+                Marker& M = NIGHT_MARKERS[NIGHT_MARKER_COUNT];
+                M.name    = ntok[0];
+                M.index   = day_idx;
+                M.r       = (uint8_t)atof(ntok[1]);
+                M.g       = (uint8_t)atof(ntok[2]);
+                M.b       = (uint8_t)atof(ntok[3]);
+                M.decay_k = 0;   // unused for night entries
+                M.decay_t = 0;
+                NIGHT_MARKER_COUNT++;
+            }
+
+        } else if (strcmp(kind, "MARKERS") == 0) {
+            // v5 section. Format per entry:
+            //   <name> <index> <r> <g> <b> <decay_k> <decay_t>
+            // Ramp rgb are floats on the wire (preserving sim precision
+            // for the round-trip test) but truncated to uint8 on load —
+            // the device doesn't need fractional ramp coefficients per
+            // MARKERS_SPEC §12 ("ramp Q8 math" — integer-only is fine).
+            if (nt < 2) { set_err("MARKERS missing count"); return false; }
+            int n = atoi(toks[1]);
+            for (int i = 0; i < n; ++i) {
+                char* body = cur.next_nonempty();
+                if (!body) { set_err("MARKERS truncated"); return false; }
+                if (MARKER_COUNT >= IR_MAX_MARKERS) {
+                    set_err("IR_MAX_MARKERS exceeded"); return false;
+                }
+                char* mtok[8];
+                int mcnt = tokenize(body, mtok, 8);
+                if (mcnt < 7) { set_err("marker entry malformed"); return false; }
+                Marker& M = MARKERS[MARKER_COUNT];
+                M.name    = mtok[0];
+                M.index   = (uint16_t)atoi(mtok[1]);
+                M.r       = (uint8_t)atof(mtok[2]);
+                M.g       = (uint8_t)atof(mtok[3]);
+                M.b       = (uint8_t)atof(mtok[4]);
+                M.decay_k = (uint8_t)atoi(mtok[5]);
+                M.decay_t = (uint16_t)atoi(mtok[6]);
+                if (M.index >= IR_MAX_MARKERS) {
+                    set_errf("marker '%s' index %u >= IR_MAX_MARKERS",
+                             M.name, (unsigned)M.index);
+                    return false;
+                }
+                MARKER_COUNT++;
+            }
 
         } else if (strcmp(kind, "LANDMARKS") == 0) {
             if (nt < 2) { set_err("LANDMARKS missing count"); return false; }

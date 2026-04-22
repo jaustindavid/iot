@@ -1,0 +1,55 @@
+# tests/markers_sugar.crit — exercise the bare-form sugar for marker
+# predicates.
+#
+# Per MARKERS_SPEC.md §2.3:
+#   `if <marker>`                  == `if <marker> > 0`
+#   `if on <marker>`               == `if on <marker> > 0`
+#   `if <marker> on landmark <X>`  == `if <marker> > 0 on landmark <X>`
+#
+# All three sugared forms must compile and desugar to the same
+# predicate as their explicit counterpart. This test only exercises
+# the grammar — behavior identity is covered by the other fixtures.
+#
+# Pass criterion: compiles clean, dump matches the explicit form
+# byte-for-byte when run with the same RNG seed.
+
+--- colors ---
+ant:   (0, 255, 255)
+trail: ramp (3.0, 3.0, 3.0) decay 0/1
+
+--- landmarks ---
+zone: trail
+  (4, 4)
+  (5, 4)
+  (6, 4)
+
+--- agents ---
+up to 1 ant
+ant starts at (5, 4)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  # Sugared board-wide + landmark-scoped check before any incr —
+  # both should be false on a fresh board.
+  if trail:
+    pause 1
+    done
+  if trail on landmark zone:
+    pause 1
+    done
+
+  # Now drop a marker on our cell and re-test using the self-cell
+  # sugar form.
+  incr trail
+  if on trail:
+    pause 20
+    done
+
+  # Unreachable on a correct implementation; compiler needs every
+  # path to yield before falling off, so this branch just pauses
+  # and exits.
+  pause 1
+  done

@@ -1,0 +1,25 @@
+# tests/markers_basic.crit — smoke test for `incr` + `if <marker>`.
+#
+# One agent, one marker. Agent increments the trail on its cell, then
+# yields. On the next tick the `if trail > 0` branch should be taken.
+# Exercises: marker declaration, ramp color, incr opcode, board-wide
+# marker predicate, eager decay (disabled here via decay 0/1).
+
+--- colors ---
+ant:   (255, 180, 80)
+trail: ramp (1.0, 1.0, 1.0) decay 0/1
+
+--- agents ---
+ant starts at (4, 4)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  incr trail
+  if trail > 0:
+    pause 3
+    done
+  pause 1
+  done

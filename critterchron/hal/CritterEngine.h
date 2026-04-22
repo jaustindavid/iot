@@ -29,6 +29,14 @@ struct Tile {
     uint8_t intended : 1;
     int16_t claimant;            // -1 unclaimed
     uint8_t r, g, b;             // last draw color (only meaningful when state)
+#if IR_MAX_MARKERS > 0
+    // Per-tile marker counts (IR v5). Slot i holds the count for the marker
+    // whose compiler-assigned index is i (see critter_ir::MARKERS[k].index).
+    // Parallels engine.py's Tile.count dict-by-slot. Zeroed on engine
+    // construction; modified by incr/decr opcodes and decayed in-tick.
+    // Size is 0 (opt-out) on builds that -DIR_MAX_MARKERS=0.
+    uint8_t count[IR_MAX_MARKERS];
+#endif
 };
 
 // Engine-wide cap across all agent types. Must be >= the sum of per-type
@@ -111,7 +119,7 @@ public:
     // RNG-matched inputs, C++↔Python) traces can diff cleanly.
     std::string dumpStateJsonl() const;
 
-    static constexpr uint8_t SUPPORTED_IR_VERSION = 4;
+    static constexpr uint8_t SUPPORTED_IR_VERSION = 6;
 
     // Night-mode toggle. When true, resolveColor() consults the night
     // palette (NIGHT_COLORS / NIGHT_DEFAULT) before falling through to
@@ -144,6 +152,12 @@ private:
     int  agentTypeIndex(const char* name) const;
     int  behaviorIndex(const char* name) const;
     int  pfConfigIndex(const char* name) const;
+    // Resolve a marker name to its Tile::count[] slot. Returns -1 if the
+    // name is unknown or the build is compiled with IR_MAX_MARKERS=0.
+    // Note: the slot is `MARKERS[k].index`, not `k` — the compiler can
+    // assign a stable slot independent of declaration order, and the HAL
+    // respects whatever slot the wire format carries.
+    int  markerSlot(const char* name) const;
 
     // Pathfinding config resolution with the same fallback chain as engine.py.
     int32_t pfInt(uint16_t type_idx, const char* key, int32_t fallback) const;

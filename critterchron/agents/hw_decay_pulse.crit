@@ -1,0 +1,45 @@
+# hw_decay_pulse.crit — visual smoke test for the decay sweep.
+#
+# Ant at (4, 4) stamps 10 units of `trail` on its own cell in one
+# tick, then despawns so its white agent pixel doesn't occlude the
+# fade. Marker declared with `decay 1/8` — every 8 ticks, every
+# non-zero cell loses 1 unit. So (4,4) starts at count=10 and
+# monotonically decays to 0 over 80 ticks ≈ 16 seconds at 200ms/tick.
+#
+# Expected visual:
+#   - tick 1:    (4,4) flashes bright orange.
+#   - tick 2:    ant pixel gone; (4,4) still bright.
+#   - ~every 8 ticks: (4,4) dims one notch.
+#   - ~16s after start: (4,4) black.
+# No other cells light up. No movement. The fade should be smooth,
+# not sudden.
+#
+# Fits any grid >= 5×5. Targets 8×8 minimum.
+
+--- colors ---
+ant:   (255, 255, 255)
+trail: ramp (25.0, 2.0, 0.0) decay 1/8
+
+--- agents ---
+up to 1 ant
+ant starts at (4, 4)
+
+--- simulation ---
+tick rate: 200ms
+
+--- behavior ---
+ant:
+  # 10 units in one tick — then get out of the way so the fade is
+  # unoccluded.
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  pause 1
+  despawn

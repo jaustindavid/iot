@@ -1,0 +1,62 @@
+# hw_gradient_follow.crit — visual smoke test for gradient seek.
+#
+# Two agents on row 0:
+#   - `beacon` at (7, 0): stamps 5 units of `trail` on its own cell
+#     in a single tick, then despawns. The cell is persistent (no
+#     decay), so it stays bright for the rest of the run.
+#   - `follower` at (0, 0): runs `seek highest trail`. Paths right
+#     along row 0 and parks on top of the (now-vacated) peak.
+#
+# Beacon despawns after stamping because a stationary non-painter
+# agent blocks pathing — follower would hang at (6, 0) unable to
+# take the last step. Stamp-and-despawn is the simplest idiom that
+# leaves a persistent peak for the seeker to land on.
+#
+# Expected visual:
+#   - tick 1:  beacon pixel (yellow) visible at (7, 0), cell
+#              flashes bright orange underneath.
+#   - tick 2:  beacon gone; (7, 0) continues to glow (no decay).
+#              Follower (white) at (0, 0).
+#   - tick ~8: follower has marched (0,0) → (7,0) at one cell/tick.
+#   - tick 9+: follower parked on (7, 0) atop the bright trail cell.
+#
+# Fits any grid >= 8×1. Targets 8×8 minimum.
+
+--- colors ---
+beacon:   (200, 200, 0)
+follower: (255, 255, 255)
+trail:    ramp (30.0, 15.0, 0.0) decay 0/1
+
+--- agents ---
+up to 1 beacon
+up to 1 follower
+beacon   starts at (7, 0)
+follower starts at (0, 0)
+
+--- simulation ---
+tick rate: 200ms
+
+--- pathfinding ---
+follower:
+  max nodes: 64
+  step rate: 1
+  diagonal: disallowed
+
+--- behavior ---
+beacon:
+  # Stamp a persistent peak at (7, 0), then clear the tile so the
+  # follower can actually land there.
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  incr trail
+  despawn
+
+follower:
+  seek highest trail timeout 20
+  if on trail:
+    pause
+    done
+  pause 1
+  done

@@ -1,0 +1,55 @@
+# tests/markers_softcap.crit — verify `seek landmark X on heap < N`
+# skips saturated cells.
+#
+# Setup: a 3-cell pile landmark. A "prefiller" agent pushes cell 0 to
+# count=3 (at-cap for this test) before the main agent runs. The main
+# agent attempts `seek landmark pile on heap < 3`; it must land on
+# cell 1 or 2, never cell 0.
+#
+# Expected dump shape: cell (0, 0) at count=3 permanently; cell (1, 0)
+# or cell (2, 0) receives the main agent's `incr`. Never both the
+# prefiller-full cell and a new incr on it.
+
+--- colors ---
+pre:   (255, 0, 0)
+ant:   (0, 255, 0)
+stack: ramp (10.0, 10.0, 10.0) decay 0/1
+
+--- landmarks ---
+pile: stack
+  (0, 0)
+  (1, 0)
+  (2, 0)
+
+--- agents ---
+up to 1 pre
+up to 1 ant
+pre starts at (0, 0)
+ant starts at (5, 5)
+
+--- simulation ---
+tick rate: 100ms
+
+--- pathfinding ---
+ant:
+  max nodes: 64
+  step rate: 1
+
+--- behavior ---
+pre:
+  # Saturate cell (0, 0) to the cap, then park.
+  if on stack < 3:
+    incr stack
+    pause 1
+    done
+  pause 10
+  done
+
+ant:
+  seek landmark pile on stack < 3 timeout 15
+  if on landmark pile:
+    incr stack
+    pause 10
+    done
+  pause 1
+  done

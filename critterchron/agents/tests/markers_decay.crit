@@ -1,0 +1,35 @@
+# tests/markers_decay.crit — verify eager decay draws marker counts
+# back to zero on the declared schedule.
+#
+# Agent drops a single trail unit, then sits. With decay 1/2 (one
+# unit per 2 ticks), `if on trail > 0` should flip false on tick 3.
+# Dumps should show the count going 1 → 1 → 0 → 0 → ...
+
+--- colors ---
+ant:   (255, 180, 80)
+trail: ramp (5.0, 5.0, 5.0) decay 1/2
+
+--- agents ---
+ant: state { drop, watch, exit }
+ant starts at (0, 0), state = drop
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  if state == drop:
+    incr trail
+    set state = watch
+    pause 1
+    done
+
+  if state == watch:
+    if on trail > 0:
+      pause 1
+      done
+    set state = exit
+    # FALLTHROUGH
+
+  pause 10
+  done

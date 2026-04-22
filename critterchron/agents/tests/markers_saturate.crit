@@ -1,0 +1,23 @@
+# tests/markers_saturate.crit — verify count clamps at 255.
+#
+# Agent hammers `incr trail 50` on the same cell on every tick. After
+# 6 ticks the raw sum is 300; the on-device count must read 255, and
+# the rendered ramp must clamp per-channel at 255 too.
+#
+# Useful as a dump-diff test between sim and HAL.
+
+--- colors ---
+ant:   (255, 180, 80)
+trail: ramp (2.0, 2.0, 2.0) decay 0/1   # ramp clamp kicks at count=128
+
+--- agents ---
+ant starts at (7, 7)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+ant:
+  incr trail 50
+  pause 1
+  done
