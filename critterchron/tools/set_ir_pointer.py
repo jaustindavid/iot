@@ -27,12 +27,18 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
+from tools.publish_ir import _content_sha  # noqa: E402
 
 
 def _as_text(value) -> str | None:
     """Normalize a KV response to str, or None if the server returned
     nothing usable. Empty strings count as 'missing' — our publish flow
-    never writes an empty blob or sidecar, so empty == absent."""
+    never writes an empty blob or sidecar, so empty == absent.
+
+    **Strips leading/trailing whitespace.** Fine for sidecar-like values
+    (sha is hex, any whitespace is noise). NOT fine for the blob itself,
+    whose trailing `\\n` is a real byte that counts toward `size`. Use
+    `_as_raw_text` for the blob."""
     if value is None:
         return None
     if isinstance(value, bytes):
@@ -46,16 +52,43 @@ def _as_text(value) -> str | None:
     return v if v else None
 
 
-def _script_exists(client, name: str) -> tuple[bool, str]:
-    """Verify a published script exists by inspecting content, not just
-    presence. `is None` isn't enough — the server can hand back empty or
-    non-string bodies for missing keys, which would pass a naive check.
+def _as_raw_text(value) -> str | None:
+    """Like `_as_text` but without the `.strip()`. The OTA blob ends with
+    `END <fletcher>\\n` — that trailing newline is counted in the
+    `size` the publisher records in the sidecar, so stripping it would
+    make the byte-length cross-check off by one."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    return value if value else None
 
-    Prefer the sidecar (64-byte fetch); fall back to the blob for
-    pre-sidecar publishes."""
+
+def _script_exists(client, name: str) -> tuple[bool, str]:
+    """Verify a published script exists *and is internally consistent*.
+    Fetches both the sidecar and the blob, then cross-checks: blob size
+    matches the sidecar's declared size, and blob's recomputed
+    content_sha matches the sidecar's sha. Either mismatch is a "reverse
+    tear" (sidecar updated but blob stale or missing) and blocks the
+    repoint — the device would detect the same mismatch later and refuse
+    to apply, so flagging it here saves a confusing round-trip.
+
+    Presence-only checks aren't enough — the server can hand back empty
+    or non-string bodies for missing keys, which would pass a naive
+    `is None` check.
+
+    Legacy sidecars (pre-2026-04-22, bare 64-hex sha with no size suffix)
+    are accepted — the size check is skipped when sidecar size is absent,
+    but the content_sha cross-check still runs."""
     sha_key = f"critterchron/scripts/{name}/sha"
     blob_key = f"critterchron/scripts/{name}"
 
+    # 1. Fetch sidecar.
     try:
         sha = _as_text(client.get(sha_key))
     except Stra2usError as e:
@@ -63,18 +96,60 @@ def _script_exists(client, name: str) -> tuple[bool, str]:
         sha_err = str(e)
     else:
         sha_err = None
-    if sha and len(sha) == 64 and all(c in "0123456789abcdefABCDEF" for c in sha):
-        return True, f"sidecar {sha_key} sha={sha[:8]}…"
+    # Sidecar format: "<64-hex sha>" (legacy) or
+    # "<64-hex sha>:<decimal size_bytes>" (current).
+    sidecar_sha: str | None = None
+    sidecar_size: int | None = None
+    if sha:
+        sha_part, _, size_part = sha.partition(":")
+        if (len(sha_part) == 64
+                and all(c in "0123456789abcdefABCDEF" for c in sha_part)
+                and (size_part == "" or size_part.isdigit())):
+            sidecar_sha = sha_part.lower()
+            sidecar_size = int(size_part) if size_part else None
 
+    # 2. Fetch blob. Multi-KB but still cheap over HTTP — this runs
+    # once per repoint, not per heartbeat. Use `_as_raw_text` (no
+    # strip) so the trailing `\n` counts toward byte-length —
+    # publisher-side size includes it.
     try:
-        blob = _as_text(client.get(blob_key))
+        blob = _as_raw_text(client.get(blob_key))
     except Stra2usError as e:
-        return False, f"sidecar missing ({sha_err or 'empty'}); blob probe failed: {e}"
-    if blob and blob.startswith("CRIT "):
+        if sidecar_sha is None:
+            return False, f"sidecar missing ({sha_err or 'empty'}); blob probe failed: {e}"
+        return False, f"sidecar ok but blob fetch failed: {e}"
+
+    if not blob:
+        if sidecar_sha is None:
+            return False, "no sidecar and no blob"
+        return False, (f"reverse tear: sidecar sha={sidecar_sha[:8]}… "
+                       f"present but blob missing")
+    if not blob.startswith("CRIT "):
+        return False, "blob present but missing CRIT header"
+
+    # 3. Cross-check (only if we have a usable sidecar).
+    if sidecar_sha is None:
+        # Legacy / malformed sidecar. Blob is parseable, trust it — this
+        # is the same fallback the old code did, just after a blob fetch
+        # that didn't cost us anything meaningful.
         return True, f"blob {blob_key} present ({len(blob)} bytes, no sidecar)"
 
-    reason = "no sidecar and no blob" if not blob else "blob present but missing CRIT header"
-    return False, reason
+    blob_bytes = blob.encode("utf-8")
+    blob_size  = len(blob_bytes)
+    if sidecar_size is not None and sidecar_size != blob_size:
+        return False, (f"reverse tear: sidecar size={sidecar_size}B but blob "
+                       f"is {blob_size}B (sha={sidecar_sha[:8]}…)")
+
+    actual_sha = _content_sha(blob)
+    if actual_sha != sidecar_sha:
+        return False, (f"reverse tear: sidecar sha={sidecar_sha[:8]}… "
+                       f"but blob content_sha is {actual_sha[:8]}…")
+
+    detail = f"sidecar {sha_key} sha={sidecar_sha[:8]}…"
+    if sidecar_size is not None:
+        detail += f" size={sidecar_size}B"
+    detail += " (sha+size cross-checked against blob)"
+    return True, detail
 
 
 def main() -> int:

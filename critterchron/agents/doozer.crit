@@ -1,187 +1,193 @@
-# doozer.crit: builders and bricks
+# doozer_markers.crit — doozer, markers-layer retelling
 #
-# a "brick" is the agent which manages the brick pile.  
-# they count with position and color.  They can accept (incr) or give (decr)
-# bricks to doozers.  Their states will be "free", "full", or "busy"
-# A "free" pile always has at last one more brick.  A "full" pile can give
-# but not accept.  A "busy" pile is occupied right now.
+# Orthogonal rewrite of doozer.crit using the Tile Markers spec
+# (MARKERS_SPEC.md). Each pile cell carries a `heap` marker count;
+# doozers `incr` to deposit a brick, `decr` to withdraw. The `heap`
+# ramp color brightens the pile cell with more bricks — brightness
+# stands in for the old script's vertical stack of brick_1/2/3 tiles.
 #
-# A doozer is a builder.  He visits a free brick pile, which will inspire 
-# the pile to shrink or grow.  He builds or demolishes time, brick by brick.
+# Sizing (32x8 widescreen, peak clock ~80 lit cells):
+#   - Single `piles` landmark unioning 2 × 8 cells on the bottom row
+#     = 16 pile cells.
+#   - Per-cell soft cap of 5 enforced by `seek highest heap < 5 on
+#     landmark piles` in the returning branch. `incr` doesn't re-
+#     check; the seek already filtered out full cells, and brief
+#     races (peer filled the cell mid-seek) are tolerated — the
+#     overshoot decays on the next fetch cycle.
+#   - Total capacity = 16 × 5 = 80, matching peak clock demand.
+#
+# Departure from the original doozer.crit: the pile is not a visible
+# vertical stack of pixels — ramp brightness substitutes. Cleaner
+# semantics, half the opcodes, same narrative. No `bricks` stateful
+# avatar-on-the-pile; the pile *is* the data structure.
 
 --- colors ---
-doozer:  (255, 255, 0)   # yellow
-brightyellow:  (255, 255, 0)
-dullyellow:  (64, 64, 0)
-brick_1:     (50, 0, 0)
-brick_2:     (100, 0, 0)
-brick_3:     (150, 0, 0)
-brick_4:     (200, 0, 0)
-brick_5:     (255, 0, 0)
-bricks:      (255, 0, 0) # agent body color (required; matches agent name)
-brick:       (255, 0, 0) # the tile
-black:       (0, 0, 0)
+doozer:    (255, 255, 0)
+bright_y:  (255, 255, 0)
+dull_y:    (64, 64, 0)
+idle_y:    (1, 1, 0)
+brick:     (16, 255, 0)
+pile_bg:   (0, 0, 0)
+
+# Ramp coef tuned so a full 5-unit cell reads as (200, 20, 0) —
+# saturated orange-red next to the amber backdrop; a 1-unit cell is
+# dim (40, 4, 0). No decay: bricks are conserved.
+heap: ramp (40.0, 4.0, 0.0) decay 0/1
+
+night:
+  doozer: (0, 0, 0)
+  bright_y: (0, 0, 0)
+  dull_y: (0, 0, 0)
+  idle_y: (0, 0, 0)
+  brick: (0, 1, 0)
+  heap: ramp (0, 0, 0)
 
 --- landmarks ---
-pile_left_floor:   brick
+# Single unioned landmark. Fetching uses `seek highest heap on
+# landmark piles` (go to the tallest non-empty stack); returning uses
+# `seek highest heap < 5 on landmark piles` (top up the tallest
+# stack that's still below the cap). Same landmark serves both;
+# workers naturally cluster around whichever pile has action.
+piles: pile_bg
   (0, max_y)
-pile_right_floor:  brick
   (max_x, max_y)
-piles:             black
   (0, max_y-1)
-  (0, max_y-2)
-  (0, max_y-3)
-  (0, max_y-4)
-  (0, max_y-5)
   (max_x, max_y-1)
+  (0, max_y-2)
   (max_x, max_y-2)
+  (0, max_y-3)
   (max_x, max_y-3)
+  (0, max_y-4)
   (max_x, max_y-4)
-  (max_x, max_y-5)
+
+bottom: pile_bg
+  (0, max_y)
+  (max_x, max_y)
 
 --- agents ---
-doozer: state { holding, building, dumping, resting }
-bricks: state { prepping, free, full, busy }
-bricks starts at pile_left_floor, state = prepping
-bricks starts at pile_right_floor, state = prepping
-doozer starts at (0, 0), state = resting
-doozer starts at (1, 0), state = resting
+up to 2 doozer
+doozer: state { idle, carrying, returning, starting }
+doozer starts at (0, 0),     state = starting
+doozer starts at (max_x, 0), state = starting
 
 --- simulation ---
-tick rate: 250ms
+tick rate: 200ms
 
 --- pathfinding ---
-bricks:
-  max nodes: 32
-  step rate: 2
-
 doozer:
-  max nodes: 2000
+  max nodes: 1024
   step rate: 1
   diagonal: allowed
   diagonal_cost: 1.414
-  penalty lit cell:      30
+  penalty lit cell:      30     # don't walk through the clock face
   penalty occupied cell: 5
 
 --- behavior ---
-bricks:
-  if state == prepping:
-    # build a stack real quick
-      step (0, -1)
-      draw brick_3
-      step (0, -1)
-      draw brick_3
-      step (0, -1)
-      draw brick_3
-      step (0, -1)
-      draw brick_3
-      step (0, -1)
-      draw brick_3
-      set state = free
-  
-  if on doozer with state == dumping:
-    # accept this brick
-    pause
-    set state = busy
-    if standing on brick_3:
-      step (0, -1)
-      draw brick_1
-      pause
-      if not standing on piles:
-        set state = full
-        done
-      set state = free
-      done
-    if standing on brick_2:
-      draw brick_3 
-    if standing on brick_1:
-      draw brick_2 
-    pause
-    set state = free
-    done
-
-  if on doozer with state == building:
-    # give a brick
-    pause
-    set state = busy
-    if standing on brick_1:
-      if standing on pile_right_floor:
-        # nothing to do; no decrement
-        pause
-        set state = free
-        done
-      if standing on pile_left_floor:
-        # nothing to do; no decrement
-        pause
-        set state = free
-        done
-      # not on the floor; step down
-      erase
-      step (0, 1)
-      set state = free
-      done
-    if standing on brick_2:
-      draw brick_1 
-    if standing on brick_3:
-      draw brick_2 
-    pause
-    set state = free
-    done
-
-  pause   # terminal: wait 1
-  done
-
 doozer:
-  if state == holding:
-    set color = brightyellow
-    # build or dump
+  if state == starting:
+    seek bottom
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 5
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 10
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 15
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 20
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 25
+    set state = idle
+
+  # --- carrying a brick: place it on a missing clock cell ---
+  if state == carrying:
+    set color = bright_y
     if missing:
-      seek missing
+      seek missing timeout 30
       if on missing:
         draw brick
         pause 2
-        set state = resting
+        set state = idle
         done
-      wander 
-      done
-    set state = dumping
+    # no demand — take the brick back to a pile
+    set state = returning
     # FALLTHROUGH
 
-  if state == dumping:
-    set color = brightyellow
-    # return a brick OR ELSE
-    seek bricks with state == free
-    if on bricks with state == free:
-      pause 2  # spend a sec dumping the brick
-      set state = resting
-    # keep trying until we dump
+  # --- returning: drop the brick on a pile cell with room ---
+  # `seek highest heap < 5` prefers the tallest-not-yet-full cell,
+  # which clusters bricks into visually satisfying stacks instead of
+  # scattering them uniformly. If the pile is empty, the `< 5`
+  # filter includes count-0 cells, so all 16 are candidates tied at
+  # 0; distance breaks the tie and we land on the nearest pile cell.
+  if state == returning:
+    set color = bright_y
+    seek highest heap < 5 on landmark piles timeout 20
+    if on landmark piles:
+      incr heap
+      pause 2
+      set state = idle
+      done
     wander
     done
 
-  set color = dullyellow
+  # --- scavenge misplaced bricks, else fetch for the clock ---
+  set color = dull_y
 
   if extra:
-    # grab an extra brick and either build or dump
-    seek extra not on piles
+    seek extra not on piles timeout 20
     if on extra:
       erase
       pause
       if missing:
-        set state = holding
+        set state = carrying
         done
-      set state = dumping
+      set state = returning
       done
-    # FALLTHROUGH: failed "extra" seek  
+    # FALLTHROUGH — no reachable extra; try a missing cell instead
 
   if missing:
-    set state = building
-    seek bricks with state == free
-    if on bricks with state == free:
-      pause 2  # spend a sec getting the brick
-      set state = holding
+    # `seek highest heap` (no filter) targets only cells with count
+    # > 0; a fully drained pile makes this fail fast. The `if on heap`
+    # post-check uses the sugar form (== `heap > 0`) — if we arrived
+    # on a non-empty cell, withdraw a brick.
+    seek lowest heap on landmark piles timeout 20
+    if on heap:
+      decr heap
+      pause 2
+      set state = carrying
       done
+    # Pile dry — conjure a brick directly. The pile is a cache, not
+    # a source: `draw brick` / `erase` manipulate the world freely,
+    # and the heap marker is just a ledger for recycled extras. This
+    # also bootstraps the whole system on tick 0, when no prefiller
+    # has seeded the pile yet.
+    seek landmark bottom
+    incr heap # leave one
+    set state = carrying
+    done
 
-  if random 30%:
+  # idle
+  set color = idle_y
+
+  if random 20%:
     wander avoiding current
   pause
   done

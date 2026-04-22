@@ -25,16 +25,23 @@
 doozer:    (255, 255, 0)
 bright_y:  (255, 255, 0)
 dull_y:    (64, 64, 0)
-brick:     (255, 0, 0)
-pile_bg:   (16, 6, 0)                     # faint amber backdrop on empty pile
-black:     (0, 0, 0)
-white:     (255, 255, 255)
+idle_y:    (1, 1, 0)
+brick:     (16, 255, 0)
+pile_bg:   (0, 0, 0)
 foreman:   (40, 4, 0)
 
 # Ramp coef tuned so a full 5-unit cell reads as (200, 20, 0) —
 # saturated orange-red next to the amber backdrop; a 1-unit cell is
 # dim (40, 4, 0). No decay: bricks are conserved.
 heap: ramp (40.0, 4.0, 0.0) decay 0/1
+
+night:
+  doozer: (0, 0, 0)
+  bright_y: (0, 0, 0)
+  dull_y: (0, 0, 0)
+  idle_y: (0, 0, 0)
+  brick: (0, 1, 0)
+  heap: ramp (1, 0, 0)
 
 --- landmarks ---
 # Single unioned landmark. Fetching uses `seek highest heap on
@@ -43,28 +50,31 @@ heap: ramp (40.0, 4.0, 0.0) decay 0/1
 # stack that's still below the cap). Same landmark serves both;
 # workers naturally cluster around whichever pile has action.
 piles: pile_bg
-  (0, max_y-4)
-  (0, max_y-3)
-  (0, max_y-2)
-  (0, max_y-1)
   (0, max_y)
-  (max_x, max_y-4)
-  (max_x, max_y-3)
-  (max_x, max_y-2)
-  (max_x, max_y-1)
   (max_x, max_y)
+  (0, max_y-1)
+  (max_x, max_y-1)
+  (0, max_y-2)
+  (max_x, max_y-2)
+  (0, max_y-3)
+  (max_x, max_y-3)
+  (0, max_y-4)
+  (max_x, max_y-4)
 
-bottom: black
+top: pile_bg
+  (0, 0)
+  (max_x, 0)
+bottom: pile_bg
   (0, max_y)
   (max_x, max_y)
 
 --- agents ---
 up to 2 doozer
-doozer: state { idle, carrying, returning }
-doozer starts at (0, 0), state = idle
+doozer: state { idle, carrying, returning, starting }
+doozer starts at (0, 0),     state = idle
 doozer starts at (max_x, 0), state = idle
 up to 2 foreman
-foreman: state { prep, manage }
+foreman: state { prep, starting, seeking, returning }
 foreman starts at (0, max_y), state = prep
 foreman starts at (max_x, max_y), state = prep
 
@@ -82,6 +92,7 @@ doozer:
 
 --- behavior ---
 doozer:
+
   # --- carrying a brick: place it on a missing clock cell ---
   if state == carrying:
     set color = bright_y
@@ -113,7 +124,7 @@ doozer:
     wander
     done
 
-  # --- idle: scavenge misplaced bricks, else fetch for the clock ---
+  # --- scavenge misplaced bricks, else fetch for the clock ---
   set color = dull_y
 
   if extra:
@@ -144,9 +155,13 @@ doozer:
     # and the heap marker is just a ledger for recycled extras. This
     # also bootstraps the whole system on tick 0, when no prefiller
     # has seeded the pile yet.
-    # set state = carrying
-    wander
+    seek landmark bottom
+    incr heap # leave one
+    set state = carrying
     done
+
+  # idle
+  set color = idle_y
 
   if random 20%:
     wander avoiding current
@@ -154,26 +169,78 @@ doozer:
   done
 
 foreman:
-  # if I'm on an empty, step down
-  # if I'm at the bottom and empty, add one
-  # if this heap is full, step up and add one
-  if not standing on heap:
-    step (0, 1)   # doesn't need to test bottom
-    # fallthrough
-  if standing on bottom:
-    if not standing on heap:
-      incr heap
-      pause
-      done
-    # fallthrough
-  if heap > 2:
+  if state == prep:
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 5
     step (0, -1)
-    if not standing on heap:
-      set color = white
-      incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 10
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 15
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 20
+    step (0, -1)
+    incr heap
+    incr heap
+    incr heap
+    incr heap
+    incr heap # 25
+    set state = starting
+    done
+
+  # start at bottom
+  if state == starting:
+    if standing on bottom:
+      set state = seeking
       pause
-      set color = foreman
       done
-    # fallthrough
+    step (0, 1)
+    done
+
+  # seeking: walk up to first blank
+  if state == seeking:
+     step (0, -1)
+     if on heap:
+       decr heap
+       set state = returning
+       done
+     if standing on top:
+       set state = starting
+       done
+     done
+
+  # returning: walk down until "heap"
+  if state == returning:
+    step (0, 1)
+    if on bottom:
+      incr heap
+      set state = seeking
+      done 
+    if on heap:
+      if heap < 4:   # there's room here
+        incr heap
+        set state = seeking
+        done
+      # this stack is full; go up one
+      step (0, -1)
+      incr heap
+      set state = seeking
+      done
+    done
+    
   pause
   done

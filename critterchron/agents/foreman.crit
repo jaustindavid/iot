@@ -65,12 +65,12 @@ top: black
 --- agents ---
 up to 2 doozer
 doozer: state { idle, carrying, returning }
-doozer starts at (0, 0), state = idle
-doozer starts at (max_x, 0), state = idle
+# doozer starts at (0, 0), state = idle
+# doozer starts at (max_x, 0), state = idle
 up to 2 foreman
-foreman: state { prep, manage }
-foreman starts at (0, max_y), state = prep
-foreman starts at (max_x, max_y), state = prep
+foreman: state { prep, starting, seeking, returning }
+foreman starts at (0, max_y - 5), state = prep
+# foreman starts at (max_x, max_y - 5), state = prep
 
 --- simulation ---
 tick rate: 200ms
@@ -158,18 +158,26 @@ doozer:
   done
 
 foreman:
+  if state == prep:
+    incr heap
+    step (0, 2)
+    incr heap
+    set state = starting
+    done
+
   # start at bottom
   if state == starting:
     if standing on bottom:
       set state = seeking
+      pause
       done
     step (0, 1)
     done
 
-  # seeking: walk to first blank
+  # seeking: walk up to first blank
   if state == seeking:
      step (0, -1)
-     if standing on heap:
+     if on heap:
        decr heap
        set state = returning
        done
@@ -179,16 +187,23 @@ foreman:
      done
 
   # returning: walk down until "heap"
-  if state = returning:
+  if state == returning:
     step (0, 1)
-    if heap < 4:   # there's room here
+    if on bottom:
+      incr heap
+      set state = seeking
+      done 
+    if on heap:
+      if heap < 4:   # there's room here
+        incr heap
+        set state = seeking
+        done
+      # this stack is full; go up one
+      step (0, -1)
       incr heap
       set state = seeking
       done
-    # this stack is full; go up one
-    step (0, -1)
-    if heap < 4:   # there's room here
-      incr heap
-      set state = seeking
-      done
+    done
     
+  pause
+  done

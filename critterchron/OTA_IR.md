@@ -50,16 +50,26 @@ Stra2us KV shape (under app `critterchron`):
 | Key                                 | Value                                             |
 |-------------------------------------|---------------------------------------------------|
 | `critterchron/scripts/<name>`       | Text blob (format below). Multi-KB.               |
-| `critterchron/scripts/<name>/sha`   | 64-char hex `src_sha256` of the blob. Sidecar.    |
+| `critterchron/scripts/<name>/sha`   | `<64-hex content_sha>:<decimal size_bytes>`. Sidecar. |
 | `critterchron/<device>/ir`          | String — script name, e.g. `thyme`                |
 
 A device polls its pointer key on its own timer (default 1200s, decoupled
 from the heartbeat cadence so a stalled OTA fetch can't silence telemetry).
 On change (or cold boot with a pointer set), it fetches the sidecar first
 (~100B), compares against the loaded sha, and only pulls the blob if they
-differ. The blob embeds its own `src_sha256` in the metadata header; the
-device verifies blob-sha == sidecar-sha before applying, which catches torn
-uploads (sidecar updated but blob stale).
+differ. The blob embeds its own `content_sha` (implicit — recomputed on
+the device); the device verifies recomputed-sha == sidecar-sha before
+applying, which catches torn uploads (sidecar updated but blob stale). The
+size suffix on the sidecar lets the device refuse an oversized blob before
+the fetch even starts, closing the crash path from an OTA that would
+overrun `IR_OTA_BUFFER_BYTES`.
+
+**Legacy sidecar format** (pre-2026-04-22): bare 64-char hex sha, no size
+suffix. Both the device and `set_ir_pointer.py` accept either format —
+rolling a fleet through the update is graceful, though devices on old
+firmware will fall back to fetching the full blob every poll cycle (since
+their strict `sha_len == 64` gate rejects the extended format) until
+reflashed.
 
 No pointer → run compiled-in default. Pointer set but blob missing → keep
 running current IR, log `ir_fetch_fail=<name>` in the cloud heartbeat.
@@ -261,7 +271,8 @@ Behavior:
    exit no-op (unless `--force`). Cheaper than pulling the blob and parsing
    its metadata.
 5. `PUT /kv/critterchron/scripts/<name>` — the blob.
-6. `PUT /kv/critterchron/scripts/<name>/sha` — the sidecar.
+6. `PUT /kv/critterchron/scripts/<name>/sha` — the sidecar
+   (`<content_sha>:<size_bytes>`).
 7. Print a short summary: size, sha, key, server.
 
 Step 5 before 6 is intentional: a mid-publish crash leaves the sidecar
