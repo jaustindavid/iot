@@ -426,6 +426,25 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 # Completed
 
+- **2026-04-21 — Palette re-resolves on day/night transition.** Tiles
+  snapshot their paint-time RGB (engine-side choice: no live animation
+  on painted cells), so before this a day-painted `draw orange` would
+  keep its day RGB forever even after night mode engaged — and the
+  same in reverse at dawn. Symptom on rachel: the leading hour digit
+  painted in "orange" at daybreak kept its day color through the
+  entire evening while fresh paint came up in the night green,
+  splitting the clock face across two palettes. Fix: stash the color
+  *name* on the tile (`Tile.color_ref` — `uint8_t` index on HAL with
+  `0xFF` sentinel, `Optional[str]` on the Python sim) at `draw <name>`
+  time; `set_night_mode()` detects the edge, sweeps the grid, and
+  re-resolves every lit tile with a stashed ref against the target
+  palette. Idempotent (no-op if the flag didn't change), skips unlit
+  tiles and nameless-paint tiles, and the HAL's `color_ref` costs
+  1B/tile (256B on a 16×16; negligible). **Caveat:** cycle colors
+  re-resolve at frame 0 on the transition edge (per-tile cycle phase
+  isn't snapshotted — would cost another `uint16_t` per tile). Result
+  is a one-frame lockstep pulse right after the flip; revisit if it
+  becomes visible in the wild.
 - **2026-04-20 — Compiler rejects unknown day-color refs in night
   palette.** `_validate_night_palette` cross-checks every night
   override name, every bare name-ref value, and every cycle sub-entry

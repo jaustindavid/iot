@@ -61,27 +61,32 @@ line number — mixed indentation has bitten too many scripts.
 
 ### Name spaces and collisions
 
-Colors, landmarks, and agent types share a flat namespace with one deliberate
-overlap:
+Colors, landmarks, agent types, and markers share a flat namespace with one
+deliberate overlap:
 
 - **Agent name == color name is required.** Every agent type must have a
-  color of the same name; that's the default body color at spawn. This is
-  the *one* overlap the compiler demands.
+  color or cycle of the same name; that's the default body color at
+  spawn. This is the *one* overlap the compiler demands.
 - **Landmark name == agent name is forbidden.** `if on <name>` /
   `seek <name>` would be ambiguous.
 - **Landmark name == color name is forbidden.** `if standing on <name>`
   would be ambiguous.
+- **Marker name == landmark / agent / color name is forbidden.** `if <m>`
+  (marker-count predicate) and `if <landmark>` (cell-on-landmark) reach
+  for the same sugar; keep them distinct so the canonicalizer's dispatch
+  stays unambiguous.
 
-Pick landmark names that aren't already colors or agents. If a pile-of-thing
-agent collides with its tile color (e.g. `brick` tiles and a `brick` agent),
-rename one — `bricks` plural for the pile reads naturally.
+Pick landmark names that aren't already colors, agents, or markers. If a
+pile-of-thing agent collides with its tile color (e.g. `brick` tiles and a
+`brick` agent), rename one — `bricks` plural for the pile reads naturally.
 
 ## Blocks
 
 ### `--- colors ---`
 
-Named RGB tuples. Every agent type and every landmark must have a color by
-the same name, or compilation fails.
+Named RGB tuples (and a few related entities that share this section
+syntactically). Every agent type and every landmark must have a color or
+cycle by the same name, or compilation fails.
 
 ```
 red: (255, 0, 0)
@@ -97,8 +102,81 @@ rainbow: cycle red 2, green 2, blue 2
 ```
 
 Agents can bind to a cycle at spawn (by naming the agent type as the cycle)
-or via `set color = <name>` at runtime. Tiles snapshot the current cycle
-value at the moment of `draw` — painted tiles don't animate.
+or via `set color = <name>` at runtime. Agents spawned sharing a cycle get
+a randomized per-agent phase offset so they drift out of lockstep. Tiles
+snapshot the current cycle value at the moment of `draw` — painted tiles
+don't animate.
+
+#### Markers (`ramp`)
+
+A marker declaration lives syntactically inside `--- colors ---` but is a
+different beast: it's a per-tile `uint8_t` count, rendered as a scalar-
+scaled RGB contribution on top of the agent/tile layer. Agents modify it
+with `incr marker` / `decr marker`; it decays on a declared schedule.
+
+```
+trail: ramp (0.3, 0.2, 0.0) decay 1/20     # -1 unit every 20 ticks
+pile:  ramp (0, 2, 0)       decay 0/1       # no decay
+```
+
+- `ramp (r, g, b)` — per-unit coefficients. Rendered contribution at count
+  `N` is `(r*N, g*N, b*N)` clamped to `[0, 255]` per channel.
+- `decay K/T` — subtract `K` from every non-zero marker cell every `T`
+  ticks. `K = 0` disables decay (a permanent pile); `T` must be positive.
+- Cap: **4 markers per script** (`MAX_MARKERS`). The runtime stores counts
+  as a fixed-width array per tile on device; raising the cap costs 1 B per
+  tile per extra slot.
+- Markers don't imply `lit`. A tile can carry a non-zero marker count while
+  `state` is off.
+
+Marker names go in the same namespace as colors / landmarks / agent
+types — the compiler rejects collisions on principle (`if <pile>` would
+be ambiguous between a landmark and a marker count).
+
+See `MARKERS_SPEC.md` for the deeper design rationale and
+`agents/ants.crit` for a worked example.
+
+#### Night palette (`night:`)
+
+An optional nested block inside `--- colors ---` declares overrides that
+apply when the device enters night mode (hardware: Schmitt hysteresis on
+smoothed brightness; sim: `--night` flag). Absent entries fall through to
+the day palette, so a night block is purely additive.
+
+```
+--- colors ---
+orange:   (255, 128, 0)
+warmwhite:(255, 200, 160)
+brick:    (180, 60, 30)
+trail:    ramp (0.3, 0.2, 0.0) decay 1/20
+
+night:
+  orange:   (0, 255, 0)       # static override
+  brick:    warmwhite          # name-ref into the day palette
+  default:  (8, 8, 8)          # catch-all for unlisted colors
+  trail:    ramp (0, 1, 0)     # per-marker ramp override
+```
+
+Inside `night:`:
+
+- Static RGB overrides the matching day color.
+- A bare identifier on the right is a reference into the day palette and
+  resolves recursively (cycles and name-refs are fine; the resolver
+  terminates on day-palette lookups).
+- `default:` is a catch-all used when a color has no explicit night entry.
+  Without both a specific entry and a `default:`, night mode falls all the
+  way through to the day color.
+- A cycle is legal on the RHS (`foo: cycle a 2, b 2`). Sub-names resolve
+  through the day palette.
+- A `ramp (r, g, b)` entry overrides a day marker's per-unit coefficients
+  for night mode. **Decay (`K/T`) is *not* overridable** and staying on
+  the day declaration is enforced — the decay scheduler is shared across
+  modes. This is a v6 addition.
+
+Tiles painted before a day↔night flip re-resolve against the target
+palette automatically on the transition (the tile remembers the color
+*name* it was painted with). Cycle colors reset phase on the flip —
+a one-frame lockstep pulse that's been deemed acceptable for now.
 
 ### `--- landmarks ---`
 
@@ -194,18 +272,34 @@ could spin forever in one tick.
 | `done`                    | End of this tick's execution; PC resets to 0.            |
 | `set state = <name>`      | Change named state (declared in `agents` block).         |
 | `set color = <name>`      | Rebind agent color; cycles start animating immediately.  |
-| `draw [<color>]`          | Light this tile. Color is snapshotted at paint time.     |
+| `draw [<color>]`          | Light this tile. Color is snapshotted at paint time; the color name is remembered for day↔night re-resolution. |
 | `erase`                   | Unlight this tile.                                       |
 | `pause [N\|LO-HI]`        | Yield for N ticks (default 1). Range picks uniformly.    |
 | `step (dx, dy)`           | Literal relative move. Clamps to grid edges. No guards.  |
 | `wander [avoiding current\|any]` | One-step random walk; avoiding clause is optional. |
-| `seek <target> [timeout N]` | A\* toward target. See below.                           |
+| `seek <target> [...filters...] [timeout N]` | A\* toward target. See below.              |
+| `incr marker <m> [N]`     | Add N (default 1) to this cell's count for marker `<m>`. Clamped to 255. Doesn't yield. |
+| `decr marker <m> [N]`     | Subtract N (default 1) from this cell's count for marker `<m>`. Clamped to 0. Doesn't yield. |
 | `despawn [agent <name>]`  | Bare: remove self (terminator, yields). With name: remove a colocated other agent; falls through. |
+
+The `incr`/`decr` opcodes accept a sugared bare form — `incr trail` works
+when `trail` is a declared marker — the compiler pre-pass rewrites it to
+the canonical `incr marker trail`. Same for `decr`.
 
 ### `seek`
 
+Two top-level forms: a **target seek** (go to a named landmark / agent
+type / tile predicate), and a **gradient seek** (climb or descend a
+marker's scalar field).
+
+#### Target seek
+
 ```
-seek [nearest] [agent|landmark] <name> [on <pred>|not on <pred>] [timeout N]
+seek [nearest] [agent|landmark] <name>
+     [with state == <stateName>]
+     [on <pred> | not on <pred>
+      | on marker <m> [op N] | not on marker <m>]
+     [timeout N]
 ```
 
 - `<name>` is a landmark, an agent type, or a tile predicate (`current` /
@@ -213,13 +307,42 @@ seek [nearest] [agent|landmark] <name> [on <pred>|not on <pred>] [timeout N]
   forces you to disambiguate with `agent <name>` / `landmark <name>`.
 - `nearest` only matters when the target is multi-cell (e.g. a landmark
   with many points, or an agent type with many instances).
+- `with state == <stateName>` restricts candidates to agents currently in
+  that named state. Only meaningful when the target is an agent type.
 - `on <pred>` / `not on <pred>` filters candidates by tile state. Mostly
   useful with tile predicates: `seek aphid on extra` = go to an aphid
   standing on an unintended lit cell.
+- `on marker <m> [op N]` / `not on marker <m>` filters by tile marker
+  count (e.g. `seek nearest landmark food on marker trail > 0`). The
+  `marker` keyword is required in this clause; the canonicalizer pass
+  doesn't rewrite bare names inside the `on` tail.
 - `timeout N`: if the seek can't reach its target within N ticks, the
-  agent yields and tries again next tick. Without a timeout, a failed seek
-  does **not** yield — the script keeps running, which is why solo
+  agent yields and tries again next tick. Without a timeout, a failed
+  seek does **not** yield — the script keeps running, which is why solo
   `seek`s don't count as a yield for the path-validator.
+
+#### Gradient seek
+
+```
+seek (highest | lowest) marker <m> [op N]
+     [on landmark <l>]
+     [timeout N]
+```
+
+- Walks A\* toward the cell maximizing (`highest`) or minimizing
+  (`lowest`) marker `<m>`'s count within scope. Ties break by distance.
+- Optional `[op N]` clause (`> N` / `< N`) prunes candidate cells by
+  count before selection — `seek highest marker trail > 0` ignores cells
+  where no trail has been laid.
+- `on landmark <l>` restricts scope to the landmark's point set. Without
+  it, scope is the whole grid.
+- Gradient seeks only take a `marker` target; the `agent` / `landmark` /
+  tile-predicate targets are for the target-seek form above.
+- Same `timeout N` semantics as target-seek.
+
+Bare-sugar forms the compiler rewrites to the canonical `marker` keyword
+form: `seek highest trail > 0 on landmark food` (when `trail` is a
+declared marker) → `seek highest marker trail > 0 on landmark food`.
 
 ## Conditions (`if <cond>:`)
 
@@ -229,24 +352,44 @@ seek [nearest] [agent|landmark] <name> [on <pred>|not on <pred>] [timeout N]
 | `if random N%`                       | True N% of the time.                         |
 | `if on <pred>`                       | Agent's cell matches tile predicate.         |
 | `if on landmark <name>`              | Agent stands on any point of that landmark.  |
-| `if on agent <name>`                 | Another agent of that type shares the cell.  |
+| `if on agent <name> [with state == <s>]` | Another agent of that type (optionally in state `<s>`) shares the cell. |
 | `if <pred>`                          | Board-wide: any cell matches the predicate.  |
 | `if agent <name>`                    | Any other agent of that type exists.         |
 | `if landmark <name>`                 | Landmark is defined (compile-time constant). |
 | `if standing on <pred>`              | Same as `if on <pred>` but only for tile predicates. |
 | `if standing on <color>`             | Agent's cell is lit with that color (walks cycle entries for cycle colors). |
 | `if standing on landmark <name>`     | Alias for `if on landmark <name>`.           |
+| `if marker <m> > N` / `< N`          | Any cell on the board has count in that range. |
+| `if marker <m> > N on landmark <l>`  | Any cell of landmark `<l>` has count in that range. |
+| `if no marker <m> [on landmark <l>]` | All cells (or all of landmark `<l>`) have count 0. Canonical form of the `== 0` alias. |
+| `if on marker <m> > N` / `< N`       | Agent's cell has count in that range.        |
+| `if on no marker <m>`                | Agent's cell has count 0.                    |
 
 Tile predicates: `current` (intended AND lit), `missing` (intended AND
 unlit), `extra` (unintended AND lit).
 
+**Marker sugar.** When `<m>` is a declared marker, the compiler's
+canonicalization pass rewrites these shorthand forms to the canonical
+`marker <m>` versions above, so scripts can read more naturally:
+
+- `if <m>` / `if <m> > N` / `if <m> == 0` → board-scope.
+- `if <m> [op N] on landmark <l>` → landmark-scope.
+- `if on <m>` / `if on <m> > N` / `if not on <m>` / `if not standing on <m>` → self-cell scope.
+- `if no <m>` / `if <m> == 0` → zero-alias for `if no marker <m>`.
+
+Only `<` and `>` are supported; `== 0` is aliased as `no`. General `== N`
+would require runtime equality that the engine intentionally doesn't
+carry.
+
 Bare names after `if on`, `if <name>`, `seek`, and `despawn` are resolved
 at compile time: if `<name>` is a landmark it becomes `if on landmark
-<name>`, if it's an agent type it becomes `if on agent <name>`. A name
-that's both is a compile error — disambiguate explicitly.
+<name>`; an agent type → `if on agent <name>`; a marker → one of the
+marker forms above. A name matching multiple kinds is a compile error —
+disambiguate explicitly.
 
-`if on <name>` resolves agent/landmark first, so it never matches a bare
-color. Use `if standing on <color>` to test the tile's paint color.
+`if on <name>` resolves agent/landmark/marker first, so it never matches
+a bare color. Use `if standing on <color>` to test the tile's paint
+color.
 
 ## Runtime model
 
@@ -272,15 +415,34 @@ The compiler rejects:
 - Paths through a behavior that can fall off the bottom without `done`.
 - Paths to `done` that never yield.
 - Agent names without a color of the same name.
-- Landmark name colliding with an agent type or a color.
-- Ambiguous bare names (both a landmark and an agent type).
+- Landmark name colliding with an agent type, color, or marker.
+- Marker name colliding with a color, landmark, or agent type.
+- Ambiguous bare names (matching more than one of landmark / agent type / marker).
 - `diagonal`/`diagonal_cost` present without the other.
 - Cycle colors referencing unknown colors or empty cycle lists.
+- Night-palette entries referring to an unknown day color.
+- Night-marker entries referring to an unknown day marker, or carrying
+  their own `decay K/T` clause (decay is shared with the day entry).
+- More than `MAX_MARKERS` (=4) marker declarations.
+- `incr` / `decr` naming an undeclared marker.
+- `ramp (r, g, b)` components outside `[0, 255]`. Components in `(0, 1)`
+  compile with a truncation warning — they round to zero as `uint8_t` on
+  device, which almost always means the author meant `1`.
 
 ## Versioning
 
-The compiler emits IR v3 (encoder `ir_encoder/2`). Devices refuse blobs with
-`ir_version` above what they support, so bumping IR_VERSION is the gate for
-any wire-breaking change. Wire format: body ends at a `END <fletcher16>`
-line; an optional `SOURCE <n>` trailer with the original `.crit` text lives
-after END, so devices parse up to END and skip the rest.
+Current: **IR v6**, encoder `ir_encoder/2`. Devices refuse blobs with
+`ir_version` above what they support, so bumping `IR_VERSION` is the gate
+for any wire-breaking change.
+
+| Version | Added                                                     |
+|---------|-----------------------------------------------------------|
+| v3      | Baseline of this doc: cycles, landmarks, spawn rules, pathfinding per-agent blocks. |
+| v4      | Night palette (`night:` block inside `--- colors ---`).   |
+| v5      | Tile markers (`ramp` declarations, `incr`/`decr marker`, marker conditions, gradient seeks). |
+| v6      | Per-marker night-mode ramp overrides. Night ramps carry rgb only; decay stays on the day declaration. |
+
+Wire format: body ends at an `END <fletcher16>` line; an optional
+`SOURCE <n>` trailer with the original `.crit` text lives after END, so
+devices parse up to END and skip the rest. See `OTA_IR.md` for the full
+section list.

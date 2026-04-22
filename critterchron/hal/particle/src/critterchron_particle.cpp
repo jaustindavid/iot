@@ -233,7 +233,11 @@ static bool is_crash_reset(int reason) {
 static int telemetry_cycle() {
     if (!Time.isValid()) return 0;
 
-    char report[256];
+    // 256 bytes was snug before the light-sensor diagnostic fragment below
+    // widened the payload. Bump to 320 to leave headroom; truncation is still
+    // handled by the final NUL-terminate at the bottom, but we'd lose the new
+    // `light=(...)` fragment on every heartbeat without the extra bytes.
+    char report[320];
     int  rssi = -127;
     if (WiFi.ready()) {
         WiFiSignal sig = WiFi.RSSI();
@@ -277,6 +281,32 @@ static int telemetry_cycle() {
         (unsigned)g_engine.liveAgentCount(),
         (unsigned long)m.failed_seeks);
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
+
+#if defined(LIGHT_SENSOR_TYPE)
+    // Calibration diagnostic. `bri=(min<cur<max)` above only shows the
+    // *output* of the sensor-mapping pipeline; when bri goes pathological
+    // (TODO.md "Light-sensor calibration poisons itself") we need the
+    // inputs — the live raw ADC read and the learned [cal_bright, cal_dark]
+    // pair — to tell "raw tracking fine, mapping is wrong" apart from
+    // "raw is stuck between a collapsed pair" apart from a scenario I
+    // haven't thought of. Format: `light=(raw<cb<cd)` — same ordering
+    // convention as bri (low-to-high in the mapping's sense: cal_bright
+    // is the *low* raw value, cal_dark is the *high* one), so a glance
+    // tells you whether raw is outside the learned range (good — instant
+    // widen incoming) or inside it (mapping is doing what it was told).
+    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " light=(%d<%d<%d)",
+                             g_light.last_raw,
+                             g_light.cal_bright,
+                             g_light.cal_dark);
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+        } else {
+            report[sizeof(report) - 1] = '\0';
+        }
+    }
+#endif
 
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_APP, report);

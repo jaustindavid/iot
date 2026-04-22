@@ -24,6 +24,14 @@ class Tile:
     state: bool = False  # The 'actual' physical state
     intended: bool = False  # The 'oracle' state from the clock
     color: tuple = (0, 0, 0)
+    # Name of the color that produced `color`, or None. Stashed by the
+    # `draw <cname>` handler so `set_night_mode()` can re-resolve the
+    # tile against the other palette on a day/night edge — without this,
+    # tiles painted before the flip keep their day RGB forever while
+    # newly-painted tiles and the marker composite swap live. Mirrors
+    # HAL Tile::color_ref (an index on device; a name here because we
+    # key night_colors / colors dicts by name in Python).
+    color_ref: str = None
     claimant_id: int = None  # Semaphore for logical locks
     # Per-tile marker counts, indexed by marker declaration order
     # (see compiler's ir["markers"][name]["index"]). Default zero —
@@ -158,6 +166,31 @@ class CritterEngine:
                 return night["rgb"]
         spec = self._markers.get(name)
         return spec["rgb"] if spec else (0.0, 0.0, 0.0)
+
+    def set_night_mode(self, on):
+        """Toggle night mode, sweeping the grid on the edge.
+
+        Tiles cache their paint-time RGB (engine draws snapshot, not live),
+        so a naive flag flip would leave pre-flip tiles in yesterday's
+        palette forever — see Tile.color_ref. On a real transition we
+        re-resolve every lit tile that remembers the color name it was
+        painted with. Idempotent: a set that doesn't change the flag
+        short-circuits before the sweep. Caveat: cycle colors re-resolve
+        at phase 0 (per-tile cycle phase isn't snapshotted); lands as a
+        one-frame lockstep on the first frame after a flip. Revisit if
+        it becomes visible."""
+        on = bool(on)
+        if on == self.night_mode:
+            return
+        self.night_mode = on
+        for x in range(self.width):
+            for y in range(self.height):
+                tile = self.grid[x][y]
+                if not tile.state or tile.color_ref is None:
+                    continue
+                tile.color = self._resolve_color_at(
+                    tile.color_ref, 0, tile.color, depth=0,
+                )
 
     def _resolve_color(self, ref, default=(255, 255, 255), phase=0):
         """Resolve a color reference (name) to an (r,g,b) tuple.
@@ -643,7 +676,8 @@ class CritterEngine:
                 continue
                 
             elif inst.startswith("draw"):
-                self.grid[agent.pos[0]][agent.pos[1]].state = True
+                tile = self.grid[agent.pos[0]][agent.pos[1]]
+                tile.state = True
                 parts = inst.split()
                 if len(parts) > 1:
                     cname = parts[1]
@@ -651,8 +685,14 @@ class CritterEngine:
                     # no live animation on tiles by design. Use the painting
                     # agent's phase so the snapshot matches what the agent
                     # looked like when it painted.
-                    self.grid[agent.pos[0]][agent.pos[1]].color = self._resolve_color(
+                    tile.color = self._resolve_color(
                         cname, default=(255, 255, 255), phase=agent.color_phase)
+                    # Remember the *name* so set_night_mode() can re-resolve
+                    # this tile against the other palette on the next flip.
+                    # Bare `draw` (no name) leaves color_ref alone — keeps
+                    # whatever the previous paint stashed, so re-drawing a
+                    # tile that was first painted with a name still swaps.
+                    tile.color_ref = cname
                 pc += 1
                 continue
 

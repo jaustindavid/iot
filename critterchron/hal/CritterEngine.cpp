@@ -155,6 +155,41 @@ bool CritterEngine::colorRGB(const char* name, uint8_t& r, uint8_t& g, uint8_t& 
     return true;
 }
 
+void CritterEngine::setNightMode(bool on) {
+    // No-op on unchanged state — skip the sweep. This matters because the
+    // platform glue pulls the Schmitt trigger every 200ms light sample and
+    // reasserts night_mode_ every time; a naive sweep on every call would
+    // walk the grid 5×/sec for no reason.
+    if (on == (bool)night_mode_) return;
+    night_mode_ = on;
+    // Re-resolve every named lit tile against the now-active palette. Tiles
+    // painted before this edge stored their color_ref alongside the
+    // snapshot RGB (see the `draw` handler); walking the grid and rewriting
+    // r/g/b from resolveColor(color_ref, 0, ...) makes the whole panel
+    // swap in lockstep with the marker composite (which already renders
+    // live per-frame) and with the landmark background (also resolved live).
+    // Without this, `draw brick` from an hour ago would keep its day RGB
+    // forever — visible for persistent tiles like clock digits that don't
+    // get overpainted for minutes or hours.
+    //
+    // Frame is pinned to 0 deliberately: a per-tile cycle phase would cost
+    // another 1-2 bytes/tile, and a phase reset on the relatively rare
+    // day/night edge is below the visibility bar right now. If it ever
+    // isn't, promote color_ref to a { idx, phase } pair.
+    //
+    // color_ref == 0xFF means "no name on file" (virgin tile, or `draw`
+    // that hit the unknown-name fallback) — skip; we have no way to
+    // re-resolve it. state == 0 tiles are dark in the composite anyway.
+    for (int x = 0; x < GRID_WIDTH; ++x) {
+        for (int y = 0; y < GRID_HEIGHT; ++y) {
+            Tile& t = grid_[x][y];
+            if (!t.state) continue;
+            if (t.color_ref == 0xFF) continue;
+            resolveColor((int)t.color_ref, 0, t.r, t.g, t.b);
+        }
+    }
+}
+
 void CritterEngine::resolveColor(int idx, uint32_t frame,
                                  uint8_t& r, uint8_t& g, uint8_t& b) const {
     // Night-mode preempt: if the active day color has a NIGHT_COLORS
@@ -358,6 +393,15 @@ bool CritterEngine::reinit() {
     // phase continuity survives a swap — the visible script is new, but the
     // clock shouldn't jitter.
     std::memset(grid_, 0, sizeof(grid_));
+    // memset zeroes color_ref to 0 — a valid color index. That would be
+    // fine in steady state (we gate the night-swap re-resolve on state==1
+    // and no virgin tile is lit) but defensive: if any code path ever
+    // sets state=1 without going through the draw handler, we don't want
+    // a stray "re-resolve COLORS[0]" to overwrite the RGB on a night
+    // transition. Pin to the 0xFF "no name" sentinel up front.
+    for (int x = 0; x < GRID_WIDTH; ++x)
+        for (int y = 0; y < GRID_HEIGHT; ++y)
+            grid_[x][y].color_ref = 0xFF;
     clearClaims();
 
     // Painter mask: agent types whose behavior contains draw/erase are
@@ -1087,12 +1131,23 @@ void CritterEngine::processAgent(Agent& a) {
                 // Snapshot the agent's phase-adjusted color so painted tiles
                 // match what the agent looked like at paint time. Tile stays
                 // static after — no live animation on tiles.
+                //
+                // Also stash the color index itself in color_ref so a
+                // day/night flip can re-resolve the tile against the other
+                // palette (see setNightMode below). `ci < 0` (unknown
+                // color, clamp to white) writes the sentinel 0xFF — there's
+                // no name on file to re-resolve against, so the night
+                // transition leaves the tile's RGB alone. Since IR_MAX_COLORS
+                // is 32 by default and never approaches 255, uint8_t is
+                // plenty; 0xFF is an unambiguous "not a color index."
                 int ci = colorIndex(tok[1]);
                 uint8_t r, g, b;
                 if (ci >= 0) {
                     resolveColor(ci, render_frame_ + a.color_phase, r, g, b);
+                    grid_[a.pos.x][a.pos.y].color_ref = (uint8_t)ci;
                 } else {
                     r = g = b = 255;
+                    grid_[a.pos.x][a.pos.y].color_ref = 0xFF;
                 }
                 grid_[a.pos.x][a.pos.y].r = r;
                 grid_[a.pos.x][a.pos.y].g = g;

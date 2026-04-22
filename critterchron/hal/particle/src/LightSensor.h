@@ -32,10 +32,18 @@ class LightSensor {
 public:
     int cal_dark   = 3500;   // raw value that maps to "fully dark"
     int cal_bright = 2000;   // raw value that maps to "fully bright"
+    // Most recent raw ADC read, captured at the top of update(). Exposed
+    // publicly so the telemetry path (which doesn't own the sample loop)
+    // can report it in the heartbeat without duplicating the read —
+    // observability hook for diagnosing calibration poisoning (TODO.md
+    // "Light-sensor calibration poisons itself"). Zero until update()
+    // has been called at least once.
+    int last_raw  = 0;
 
     explicit LightSensor(const Config& cfg) : cfg_(cfg) {}
 
     uint8_t update(int raw, uint8_t min_bri, uint8_t max_bri) {
+        last_raw = raw;
         // Slow pull-in: every DECAY_EVERY samples (~173s at 5Hz), nudge each
         // cal bound one unit toward raw. A 1000-unit excursion un-learns over
         // ~48 hours — slow enough that a normal day's range stays learned,

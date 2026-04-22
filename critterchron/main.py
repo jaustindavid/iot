@@ -86,7 +86,7 @@ def main():
     # 2. Initialize Engine & Renderer
     engine = CritterEngine(ir, width=args.width, height=args.height)
     engine.trace = args.trace
-    engine.night_mode = args.night
+    engine.set_night_mode(args.night)
     renderer = None if args.headless else CritterRenderer(engine)
 
     dump_file = open(args.dump_state, "w") if args.dump_state else None

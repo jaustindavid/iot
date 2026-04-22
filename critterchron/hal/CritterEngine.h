@@ -29,6 +29,16 @@ struct Tile {
     uint8_t intended : 1;
     int16_t claimant;            // -1 unclaimed
     uint8_t r, g, b;             // last draw color (only meaningful when state)
+    // Index into critter_ir::COLORS of the color name that produced r/g/b.
+    // Sentinel 0xFF means "no name on file" (virgin tile, or `draw` with no
+    // color arg whose prior RGB was set by something other than `draw
+    // <name>`). Consulted by setNightMode() on a day/night transition so
+    // tiles painted before the flip re-resolve to the other palette —
+    // without this, a `draw brick` from an hour ago would keep its day RGB
+    // forever even though the panel is now in night mode. Costs 1B/tile
+    // (256B on a 16×16, 256B on a 32×8 — negligible). Only consulted when
+    // state == 1, so the post-memset zero value is harmless (we skip it).
+    uint8_t color_ref;
 #if IR_MAX_MARKERS > 0
     // Per-tile marker counts (IR v5). Slot i holds the count for the marker
     // whose compiler-assigned index is i (see critter_ir::MARKERS[k].index).
@@ -126,7 +136,16 @@ public:
     // the day palette. Blobs without a night palette are unaffected —
     // a missing override just falls through. Default off; platform glue
     // drives this off the LightSensor via a Schmitt trigger.
-    void setNightMode(bool on) { night_mode_ = on; }
+    // Toggle night mode. Out-of-line so we can sweep the grid on the
+    // transition edge: tiles painted before the flip have their RGB
+    // re-resolved against the target palette via their stashed
+    // `color_ref`, so the whole panel swaps in lockstep instead of
+    // leaving stragglers painted in yesterday's palette forever.
+    // Idempotent — a set that doesn't change the state skips the sweep.
+    // Caveat: cycle colors re-resolve at frame 0 (phase reset). If a
+    // per-tile phase snapshot ever becomes important, it's another
+    // uint16_t per tile; deferred until it shows up as a visible problem.
+    void setNightMode(bool on);
     bool nightMode() const      { return night_mode_; }
 
 private:
