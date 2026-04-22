@@ -93,6 +93,38 @@ public:
     // safe without a lock.
     bool ir_pending_ready() const { return ir_pending_len_ != 0; }
 
+    // Identity of the *pending* blob (set alongside ir_pending_len_ by
+    // ir_poll() before it flips length-last). Safe to read iff
+    // ir_pending_ready() returned true in the same thread-order. Used by
+    // the main thread to snapshot the name+sha into the OTA lifecycle
+    // publish payload without having to reach into private members.
+    const char* ir_pending_script() const { return ir_pending_ptr_; }
+    const char* ir_pending_sha()    const { return ir_pending_sha_; }
+
+    // ---------- OTA detected (lifecycle publish #1) ----------
+    //
+    // ir_poll() snapshots identity + flips `ir_detected_flag_` when it
+    // discovers a new sidecar pointing at a candidate it's about to
+    // fetch. The tel worker main loop reads the flag on its next
+    // iteration, publishes `ota_detected`, and clears the flag via
+    // ir_clear_detected(). Publishing from the main loop rather than
+    // from inside ir_poll keeps the POST out of the sidecar-GET/blob-GET
+    // window on the keep-alive socket — a wedge there hard-freezes the
+    // tel thread (TODO.md completed entry 2026-04-22).
+    //
+    // Snapshot is frozen at detect time because the "from" identity
+    // (ir_loaded_*) may be overwritten by a concurrent main-thread
+    // ir_apply_if_ready() before the publish fires, which would turn the
+    // message into "from=NEW to=NEW" — useless. Snapshot holds from/to
+    // name+sha plus the sidecar-declared size (5 fields).
+    bool ir_detected_ready() const { return ir_detected_flag_; }
+    void ir_clear_detected() { ir_detected_flag_ = false; }
+    const char* ir_detected_from_name() const { return ir_detected_from_name_; }
+    const char* ir_detected_from_sha()  const { return ir_detected_from_sha_;  }
+    const char* ir_detected_to_name()   const { return ir_detected_to_name_;   }
+    const char* ir_detected_to_sha()    const { return ir_detected_to_sha_;    }
+    size_t      ir_detected_size()      const { return ir_detected_size_;      }
+
     // Name of the script currently loaded on this device (empty string until
     // the first successful apply). Used in the heartbeat payload so the
     // server can see which script each device thinks it's running.
@@ -201,6 +233,19 @@ private:
     // under the same name, so the sha is the real source of truth.
     char           ir_loaded_ptr_[IR_SCRIPT_NAME_MAX] = {0};
     char           ir_loaded_sha_[65] = {0};
+
+    // Detected-OTA snapshot + flag. See the public-API block above for
+    // why this snapshot lives on the class rather than as a stack
+    // capture in ir_poll. Volatile flag for the tel-loop/main-loop
+    // reader on the flip side; the buffers are touched by the same
+    // thread that flips the flag (ir_poll runs on tel), so only the
+    // flag itself is ever racing with a foreign-thread read.
+    volatile bool  ir_detected_flag_ = false;
+    char           ir_detected_from_name_[IR_SCRIPT_NAME_MAX] = {0};
+    char           ir_detected_from_sha_ [65] = {0};
+    char           ir_detected_to_name_  [IR_SCRIPT_NAME_MAX] = {0};
+    char           ir_detected_to_sha_   [65] = {0};
+    size_t         ir_detected_size_      = 0;
 };
 
 #endif  // PLATFORM_ID

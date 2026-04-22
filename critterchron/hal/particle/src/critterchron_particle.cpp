@@ -169,6 +169,39 @@ static volatile bool g_boot_light_ready = false;
 static bool          g_boot_light_sent  = false;  // tel-thread-only
 #endif
 
+#if defined(STRA2US_HOST)
+// OTA lifecycle publish handoff (main thread → tel thread) for the
+// `ota_matrix` and `ota_loaded` events. Mirrors the boot_light pattern:
+// main writes the snapshot, then flips the volatile flag last; tel reads
+// the flag, then the snapshot, then clears the flag.
+//
+// The third event, `ota_detected`, uses an analogous handoff that lives
+// on Stra2usClient (ir_detected_flag_ / ir_detected_{from,to}_* ) —
+// because it's fired from ir_poll on the tel thread, the snapshot
+// naturally lives with the code that captures it rather than as a
+// separate global here.
+//
+// Two independent buffer pairs because the matrix event and the loaded
+// event can both be pending when tel finally wakes (the tel loop only
+// runs every ~100ms, but the main thread fires both within a ~5s window,
+// and in the worst case a transient TCP failure delays tel's first drain
+// past the second flag-set). One shared buffer would race; two buffers
+// keep each event's payload intact regardless of ordering.
+//
+// Matrix identity is snapshotted from ir_pending_* when the main loop
+// enters the OTA loading state. Loaded identity is snapshotted from
+// ir_loaded_* immediately after ir_apply_if_ready() — captured at that
+// moment rather than read live, so a back-to-back OTA (unlikely at our
+// 20-minute poll cadence, but possible) doesn't clobber the payload
+// between flag-set and tel-drain.
+static volatile bool g_ota_pub_matrix = false;
+static volatile bool g_ota_pub_loaded = false;
+static char          g_ota_matrix_name[IR_SCRIPT_NAME_MAX] = {0};
+static char          g_ota_matrix_sha [65]                 = {0};
+static char          g_ota_loaded_name[IR_SCRIPT_NAME_MAX] = {0};
+static char          g_ota_loaded_sha [65]                 = {0};
+#endif
+
 // Telemetry-visible state. The worker thread reads these as snapshots;
 // ARM aligned 32-bit writes are atomic enough for a "current value"
 // heartbeat. Don't fold these into something that needs locking.
@@ -404,6 +437,65 @@ static void telemetry_worker() {
         bool edge     = wifi_now && !wifi_prev;
         wifi_prev     = wifi_now;
         if (!wifi_now) { delay(100); continue; }
+
+        // OTA lifecycle publishes. Run *before* the heartbeep `due` gate
+        // so these fire as soon as the main thread flips the flag —
+        // within ~100ms of the event rather than "next heartbeat, which
+        // could be 5 minutes away." Each is one-shot per event: read
+        // flag, fetch snapshot, publish, clear flag. Static msg buffers
+        // (not stack) to keep the tel stack budget reachable on OG
+        // Photon — same rationale as boot_light below.
+        //
+        // Ordering matters: detected → matrix → loaded. ir_poll (tel
+        // thread) sets `detected` before staging; main thread sees the
+        // pending blob and sets `matrix` when it enters the loading
+        // state; ir_apply_if_ready (main thread) sets `loaded` after the
+        // engine reinit. Publishing in that order here keeps the app
+        // stream legible: each event names its phase of the lifecycle.
+        //
+        // `detected` identity comes from `g_cfg` getters (snapshot lives
+        // inside Stra2usClient since ir_poll is where it's captured);
+        // `matrix`/`loaded` use local global snapshots because the
+        // main-thread handoff needs its own freeze point against a
+        // racing OTA.
+        if (g_cfg.ir_detected_ready()) {
+            static char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "ota_detected from=%s@%.8s to=%s@%.8s size=%u up=%lu",
+                     g_cfg.ir_detected_from_name(), g_cfg.ir_detected_from_sha(),
+                     g_cfg.ir_detected_to_name(),   g_cfg.ir_detected_to_sha(),
+                     (unsigned)g_cfg.ir_detected_size(),
+                     (unsigned long)System.uptime());
+            g_cfg.connect();
+            int s = g_cfg.publish(STRA2US_APP, msg);
+            g_cfg.close();
+            Log.info("ota_detected publish=%d %s", s, msg);
+            g_cfg.ir_clear_detected();
+        }
+        if (g_ota_pub_matrix) {
+            static char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "ota_matrix name=%s@%.8s up=%lu",
+                     g_ota_matrix_name, g_ota_matrix_sha,
+                     (unsigned long)System.uptime());
+            g_cfg.connect();
+            int s = g_cfg.publish(STRA2US_APP, msg);
+            g_cfg.close();
+            Log.info("ota_matrix publish=%d %s", s, msg);
+            g_ota_pub_matrix = false;
+        }
+        if (g_ota_pub_loaded) {
+            static char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "ota_loaded name=%s@%.8s up=%lu",
+                     g_ota_loaded_name, g_ota_loaded_sha,
+                     (unsigned long)System.uptime());
+            g_cfg.connect();
+            int s = g_cfg.publish(STRA2US_APP, msg);
+            g_cfg.close();
+            Log.info("ota_loaded publish=%d %s", s, msg);
+            g_ota_pub_loaded = false;
+        }
 
         bool due = first || edge ||
                    (now - last_attempt_ms >= next_interval_ms);
@@ -836,6 +928,18 @@ void loop() {
     if (!g_ota_loading && g_cfg.ir_pending_ready()) {
         g_ota_loading          = true;
         g_ota_loading_start_ms = now;
+        // Snapshot pending identity for lifecycle publish #2
+        // (`ota_matrix`). Snapshot before the flag flip — tel reads
+        // name/sha only after seeing the flag true, so these writes
+        // must be in place first. Same volatile-flag-last fence as
+        // the boot_light handoff.
+        strncpy(g_ota_matrix_name, g_cfg.ir_pending_script(),
+                sizeof(g_ota_matrix_name) - 1);
+        g_ota_matrix_name[sizeof(g_ota_matrix_name) - 1] = '\0';
+        strncpy(g_ota_matrix_sha, g_cfg.ir_pending_sha(),
+                sizeof(g_ota_matrix_sha) - 1);
+        g_ota_matrix_sha[sizeof(g_ota_matrix_sha) - 1] = '\0';
+        g_ota_pub_matrix = true;
         Log.info("ota_loading: entered (pending blob ready)");
     }
 
@@ -851,6 +955,19 @@ void loop() {
                     g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
                     last_sync_minute = -1; // force syncTime next tick
                 }
+                // Snapshot loaded identity for lifecycle publish #3
+                // (`ota_loaded`). Fire even if reinit failed — a failed
+                // reinit is still an observable "this blob landed on
+                // the device" event worth reporting to the stream;
+                // a gap between ota_matrix and ota_loaded is a
+                // louder signal than a missing ota_loaded.
+                strncpy(g_ota_loaded_name, g_cfg.ir_loaded_script(),
+                        sizeof(g_ota_loaded_name) - 1);
+                g_ota_loaded_name[sizeof(g_ota_loaded_name) - 1] = '\0';
+                strncpy(g_ota_loaded_sha, g_cfg.ir_loaded_sha(),
+                        sizeof(g_ota_loaded_sha) - 1);
+                g_ota_loaded_sha[sizeof(g_ota_loaded_sha) - 1] = '\0';
+                g_ota_pub_loaded = true;
             }
             g_ota_loading = false;
         } else {

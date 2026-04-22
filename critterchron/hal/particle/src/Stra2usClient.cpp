@@ -640,8 +640,25 @@ void Stra2usClient::ir_poll() {
 
     if (have_sidecar && strcmp(sidecar_sha, ir_loaded_sha_) == 0) {
         // Sidecar matches loaded — no blob fetch this cycle. Fast path.
+        // Kept silent by design: fires every poll on a stable deployment,
+        // and a log line every 20min just to say "nothing to do" is
+        // noise. Everything beyond this point is OTA activity and gets
+        // breadcrumb logs so a freeze leaves a serial trail of which
+        // phase we reached — see TODO.md "OTA crash — first pull after
+        // boot freezes device" for the failure mode the breadcrumbs
+        // exist to diagnose.
         return;
     }
+
+    // OTA candidate: sidecar differs from loaded (or is missing). Announce
+    // the intent on serial so a reader can see we got this far. Loaded
+    // side may be empty (first OTA since boot) — render those as "(none)".
+    Log.info("ir_poll: OTA candidate %s sidecar=%.8s%s (loaded=%s@%.8s)",
+             new_ptr,
+             have_sidecar ? sidecar_sha : "none",
+             have_size    ? " (sized)" : "",
+             ir_loaded_ptr_[0] ? ir_loaded_ptr_ : "(none)",
+             ir_loaded_sha_[0] ? ir_loaded_sha_ : "00000000");
 
     // Pre-fetch size gate. If the sidecar tells us the blob won't fit,
     // don't attempt the fetch — it would either silently fail at the
@@ -656,19 +673,60 @@ void Stra2usClient::ir_poll() {
         return;
     }
 
+    // Lifecycle publish #1: `ota_detected`. Snapshot identity + flip the
+    // flag here; the tel worker main loop publishes on its *next* iteration,
+    // outside this ir_poll frame. An earlier version published inline right
+    // here and hard-froze the device — a POST wedged between the sidecar
+    // GET and the blob GET on the same keep-alive socket wedges the tel
+    // thread (see TODO.md completed entry 2026-04-22). The flag-and-snapshot
+    // shape matches `ota_matrix` / `ota_loaded` so the three events reach
+    // the stream the same way.
+    //
+    // Gated on have_sidecar: a missing sidecar means we don't know the
+    // target sha yet, and firing ota_detected with a partial identity is
+    // worse than not firing. Legacy no-sidecar path still fetches + applies
+    // — it just skips the pre-announcement, as before.
+    if (have_sidecar) {
+        const char* from_name = ir_loaded_ptr_[0] ? ir_loaded_ptr_ : "default";
+        const char* from_sha  = ir_loaded_sha_[0] ? ir_loaded_sha_ : "00000000";
+        strncpy(ir_detected_from_name_, from_name, sizeof(ir_detected_from_name_) - 1);
+        ir_detected_from_name_[sizeof(ir_detected_from_name_) - 1] = '\0';
+        strncpy(ir_detected_from_sha_,  from_sha,  sizeof(ir_detected_from_sha_)  - 1);
+        ir_detected_from_sha_[sizeof(ir_detected_from_sha_)   - 1] = '\0';
+        strncpy(ir_detected_to_name_,   new_ptr,   sizeof(ir_detected_to_name_)   - 1);
+        ir_detected_to_name_[sizeof(ir_detected_to_name_)     - 1] = '\0';
+        strncpy(ir_detected_to_sha_,    sidecar_sha, sizeof(ir_detected_to_sha_)  - 1);
+        ir_detected_to_sha_[sizeof(ir_detected_to_sha_)       - 1] = '\0';
+        ir_detected_size_ = sidecar_size;
+        // Flag flipped last so a concurrent reader that sees true is
+        // guaranteed to see the snapshot already committed. Same
+        // length-last / flag-last ordering used elsewhere in this file.
+        ir_detected_flag_ = true;
+    }
+
     char script_key[96 + IR_SCRIPT_NAME_MAX];
     snprintf(script_key, sizeof(script_key), "%s/scripts/%s", app_, new_ptr);
+    Log.info("ir_poll: fetching blob %s", script_key);
     size_t blob_len = 0;
     if (!kv_fetch_str_(script_key, ir_ota_buf_, sizeof(ir_ota_buf_), blob_len)) {
         Log.warn("ir_poll: fetch failed for %s", script_key);
         return;
     }
+    // Blob is in ir_ota_buf_ and accounted for. Log length here so a
+    // crash in the subsequent content_sha compute or strcmp path leaves
+    // proof the fetch itself succeeded (server-side success logs only
+    // tell us bytes *left* the server, not that the device finished
+    // reading them).
+    Log.info("ir_poll: blob in (%u bytes); computing content_sha", (unsigned)blob_len);
 
     char new_sha[65];
     if (!compute_content_sha_(ir_ota_buf_, blob_len, new_sha)) {
         Log.error("ir_poll: malformed blob for %s (no encoded_at/END); ignoring", new_ptr);
         return;
     }
+    // ASCII "..." not UTF-8 "…" — the serial monitor doesn't decode UTF-8
+    // and prints three replacement glyphs (`���`) in place of the ellipsis.
+    Log.info("ir_poll: content_sha=%.8s...; cross-checking", new_sha);
 
     // Torn-upload guard: if we got a sidecar, content_sha(blob) must match
     // it. Reject the mismatch — a later publish will resolve it. Without a
@@ -686,7 +744,7 @@ void Stra2usClient::ir_poll() {
         // already short-circuited).
         return;
     }
-    Log.info("ir_poll: staged %s (%u bytes, sha=%.8s…)",
+    Log.info("ir_poll: staged %s (%u bytes, sha=%.8s...)",
              new_ptr, (unsigned)blob_len, new_sha);
 
     // Commit: name + sha first (readers of ir_pending_ptr_/sha only trust
@@ -721,7 +779,7 @@ bool Stra2usClient::ir_apply_if_ready() {
         strncpy(ir_loaded_ptr_, ir_pending_ptr_, sizeof(ir_loaded_ptr_) - 1);
         ir_loaded_ptr_[sizeof(ir_loaded_ptr_) - 1] = '\0';
         memcpy(ir_loaded_sha_, ir_pending_sha_, 65);
-        Log.info("ir_apply: loaded %s (sha=%.8s…) "
+        Log.info("ir_apply: loaded %s (sha=%.8s...) "
                  "colors=%u landmarks=%u agents=%u spawns=%u behaviors=%u insns=%u tick=%lums",
                  ir_loaded_ptr_, ir_loaded_sha_,
                  (unsigned)critter_ir::COLOR_COUNT,

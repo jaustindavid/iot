@@ -126,63 +126,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   future-class hang resets the device with a clear panic code rather
   than wedging silently.
 
-- **OTA crash — oversize blob kills the device hard.** Distinct from
-  the "OTA freeze" entry above: this one takes the *system thread*
-  down too, not just physics. Clean repro 2026-04-22: published
-  doozer3 at 8408 bytes (216 bytes over the default
-  `IR_OTA_BUFFER_BYTES=8192`, publish warning fired as designed);
-  rachel promptly went dark — grid frozen, cloud presence gone, no
-  SOS visible. Recovery required a physical reboot. Republishing the
-  same script with `--no-source` (smaller blob) pulled cleanly after
-  the reboot, confirming the blob *size* is the trigger rather than
-  its content.
-
-  Expected behavior per `Stra2usClient.cpp:472`: the msgpack unpacker
-  sees `hdr_len + payload_len > buf_cap - 1` and returns false —
-  nothing crashed, ir_poll logs `fetch failed for <key>` on serial
-  and life goes on. Observed behavior: the device dies. So either
-  (a) the rejection path itself has a bug (buffer overflow before the
-  size check, stack blow in the oversize response handling, msgpack
-  header parse reading past valid bytes), (b) the HTTP layer below
-  msgpack is allocating on the telemetry thread's stack and an
-  oversized response blows it, or (c) an interaction with the new
-  OTA loading screen — unlikely since `ir_pending_ready()` only
-  flips true on a *successful* stage, and the streamer code doesn't
-  run on a fetch failure.
-
-  Investigation priorities:
-  1. Reproduce with serial monitor attached — capture the last
-     `Log.*` line before the freeze. That localizes the death to
-     msgpack / HTTP / post-rejection codepath.
-  2. Add explicit logging around `Stra2usClient.cpp:472`
-     ("rejecting oversized blob: hdr=%zu payload=%zu cap=%zu") so
-     the rejection path is *observably* the rejection path and not
-     a silent crash misattributed to rejection.
-  3. Audit the fetch buffer sizing: if the HTTP client accepts more
-     bytes than `ir_ota_buf_` can hold, there's an OOB write before
-     the msgpack check ever runs. The size check at :472 is checking
-     the *parsed* header+payload, not the raw bytes received.
-  4. ~~Consider a pre-fetch size probe.~~ Landed 2026-04-22 as
-     sidecar-extension: sidecar now reads `<sha>:<size>`, device
-     parses size and bails before the blob fetch when
-     `size > sizeof(ir_ota_buf_) - 1`. Closes the oversize-crash
-     trigger via the sidecar path. Doesn't fix the underlying
-     vulnerability (a device-OS bug pushing > buffer bytes, or a
-     non-oversize path into the same failure mode, would still
-     crash) — investigation priorities 1-3 above still stand,
-     but the common-case trigger is defanged.
-
-  Interim operator defense: `publish_ir.py` warning already fires
-  (landed earlier today), and the sidecar size gate now stops the
-  fetch device-side even if a warning is ignored. A device still
-  shouldn't crash on a bad blob — the OTA path needs to be crashproof
-  so one bad publish doesn't require a truck roll to every device.
-
-  Related to: "Device-side error channel on the heartbeat" (would
-  have let us see the fetch-failed log remotely), "Publish warns
-  when blob exceeds OTA buffer size" (prevention landed, doesn't
-  fix the device-side vulnerability).
-
 - **Device registers loaded sha back to Stra2us on successful OTA.**
   Today the only fleet-visibility signal for "what sha is this device
   actually running" is the heartbeat (`script=<name>@<sha_prefix>`)
@@ -534,6 +477,56 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   header format unchanged.
 
 # Completed
+
+- **2026-04-22 — OTA crash "first pull after boot freezes device hard"
+  root-caused and fixed.** Symptom: system thread down, grid frozen,
+  cloud presence gone, onboard LED stuck solid cyan (not breathing),
+  no SOS, physical reboot required. Intermittent, all platforms.
+
+  *Repro A (rachel, doozer3 oversize, 2026-04-22):* 8408-byte blob,
+  216 bytes over `IR_OTA_BUFFER_BYTES=8192`. Defanged by the same-day
+  publish-side warning + device-side sidecar size gate; the oversize
+  path was *a* trigger, not the underlying fault.
+
+  *Repro B (ricky, swarm-slower, 2026-04-22):* small script, well
+  under buffer, first `ir_poll` after boot froze the device hard.
+  Added phase-by-phase `Log.info` breadcrumbs through `ir_poll()`
+  plus an `ota_detected` publish before the blob fetch (so the
+  event would land on the server even if the device died mid-load).
+  Next repro: device froze again with zero serial output and only
+  the sidecar + blob GETs visible server-side — no breadcrumbs, no
+  `ota_detected` publish reaching the stream.
+
+  *Root cause:* the `ota_detected` publish, placed between the
+  sidecar GET and the blob GET on the same keep-alive TCP socket
+  managed by `Stra2usClient`, wedged the tel thread. Not a bug in
+  the sidecar or blob fetch themselves — a POST interleaved into a
+  GET→GET sequence on a shared socket is the fragility. Removing
+  just that publish (keeping the breadcrumbs) cleared the freeze:
+  swarm-slower pulled cleanly on first-pull-after-boot, and again
+  after a reboot with the pointer already set (the exact repro
+  condition).
+
+  *Fix:* `ota_detected` restored via the same flag-and-snapshot
+  pattern used for `ota_matrix` / `ota_loaded` — `ir_poll()` stages
+  identity into member buffers and flips a flag, the tel worker
+  main loop reads the flag on its next iteration (outside the
+  GET→GET window) and does connect→publish→close in isolation.
+
+  Mid-diagnosis we also captured one legitimate DeviceOS firmware
+  OTA on serial (`[comm.ota] Received UpdateStart request ...`) and
+  briefly chased it as the cause — Particle cloud does push firmware
+  OTAs on first-connect when the on-device version diverges from the
+  cloud's registered binary — but that path was unrelated to the
+  IR-OTA freeze.
+
+  Related items still open: `ApplicationWatchdog` coverage over
+  the OTA path (future-class hang should reset cleanly instead of
+  wedging); "device-side error channel on the heartbeat" (would
+  surface the next weird thing without needing a serial cable);
+  "synchronous bootstrap OTA before sim start" (would move
+  first-boot OTA to the main thread, sidestepping this whole
+  tel-thread socket-reuse class of bugs).
 
 - **2026-04-21 — Palette re-resolves on day/night transition.** Tiles
   snapshot their paint-time RGB (engine-side choice: no live animation

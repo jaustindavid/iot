@@ -225,6 +225,56 @@ always valid as long as the runtime IR is.
 Swap is a soft reset of engine state, not a device reset. Rescue-hold on
 crash-type reset is unchanged.
 
+## Lifecycle publishes
+
+An OTA swap produces three events on the app stream (topic
+`critterchron`), in order:
+
+| Event          | Fired at                                     | Payload (text)                                                 |
+|----------------|----------------------------------------------|----------------------------------------------------------------|
+| `ota_detected` | Sidecar fetched, new sha confirmed, about to pull blob | `ota_detected from=<old_name>@<sha8> to=<new_name>@<sha8> size=<bytes> up=<uptime_s>` |
+| `ota_matrix`   | Pending blob staged, device entering "matrix loading" visual indicator | `ota_matrix name=<new_name>@<sha8> up=<uptime_s>`       |
+| `ota_loaded`   | `critter_ir::load` + `engine.reinit` returned; new script is live | `ota_loaded name=<new_name>@<sha8> up=<uptime_s>`         |
+
+A complete trio on the stream (detected → matrix → loaded, same
+`@<sha8>` across matrix/loaded) confirms the swap landed. Missing
+`matrix` after `detected` means the blob fetch or parse failed —
+check serial for the breadcrumbs below. Missing `loaded` after
+`matrix` means `engine.reinit()` rejected the IR (version gate, etc.),
+and the device is still running the previous script.
+
+`detected` is published from the telemetry worker main loop, not
+from inside `ir_poll()`. An earlier version fired it inline between
+the sidecar GET and the blob GET on the shared keep-alive TCP socket
+and deadlocked the telemetry thread — see TODO.md completed entry
+2026-04-22. `ir_poll()` now snapshots the from/to identity into
+`Stra2usClient` member buffers and flips `ir_detected_flag_`; the
+worker loop reads the flag on its next iteration, publishes, and
+clears.
+
+### Serial breadcrumbs
+
+Each phase of `ir_poll()` emits a `Log.info` line so a serial trace
+names the last phase reached if the device hangs:
+
+```
+ir_poll: OTA candidate <name> sidecar=<sha8> (sized) (loaded=<name>@<sha8>)
+ir_poll: fetching blob critterchron/scripts/<name>
+ir_poll: blob in (<N> bytes); computing content_sha
+ir_poll: content_sha=<sha8>...; cross-checking
+ir_poll: staged <name> (<N> bytes, sha=<sha8>...)
+ir_apply: bytes=<N> preview="CRIT 1|name <name>"
+ir_apply: loaded <name> (sha=<sha8>...) colors=... tick=...ms
+```
+
+The gap between `staged` and `ir_apply` reflects the matrix-loading
+delay (a few seconds by design — lets the operator see the swap
+coming on the grid before it takes effect).
+
+All log format strings are ASCII — `test_hal_serial_ascii.py`
+enforces this. The serial console doesn't decode UTF-8, so a stray
+`…` or smart quote renders as `���` and obscures the diagnostic.
+
 ## Compiled-in default
 
 Same wire format, embedded in firmware:
