@@ -31,6 +31,18 @@ HMAC-SHA256(secret_bytes, URI + body_bytes + timestamp_string)
 
 Admin endpoints (`/api/admin/*` and `/admin/*`) require HTTP Basic Auth on the first request. The server issues a session cookie (`admin_session`) that is accepted on subsequent requests.
 
+Beyond authentication, admin routes enforce a per-caller ACL — see
+[acl_model.md](acl_model.md) for the schema and matching rules. Most
+admin routes below note their required access level; the short version:
+
+- Peek/mutate routes (`peek/kv/…`, `peek/q/…`, `POST/DELETE /kv/…`,
+  `DELETE /q/…`) require read or write access on the specific
+  resource.
+- Listing routes (`/stats`, `/logs`, `/kv_scan`) return only the
+  entries the caller can read.
+- Credential-management routes (`/keys/…`, `/admin_users/…`,
+  `/keys/backup`, `/keys/restore`) require a superuser ACL (`*:rw`).
+
 ---
 
 ## Unauthenticated Endpoints
@@ -147,13 +159,35 @@ Body is raw MessagePack bytes.
 
 All admin endpoints require Basic Auth or a valid `admin_session` cookie.
 
+### `GET /api/admin/whoami`
+
+Returns the logged-in admin's identity and ACL. Intended for UI code
+that wants to hide entries the caller can't use — the routes
+themselves still enforce.
+
+**Response `200 OK`:**
+```json
+{
+  "username": "scoped",
+  "acl": {"permissions": [{"prefix": "critterchron", "access": "rw"}]},
+  "is_superuser": false
+}
+```
+
+`is_superuser` is `true` iff the ACL contains a `{"prefix": "*", "access": "rw"}` entry.
+
+---
+
 ### `GET /api/admin/stats`
 
-Returns counts and listings of all active queues and KV pairs.
+Returns queues and KV entries the **caller** can read. Entries outside
+the caller's ACL are silently omitted.
 
 ---
 
 ### `GET /api/admin/keys`
+
+> Requires superuser ACL (`*:rw`).
 
 Lists all registered client IDs and their ACLs. Does **not** return secrets.
 
@@ -161,24 +195,25 @@ Lists all registered client IDs and their ACLs. Does **not** return secrets.
 
 ### `POST /api/admin/keys`
 
-Register a new client and generate a secret.
+> Requires superuser ACL (`*:rw`).
+
+Register a new client and generate a secret. New clients start with
+**no permissions** — set the ACL via `PUT /api/admin/keys/{id}/acl`
+before the device will be allowed to do anything.
 
 **Request body (JSON):**
 ```json
 {
-  "client_id": "ESP32-Weather-01",
-  "acl_read_write": "*"
+  "client_id": "ESP32-Weather-01"
 }
 ```
-
-`acl_read_write`: `"*"` for full access, `"read_only"` for read-only.
 
 **Response:**
 ```json
 {
   "client_id": "ESP32-Weather-01",
   "secret": "aabbcc...(64 hex chars)...",
-  "acl": {"read_write": "*"}
+  "acl": {"permissions": []}
 }
 ```
 
@@ -186,13 +221,31 @@ Register a new client and generate a secret.
 
 ---
 
+### `PUT /api/admin/keys/{client_id}/acl`
+
+> Requires superuser ACL (`*:rw`).
+
+Replace a client's ACL. See [acl_model.md](acl_model.md) for the schema.
+
+**Request body (JSON):**
+```json
+{"permissions": [{"prefix": "critterchron", "access": "rw"}]}
+```
+
+---
+
 ### `DELETE /api/admin/keys/{client_id}`
+
+> Requires superuser ACL (`*:rw`).
 
 Revoke a client. The device will immediately receive `401` on all future requests.
 
 ---
 
 ### `GET /api/admin/keys/backup`
+
+> Requires superuser ACL (`*:rw`). The backup is functionally a total
+> read of every credential in the system.
 
 Export all client credentials (IDs, secrets, ACLs) as a JSON file.
 
@@ -205,7 +258,7 @@ Export all client credentials (IDs, secrets, ACLs) as a JSON file.
     {
       "client_id": "ESP32-Weather-01",
       "secret": "aabbcc...",
-      "acl": {"read_write": "*"}
+      "acl": {"permissions": [{"prefix": "*", "access": "rw"}]}
     }
   ]
 }
@@ -216,6 +269,8 @@ Export all client credentials (IDs, secrets, ACLs) as a JSON file.
 ---
 
 ### `POST /api/admin/keys/restore`
+
+> Requires superuser ACL (`*:rw`).
 
 Restore credentials from a backup JSON body.
 
@@ -264,7 +319,13 @@ Delete a KV entry.
 
 ### `GET /api/admin/logs`
 
-Returns the most recent activity log entries, newest first. Logs are stored in a Redis Stream with dual retention: entries older than 24 hours are trimmed, with a safety cap of 150,000 entries (~11 MB) to bound storage from unusually chatty clients.
+Returns recent activity log entries the **caller** can read, newest
+first. Entries for resources outside the caller's ACL are silently
+omitted; firmware fetches and other non-app-scoped actions pass
+through regardless. Logs are stored in a Redis Stream with dual
+retention: entries older than 24 hours are trimmed, with a safety cap
+of 150,000 entries (~11 MB) to bound storage from unusually chatty
+clients.
 
 **Query Parameters:**
 
@@ -287,12 +348,45 @@ Returns the most recent activity log entries, newest first. Logs are stored in a
 
 ---
 
+### Admin user management
+
+> All routes in this section require superuser ACL (`*:rw`).
+
+Admin accounts live in `admin.htpasswd` (authentication) plus a Redis
+row (authorization). The UI reads the union and edits the ACL; the
+htpasswd side is managed out-of-band via CLI.
+
+#### `GET /api/admin/admin_users`
+
+Returns every admin in htpasswd with its ACL record if one exists.
+Users without a Redis row are surfaced as `provisioned: false` so the
+UI can flag "needs provisioning".
+
+**Response `200 OK`:**
+```json
+[
+  {"username": "alice", "acl": {"permissions": [{"prefix": "*", "access": "rw"}]}, "provisioned": true},
+  {"username": "bob",   "acl": {"permissions": []}, "provisioned": false}
+]
+```
+
+#### `PUT /api/admin/admin_users/{username}/acl`
+
+Replace an admin user's ACL. Returns `404` if the username isn't in
+htpasswd — the UI can't grant permissions to an account that can't
+authenticate.
+
+**Request body:** same shape as `PUT /api/admin/keys/{id}/acl`.
+
+---
+
 ## Redis Key Schema
 
 | Pattern | Type | Description |
 |---|---|---|
 | `client:{id}:secret` | String | Client HMAC secret (hex) |
-| `client:{id}:acl` | String (JSON) | Client ACL permissions |
+| `client:{id}:acl` | String (JSON) | Client ACL — `{"permissions": [...]}` |
+| `admin_acls:{user}` | String (JSON) | Admin user ACL — same shape as client ACL |
 | `q:{topic}` | Stream | Message queue |
 | `kv:{key}` | String | Persistent KV value (raw msgpack) |
 | `cursor:{client_id}:q:{topic}` | String | Per-client read cursor for a queue |

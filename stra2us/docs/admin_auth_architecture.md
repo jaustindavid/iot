@@ -1,5 +1,10 @@
 # Admin Auth Architecture
 
+Scope: how admin identity is established (htpasswd + session cookie).
+For what an authenticated admin is then allowed to do — the ACL
+layer, per-route gating, superuser role, scoped-admin recipes — see
+[acl_model.md](acl_model.md).
+
 ## The Core Challenge
 The administrative dashboard web frontend sits at `/admin`. This exposes sensitive device secret generation buttons, visual key revocation protocols, and un-sanitized queue log traces. Since this project natively operates without bloated system dependencies like Postgres databases or extensive OAuth OIDC wrappers, it posed a unique security design challenge to lock it seamlessly away from public internet exposure.
 

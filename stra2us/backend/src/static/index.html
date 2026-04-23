@@ -22,10 +22,12 @@
             </div>
             <ul class="nav-links">
                 <li><a href="#" data-target="dashboard" class="active">Dashboard / Stats</a></li>
-                <li><a href="#" data-target="keys">Key Management</a></li>
+                <li class="nav-superuser"><a href="#" data-target="keys">Key Management</a></li>
+                <li class="nav-superuser"><a href="#" data-target="admin_users">Admin Users</a></li>
+                <li><a href="#" data-target="catalogs">Catalogs</a></li>
                 <li><a href="#" data-target="monitor">Topic Monitor</a></li>
                 <li><a href="#" data-target="logs">Activity Logs</a></li>
-                <li><a href="#" data-target="backup">Backup / Restore</a></li>
+                <li class="nav-superuser"><a href="#" data-target="backup">Backup / Restore</a></li>
             </ul>
         </nav>
 
@@ -146,6 +148,150 @@
                 </div>
             </div>
 
+            <!-- Admin Users View -->
+            <section id="admin_users" class="view">
+                <header>
+                    <h1>Admin Users</h1>
+                    <p class="subtitle">Browser sessions are now subject to the same ACL system as HMAC clients. Passwords still live in <code>admin.htpasswd</code> (edit via <code>create_admin.py</code>); ACLs live in Redis and are edited here.</p>
+                </header>
+
+                <div class="card glass-panel form-card">
+                    <p class="form-hint">Users without a provisioned ACL row see no KV. Run <code>python migrate_admin_acls.py</code> on the server to seed defaults, or grant here row-by-row.</p>
+                </div>
+
+                <div class="card transparent-card">
+                    <h3>Active admin accounts</h3>
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Username</th>
+                                <th>Permissions</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="adminUsersTableBody"></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Catalogs View -->
+            <section id="catalogs" class="view">
+                <header>
+                    <h1>Catalogs</h1>
+                    <p class="subtitle">Published app catalogs — the human-readable descriptor of each app's tunable variables. Hand-maintained by app owners; device firmware is the arbiter.</p>
+                </header>
+
+                <!-- List state: shown when no app is selected -->
+                <div id="catalogListPane">
+                    <div class="card glass-panel form-card">
+                        <h3>Published apps <span id="catalogAppCount" class="badge">0</span></h3>
+                        <p class="form-hint">One row per app with a catalog stashed at <code>_catalog/&lt;app&gt;</code>. Published via <code>stra2us catalog publish</code>.</p>
+                        <div id="catalogAppList" class="catalog-app-list"></div>
+                    </div>
+                </div>
+
+                <!-- Detail state: shown when an app is selected -->
+                <div id="catalogDetailPane" class="hidden">
+                    <div class="card-toolbar" style="margin-bottom: 16px;">
+                        <button class="btn-ghost" onclick="closeCatalogDetail()">&larr; Back to app list</button>
+                        <span class="card-toolbar-title" id="catalogDetailTitle"></span>
+                    </div>
+                    <div id="catalogDetailError" class="hidden alert-success" style="background: var(--accent-danger); color: white;"></div>
+
+                    <nav class="catalog-tabs" id="catalogTabs">
+                        <button class="catalog-tab active" data-tab="variables" onclick="switchCatalogTab('variables')">Variables</button>
+                        <button class="catalog-tab" data-tab="devices" onclick="switchCatalogTab('devices')">Devices</button>
+                        <button class="catalog-tab" data-tab="raw" onclick="switchCatalogTab('raw')">Raw</button>
+                    </nav>
+
+                    <div id="catalogVariablesTabPane" class="catalog-tab-pane">
+                        <div class="card glass-panel card-flush">
+                            <table class="data-table" id="catalogVarsTable">
+                                <thead>
+                                    <tr>
+                                        <th>Key</th>
+                                        <th>Type</th>
+                                        <th>Scope</th>
+                                        <th>Default</th>
+                                        <th>Range / Values</th>
+                                        <th>Help</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="catalogVarsBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div id="catalogDevicesTabPane" class="catalog-tab-pane hidden">
+                        <!-- Device list state: one row per device with override count -->
+                        <div id="catalogDevicesListPane">
+                            <div class="card glass-panel form-card">
+                                <h3>Devices seen for this app <span id="catalogDevicesCount" class="badge">0</span></h3>
+                                <p class="form-hint">Devices are inferred from any KV key of the form <code>&lt;app&gt;/&lt;device&gt;/&lt;name&gt;</code>. A device only appears here once it has at least one per-device override written.</p>
+                                <div id="catalogDevicesList" class="catalog-app-list"></div>
+                            </div>
+                        </div>
+                        <!-- Device detail state: effective-config table -->
+                        <div id="catalogDeviceDetailPane" class="hidden">
+                            <div class="card-toolbar" style="margin-bottom: 16px;">
+                                <button class="btn-ghost" onclick="closeDeviceDetail()">&larr; Back to device list</button>
+                                <span class="card-toolbar-title" id="catalogDeviceDetailTitle"></span>
+                            </div>
+                            <div class="card glass-panel card-flush">
+                                <table class="data-table" id="catalogDeviceEffectiveTable">
+                                    <thead>
+                                        <tr>
+                                            <th>Key</th>
+                                            <th>Device</th>
+                                            <th>App</th>
+                                            <th>Catalog default</th>
+                                            <th>Effective</th>
+                                            <th>Source</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="catalogDeviceEffectiveBody"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="catalogRawTabPane" class="catalog-tab-pane hidden">
+                        <div class="card glass-panel form-card">
+                            <h3>Raw KV under <code id="catalogRawAppLabel"></code> <span id="catalogRawCount" class="badge">0</span></h3>
+                            <p class="form-hint">Every key written under this app's prefix, catalog-tracked or not. Off-catalog keys (drift) are flagged &mdash; the firmware can still read them, but they bypass the catalog contract. Read-only; edits go through the Variables tab so invariants stay intact.</p>
+                            <div class="card card-flush" style="margin-top: 12px;">
+                                <table class="data-table" id="catalogRawTable">
+                                    <thead>
+                                        <tr>
+                                            <th>Key path</th>
+                                            <th>Scope</th>
+                                            <th>Size</th>
+                                            <th>Catalog</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="catalogRawBody"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Key Editor Modal (M3b) -->
+            <div id="keyEditorModal" class="modal">
+                <div class="modal-content glass-panel key-editor-modal">
+                    <span class="close-btn" onclick="closeKeyEditor()">&times;</span>
+                    <h3 id="keyEditorTitle"></h3>
+                    <div class="key-editor-meta" id="keyEditorMeta"></div>
+                    <div class="key-editor-pane hidden" id="keyEditorAppPane"></div>
+                    <div class="key-editor-pane hidden" id="keyEditorDevicePane"></div>
+                    <div class="modal-actions">
+                        <button class="btn-sm" onclick="closeKeyEditor()">Close</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Topic Monitor View -->
             <section id="monitor" class="view">
                 <header>
@@ -228,6 +374,12 @@
         </main>
     </div>
 
-    <script src="app.js?v=2"></script>
+    <!-- js-yaml for parsing stashed catalog YAML client-side. ~40 KB gz.
+         Pinned to 4.1.0; served from jsdelivr with SRI so the admin UI
+         can't be silently upgraded from under us. -->
+    <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"
+            integrity="sha256-Rdw90D3AegZwWiwpibjH9wkBPwS9U4bjJ51ORH8H69c="
+            crossorigin="anonymous"></script>
+    <script src="app.js?v=7"></script>
 </body>
 </html>

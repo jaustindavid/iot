@@ -5,7 +5,10 @@ import time
 import base64
 import json
 
-HTPASSWD_FILE = "admin.htpasswd"
+HTPASSWD_FILE = os.environ.get(
+    "STRA2US_HTPASSWD",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "admin.htpasswd"),
+)
 
 # In a production environment with multiple horizontally scaled workers, 
 # ADMIN_SESSION_SECRET should be statically set as an environment variable 
@@ -48,21 +51,27 @@ def generate_session_token(username):
     return base64.b64encode(json.dumps(token_dict).encode()).decode()
 
 def verify_session_token(token):
+    """Validate a session cookie and return the username it authenticates, or
+    None if invalid/expired. Older callers that treated this as a bool still
+    work — None is falsy, a username string is truthy.
+    """
     try:
         token_dict = json.loads(base64.b64decode(token).decode())
         username = token_dict.get("u")
         exp = token_dict.get("e")
         signature = token_dict.get("s")
-        
+
         if not username or not exp or not signature:
-            return False
-            
+            return None
+
         if int(time.time()) > int(exp):
-            return False # Expired
-            
+            return None # Expired
+
         expected_payload = f"{username}:{exp}"
         expected_sig = hmac.new(SESSION_SECRET.encode(), expected_payload.encode(), hashlib.sha256).hexdigest()
-        
-        return hmac.compare_digest(expected_sig, signature)
+
+        if hmac.compare_digest(expected_sig, signature):
+            return username
+        return None
     except Exception:
-        return False
+        return None

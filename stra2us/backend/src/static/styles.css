@@ -503,3 +503,126 @@ input:focus, select:focus { border-color: var(--accent-blue); }
 .checkbox-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .checkbox-row .form-hint { margin-bottom: 0; }
 .checkbox-input { width: auto; padding: 0; }
+
+/* Catalogs view (M3a) */
+.catalog-app-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.catalog-app-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border-light);
+    background: rgba(255,255,255,0.02);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.catalog-app-row:hover {
+    border-color: var(--accent-blue);
+    background: rgba(0, 240, 255, 0.06);
+}
+.catalog-app-name { font-weight: 600; color: var(--text-primary); }
+.catalog-app-meta { color: var(--text-muted); font-size: 0.85rem; }
+.catalog-app-chevron { color: var(--text-muted); font-size: 1.4rem; line-height: 1; }
+.catalog-app-row:hover .catalog-app-chevron { color: var(--accent-blue); }
+/* Wrap long help text; rest of the table stays single-line. */
+#catalogVarsTable td:last-child { white-space: normal; max-width: 420px; color: var(--text-muted); }
+#catalogVarsTable td code { font-size: 0.85rem; }
+tr.catalog-var-row { cursor: pointer; }
+tr.catalog-var-row:hover td { background: rgba(0, 240, 255, 0.06); }
+
+/* Key editor modal (M3b) */
+.key-editor-modal { max-width: 680px; }
+.key-editor-meta {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 12px 16px; margin-top: 12px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+.key-editor-meta strong { color: var(--text-muted); font-weight: 500; margin-right: 6px; }
+.key-editor-help {
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--border-light);
+    color: var(--text-muted); white-space: pre-wrap;
+}
+.key-editor-pane { margin-top: 18px; }
+.key-editor-pane h4 { margin: 0 0 10px 0; font-weight: 600; }
+.key-editor-row { display: flex; flex-direction: column; gap: 10px; }
+.key-editor-current { color: var(--text-muted); font-size: 0.9rem; }
+.key-editor-edit { display: flex; gap: 8px; align-items: center; }
+.key-editor-edit input, .key-editor-edit select { flex: 1; }
+.key-editor-device-picker { display: flex; gap: 8px; }
+.key-editor-device-picker input { flex: 1; }
+.key-editor-error { color: var(--accent-danger); font-size: 0.85rem; }
+.badge-type {
+    display: inline-block; padding: 2px 10px; border-radius: 10px;
+    background: rgba(0, 240, 255, 0.12); color: var(--accent-blue);
+    font-size: 0.75rem; margin-left: 8px; vertical-align: middle;
+}
+.btn-danger {
+    background: rgba(220, 60, 60, 0.15); color: var(--accent-danger);
+    border: 1px solid rgba(220, 60, 60, 0.3);
+}
+.btn-danger:hover { background: rgba(220, 60, 60, 0.25); }
+.form-hint-sm { color: var(--text-muted); font-size: 0.8rem; }
+
+/* Catalog detail tabs (M3c) */
+.catalog-tabs {
+    display: flex; gap: 4px;
+    border-bottom: 1px solid var(--border-light);
+    margin-bottom: 16px;
+}
+.catalog-tab {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    padding: 10px 18px;
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 0.15s, border-color 0.15s;
+}
+.catalog-tab:hover { color: var(--text-primary); }
+.catalog-tab.active {
+    color: var(--accent-blue);
+    border-bottom-color: var(--accent-blue);
+}
+
+/* Source badges on effective-config rows */
+.source-device { background: rgba(0, 240, 255, 0.15); color: var(--accent-blue); border: 1px solid rgba(0, 240, 255, 0.35); }
+.source-app    { background: rgba(138, 43, 226, 0.18); color: #c79cff;         border: 1px solid rgba(138, 43, 226, 0.4); }
+.source-default{ background: rgba(0, 255, 136, 0.12); color: var(--accent-success); border: 1px solid rgba(0, 255, 136, 0.3); }
+.source-unset  { background: rgba(255,255,255,0.04); color: var(--text-muted); border: 1px solid var(--border-light); }
+
+#catalogDeviceEffectiveTable td,
+#catalogRawTable td { font-size: 0.88rem; }
+
+/* Keep scope / catalog badges on one line — they're short labels and the
+   container shouldn't have to stretch around a wrap. */
+#catalogRawTable .badge,
+#catalogDeviceEffectiveTable .badge { white-space: nowrap; }
+#catalogRawTable td:nth-child(2),
+#catalogRawTable td:nth-child(3),
+#catalogRawTable td:nth-child(4) { white-space: nowrap; width: 1%; }
+
+/* The key path column can be long (`<app>/<device>/<name>`) — let it
+   ellipsize rather than force the whole table to overflow. */
+#catalogRawTable { table-layout: auto; width: 100%; }
+#catalogRawTable td:first-child {
+    max-width: 0;              /* with table-layout auto + width:100%, forces col to shrink */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#catalogRawTable td:first-child code { font-size: 0.85rem; }
+
+/* Raw/Devices inner cards: allow horizontal scroll as a graceful fallback
+   if the table still doesn't fit (e.g. very long device ids). */
+#catalogRawTabPane .card.card-flush,
+#catalogDevicesTabPane .card.card-flush { overflow-x: auto; }

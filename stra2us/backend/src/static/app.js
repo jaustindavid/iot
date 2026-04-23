@@ -26,6 +26,8 @@ document.querySelectorAll('.nav-links a').forEach(link => {
         // Fetch specifics immediately on tab switch
         if (targetId === 'dashboard') fetchStats();
         if (targetId === 'keys') fetchKeys();
+        if (targetId === 'admin_users') fetchAdminUsers();
+        if (targetId === 'catalogs') { closeCatalogDetail(); fetchCatalogList(); }
         if (targetId === 'logs') { logClientsLoaded = false; fetchLogs(); }
     });
 });
@@ -254,17 +256,42 @@ async function revokeClient(id) {
 }
 
 // --- ACL Editor ---
+// The editor is shared between HMAC clients (/keys/<id>/acl) and admin
+// users (/admin_users/<user>/acl). `_aclTarget` carries the save endpoint
+// and a refresh callback so the modal stays decoupled from its caller.
 let aclEditingClientId = null;
 let aclCurrentPermissions = [];
 let aclNewAccess = 'rw';
+let _aclTarget = null;  // { endpoint: string, refresh: () => void }
 
 function openAclModal(clientId) {
     const client = allClientsData[clientId];
-    aclEditingClientId = clientId;
-    aclCurrentPermissions = ((client.acl || {}).permissions || []).map(p => ({...p}));
+    _openAclEditor({
+        subjectLabel: clientId,
+        permissions: (client.acl || {}).permissions || [],
+        endpoint: `/keys/${clientId}/acl`,
+        refresh: fetchKeys,
+    });
+    aclEditingClientId = clientId;  // kept for any legacy reference
+}
+
+function openAdminAclModalFor(username) {
+    const entry = _adminUsersById[username];
+    if (!entry) return;
+    _openAclEditor({
+        subjectLabel: `admin: ${username}`,
+        permissions: (entry.acl || {}).permissions || [],
+        endpoint: `/admin_users/${encodeURIComponent(username)}/acl`,
+        refresh: fetchAdminUsers,
+    });
+}
+
+function _openAclEditor({ subjectLabel, permissions, endpoint, refresh }) {
+    _aclTarget = { endpoint, refresh };
+    aclCurrentPermissions = permissions.map(p => ({...p}));
     aclNewAccess = 'rw';
 
-    document.getElementById('aclClientName').textContent = clientId;
+    document.getElementById('aclClientName').textContent = subjectLabel;
     document.getElementById('aclNewPrefix').value = '';
     const toggle = document.getElementById('aclNewAccessToggle');
     toggle.textContent = 'rw';
@@ -278,6 +305,7 @@ function closeAclModal() {
     document.getElementById('aclModal').style.display = 'none';
     aclEditingClientId = null;
     aclCurrentPermissions = [];
+    _aclTarget = null;
 }
 
 function renderAclPermissions() {
@@ -328,21 +356,674 @@ function aclAddRule() {
 }
 
 async function saveAcl() {
-    const { ok, status, data } = await fetchAPI(`/keys/${aclEditingClientId}/acl`, 'PUT', {
+    if (!_aclTarget) return;
+    const { ok, status, data } = await fetchAPI(_aclTarget.endpoint, 'PUT', {
         permissions: aclCurrentPermissions
     });
     if (!ok) {
         alert(`Save failed (HTTP ${status}): ${data.detail || JSON.stringify(data)}`);
         return;
     }
+    const refresh = _aclTarget.refresh;
     closeAclModal();
-    fetchKeys();
+    if (refresh) refresh();
 }
 
 document.getElementById('aclModalClose').addEventListener('click', closeAclModal);
 document.getElementById('aclNewPrefix').addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); aclAddRule(); }
 });
+
+// 2a. Admin Users
+let _adminUsersById = {};
+
+async function fetchAdminUsers() {
+    const { ok, data } = await fetchAPI('/admin_users');
+    const tbody = document.getElementById('adminUsersTableBody');
+    if (!ok) {
+        tbody.innerHTML = `<tr><td colspan="4" class="text-muted">Failed to load (HTTP error).</td></tr>`;
+        return;
+    }
+    _adminUsersById = {};
+    data.forEach(u => { _adminUsersById[u.username] = u; });
+
+    const rows = [...data].sort((a, b) => a.username.localeCompare(b.username));
+    tbody.innerHTML = rows.map(u => {
+        const uname = escapeHtml(u.username);
+        const status = u.provisioned
+            ? '<span class="badge" style="background:rgba(0,255,136,0.12);color:var(--accent-success);border:1px solid rgba(0,255,136,0.3);">provisioned</span>'
+            : '<span class="badge" style="background:rgba(255,170,0,0.12);color:#ffaa00;border:1px solid rgba(255,170,0,0.3);" title="No ACL row in Redis — this user sees no KV. Run migrate_admin_acls.py or edit here.">needs setup</span>';
+        return `
+            <tr>
+                <td><strong>${uname}</strong></td>
+                <td>${formatAclSummary(u.acl)}</td>
+                <td>${status}</td>
+                <td><button class="btn-sm" onclick="openAdminAclModalFor('${uname}')">Edit ACL</button></td>
+            </tr>
+        `;
+    }).join('') || '<tr><td colspan="4" class="text-muted">No admin users in htpasswd.</td></tr>';
+}
+
+// 2b. Catalogs (M3a — read-only)
+// Reads published catalog YAMLs out of /kv/_catalog/* via the admin
+// scan + peek endpoints and renders them as a browsable table. Parsing
+// is client-side (js-yaml) — the server stores the YAML opaquely.
+
+const CATALOG_PREFIX = '_catalog/';
+
+// Cached parsed catalog for the currently-open app — lets the key editor
+// modal look up the var descriptor (type / range / help / ...) without
+// re-fetching. Cleared on back-nav or tab switch.
+let _currentCatalog = null;   // { app, vars: {name: varDescriptor} }
+
+function _formatScope(scope) {
+    if (!Array.isArray(scope)) return escapeHtml(String(scope || ''));
+    return scope.map(escapeHtml).join(',');
+}
+
+function _formatDefault(v) {
+    if (v.default_per_device) return '<em class="text-muted">per-device</em>';
+    if (v.default === undefined || v.default === null) return '<span class="text-muted">&mdash;</span>';
+    return escapeHtml(JSON.stringify(v.default));
+}
+
+function _formatRange(v) {
+    if (v.type === 'enum' && Array.isArray(v.values)) {
+        return v.values.map(x => `<code>${escapeHtml(String(x))}</code>`).join(' ');
+    }
+    if (Array.isArray(v.range) && v.range.length === 2) {
+        return `<code>[${escapeHtml(String(v.range[0]))}, ${escapeHtml(String(v.range[1]))}]</code>`;
+    }
+    return '<span class="text-muted">&mdash;</span>';
+}
+
+function _formatHelp(v) {
+    const raw = (v.help || '').trim();
+    if (!raw) return '';
+    // Collapse the first line as a summary; the full help hides in `title`.
+    const firstLine = raw.split('\n')[0];
+    return `<span title="${escapeHtml(raw)}">${escapeHtml(firstLine)}</span>`;
+}
+
+async function fetchCatalogList() {
+    const listEl = document.getElementById('catalogAppList');
+    const countEl = document.getElementById('catalogAppCount');
+    listEl.innerHTML = '<div class="text-muted">Loading&hellip;</div>';
+
+    const { ok, data } = await fetchAPI(`/kv_scan?prefix=${encodeURIComponent(CATALOG_PREFIX)}`);
+    if (!ok) {
+        listEl.innerHTML = `<div class="text-muted">Failed to list catalogs (HTTP ${data && data.detail ? escapeHtml(data.detail) : 'error'}).</div>`;
+        countEl.innerText = '--';
+        return;
+    }
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    countEl.innerText = items.length;
+
+    if (items.length === 0) {
+        listEl.innerHTML = `<div class="text-muted">No catalogs published yet. Apps publish with <code>stra2us catalog publish</code>; see <a href="https://github.com/" target="_blank" rel="noopener">tools/README.md</a>.</div>`;
+        return;
+    }
+
+    listEl.innerHTML = items.map(it => {
+        const app = it.key.startsWith(CATALOG_PREFIX) ? it.key.slice(CATALOG_PREFIX.length) : it.key;
+        const kb = (it.bytes / 1024).toFixed(1);
+        return `
+            <div class="catalog-app-row" onclick="openCatalogDetail('${escapeHtml(app)}')">
+                <span class="catalog-app-name">${escapeHtml(app)}</span>
+                <span class="catalog-app-meta">${kb} KB &middot; <code>${escapeHtml(it.key)}</code></span>
+                <span class="catalog-app-chevron">&rsaquo;</span>
+            </div>
+        `;
+    }).join('');
+}
+
+async function openCatalogDetail(app) {
+    document.getElementById('catalogListPane').classList.add('hidden');
+    document.getElementById('catalogDetailPane').classList.remove('hidden');
+    document.getElementById('catalogDetailTitle').innerText = app;
+    // Fresh app — lazy-loaded tabs must refetch.
+    _catalogTabsLoaded = {};
+    switchCatalogTab('variables');
+    closeDeviceDetail();
+
+    const errEl = document.getElementById('catalogDetailError');
+    const body = document.getElementById('catalogVarsBody');
+    errEl.classList.add('hidden');
+    body.innerHTML = `<tr><td colspan="6" class="text-muted">Loading&hellip;</td></tr>`;
+
+    const key = `${CATALOG_PREFIX}${app}`;
+    const { ok, data } = await fetchAPI(`/peek/kv/${encodeURIComponent(key).replace(/%2F/g, '/')}`);
+    if (!ok || data.status !== 'ok') {
+        errEl.innerText = `Could not load _catalog/${app}: ${data && data.status ? data.status : 'error'}`;
+        errEl.classList.remove('hidden');
+        body.innerHTML = '';
+        return;
+    }
+
+    const yamlText = typeof data.message === 'string' ? data.message : '';
+    if (!yamlText) {
+        errEl.innerText = `Stashed value at _catalog/${app} is not a string (got ${typeof data.message}). Was it published as YAML text?`;
+        errEl.classList.remove('hidden');
+        body.innerHTML = '';
+        return;
+    }
+
+    let cat;
+    try {
+        cat = jsyaml.load(yamlText);
+    } catch (e) {
+        errEl.innerText = `YAML parse error: ${e.message}`;
+        errEl.classList.remove('hidden');
+        body.innerHTML = '';
+        return;
+    }
+
+    if (!cat || typeof cat !== 'object' || !cat.vars) {
+        errEl.innerText = 'Catalog has no `vars` section. File a bug with the app owner — catalog is malformed.';
+        errEl.classList.remove('hidden');
+        body.innerHTML = '';
+        return;
+    }
+
+    _currentCatalog = { app, vars: cat.vars };
+
+    const rows = Object.entries(cat.vars).map(([name, v]) => {
+        v = v || {};
+        return `
+            <tr class="catalog-var-row" onclick="openKeyEditor('${escapeHtml(name)}')">
+                <td><code>${escapeHtml(name)}</code></td>
+                <td>${escapeHtml(v.type || '?')}</td>
+                <td>${_formatScope(v.scope)}</td>
+                <td>${_formatDefault(v)}</td>
+                <td>${_formatRange(v)}</td>
+                <td>${_formatHelp(v)}</td>
+            </tr>
+        `;
+    }).join('');
+    body.innerHTML = rows || `<tr><td colspan="6" class="text-muted">Catalog has no variables.</td></tr>`;
+}
+
+function closeCatalogDetail() {
+    _currentCatalog = null;
+    document.getElementById('catalogListPane').classList.remove('hidden');
+    document.getElementById('catalogDetailPane').classList.add('hidden');
+    // Reset to Variables tab so the next open starts in a known state.
+    switchCatalogTab('variables');
+    closeDeviceDetail();
+}
+
+
+// --- Catalog detail tabs (M3c) --------------------------------------------
+// Three tabs in the app detail pane: Variables | Devices | Raw. Data for
+// Devices/Raw is fetched lazily on first entry per app-open.
+
+const CATALOG_TABS = ['variables', 'devices', 'raw'];
+let _catalogTabsLoaded = {};  // { devices: bool, raw: bool }
+
+function switchCatalogTab(tab) {
+    if (!CATALOG_TABS.includes(tab)) return;
+    CATALOG_TABS.forEach(t => {
+        const pane = document.getElementById(`catalog${t.charAt(0).toUpperCase()+t.slice(1)}TabPane`);
+        const btn = document.querySelector(`.catalog-tab[data-tab="${t}"]`);
+        if (pane) pane.classList.toggle('hidden', t !== tab);
+        if (btn) btn.classList.toggle('active', t === tab);
+    });
+
+    if (tab === 'devices' && !_catalogTabsLoaded.devices) {
+        fetchCatalogDevices();
+    }
+    if (tab === 'raw' && !_catalogTabsLoaded.raw) {
+        fetchCatalogRaw();
+    }
+}
+
+// Parse the middle segment out of `<app>/<device>/<name>`. Keys with only
+// two segments (`<app>/<name>`) are app-scope and contribute no device.
+function _parseDeviceFromKey(app, keyName) {
+    if (!keyName.startsWith(`${app}/`)) return null;
+    const rest = keyName.slice(app.length + 1);
+    const firstSlash = rest.indexOf('/');
+    if (firstSlash < 0) return null;  // app-scope key, no device segment
+    return rest.slice(0, firstSlash);
+}
+
+async function _scanAppKeys(app) {
+    const { ok, data } = await fetchAPI(`/kv_scan?prefix=${encodeURIComponent(app + '/')}`);
+    if (!ok) return { ok: false, items: [] };
+    return { ok: true, items: Array.isArray(data.items) ? data.items : [], truncated: !!data.truncated };
+}
+
+async function fetchCatalogDevices() {
+    if (!_currentCatalog) return;
+    const app = _currentCatalog.app;
+    const listEl = document.getElementById('catalogDevicesList');
+    const countEl = document.getElementById('catalogDevicesCount');
+    listEl.innerHTML = '<div class="text-muted">Loading&hellip;</div>';
+
+    const scan = await _scanAppKeys(app);
+    if (!scan.ok) {
+        listEl.innerHTML = '<div class="text-muted">Failed to scan app keys.</div>';
+        countEl.innerText = '--';
+        return;
+    }
+
+    // Group per-device overrides.
+    const deviceOverrides = {};  // { deviceId: count }
+    for (const it of scan.items) {
+        const dev = _parseDeviceFromKey(app, it.key);
+        if (!dev) continue;
+        deviceOverrides[dev] = (deviceOverrides[dev] || 0) + 1;
+    }
+
+    const devices = Object.keys(deviceOverrides).sort();
+    countEl.innerText = devices.length;
+    _catalogTabsLoaded.devices = true;
+
+    if (devices.length === 0) {
+        listEl.innerHTML = `<div class="text-muted">No per-device overrides written yet. Devices appear here once something like <code>${escapeHtml(app)}/&lt;device&gt;/&lt;key&gt;</code> has been set.</div>`;
+        return;
+    }
+
+    listEl.innerHTML = devices.map(dev => {
+        const n = deviceOverrides[dev];
+        return `
+            <div class="catalog-app-row" onclick="openDeviceDetail('${escapeHtml(dev)}')">
+                <span class="catalog-app-name">${escapeHtml(dev)}</span>
+                <span class="catalog-app-meta">${n} override${n === 1 ? '' : 's'}</span>
+                <span class="catalog-app-chevron">&rsaquo;</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function closeDeviceDetail() {
+    document.getElementById('catalogDevicesListPane').classList.remove('hidden');
+    document.getElementById('catalogDeviceDetailPane').classList.add('hidden');
+}
+
+// Resolve an effective value for one var at one device, mirroring the
+// lookup chain used on-device: device override → app-scope → catalog default.
+async function openDeviceDetail(deviceId) {
+    if (!_currentCatalog) return;
+    const app = _currentCatalog.app;
+    document.getElementById('catalogDevicesListPane').classList.add('hidden');
+    document.getElementById('catalogDeviceDetailPane').classList.remove('hidden');
+    document.getElementById('catalogDeviceDetailTitle').innerHTML =
+        `<code>${escapeHtml(app)}/${escapeHtml(deviceId)}</code>`;
+
+    const body = document.getElementById('catalogDeviceEffectiveBody');
+    body.innerHTML = `<tr><td colspan="6" class="text-muted">Resolving&hellip;</td></tr>`;
+
+    const entries = Object.entries(_currentCatalog.vars);
+    // Fan out reads — bounded by the catalog size (usually < 50 vars).
+    const results = await Promise.all(entries.map(async ([name, v]) => {
+        v = v || {};
+        const scope = Array.isArray(v.scope) ? v.scope : [];
+        const [devRes, appRes] = await Promise.all([
+            scope.includes('device') ? _fetchScopeValue(app, name, deviceId) : Promise.resolve({ state: 'na', value: null }),
+            scope.includes('app') ? _fetchScopeValue(app, name, null) : Promise.resolve({ state: 'na', value: null }),
+        ]);
+        return { name, v, devRes, appRes };
+    }));
+
+    body.innerHTML = results.map(({ name, v, devRes, appRes }) => {
+        const catDefault = _formatDefault(v);
+        const devCell = _effectiveCell(devRes);
+        const appCell = _effectiveCell(appRes);
+
+        // Resolve effective + source.
+        let effHtml, sourceHtml;
+        if (devRes.state === 'set') {
+            effHtml = `<code>${escapeHtml(JSON.stringify(devRes.value))}</code>`;
+            sourceHtml = `<span class="badge source-device">device</span>`;
+        } else if (appRes.state === 'set') {
+            effHtml = `<code>${escapeHtml(JSON.stringify(appRes.value))}</code>`;
+            sourceHtml = `<span class="badge source-app">app</span>`;
+        } else if (v.default !== undefined && v.default !== null && !v.default_per_device) {
+            effHtml = `<code>${escapeHtml(JSON.stringify(v.default))}</code>`;
+            sourceHtml = `<span class="badge source-default">default</span>`;
+        } else {
+            effHtml = `<span class="text-muted">(unset)</span>`;
+            sourceHtml = `<span class="badge source-unset">&mdash;</span>`;
+        }
+
+        return `
+            <tr class="catalog-var-row" onclick="openKeyEditorForDevice('${escapeHtml(name)}','${escapeHtml(deviceId)}')">
+                <td><code>${escapeHtml(name)}</code></td>
+                <td>${devCell}</td>
+                <td>${appCell}</td>
+                <td>${catDefault}</td>
+                <td>${effHtml}</td>
+                <td>${sourceHtml}</td>
+            </tr>
+        `;
+    }).join('') || `<tr><td colspan="6" class="text-muted">Catalog has no variables.</td></tr>`;
+}
+
+function _effectiveCell(res) {
+    if (res.state === 'na') return `<span class="text-muted">&mdash;</span>`;
+    if (res.state === 'unset') return `<span class="text-muted">(unset)</span>`;
+    if (res.state === 'error') return `<span class="text-muted">(err)</span>`;
+    return `<code>${escapeHtml(JSON.stringify(res.value))}</code>`;
+}
+
+// Open the M3b key editor from a device-effective row, pre-filling the
+// device id so the Device pane is ready to save.
+function openKeyEditorForDevice(keyName, deviceId) {
+    openKeyEditor(keyName);
+    const input = document.getElementById('deviceIdInput');
+    if (input) {
+        input.value = deviceId;
+        loadDeviceScope();
+    }
+}
+
+async function fetchCatalogRaw() {
+    if (!_currentCatalog) return;
+    const app = _currentCatalog.app;
+    const body = document.getElementById('catalogRawBody');
+    const countEl = document.getElementById('catalogRawCount');
+    document.getElementById('catalogRawAppLabel').innerText = `${app}/`;
+    body.innerHTML = `<tr><td colspan="4" class="text-muted">Loading&hellip;</td></tr>`;
+
+    const scan = await _scanAppKeys(app);
+    if (!scan.ok) {
+        body.innerHTML = `<tr><td colspan="4" class="text-muted">Failed to scan app keys.</td></tr>`;
+        countEl.innerText = '--';
+        return;
+    }
+
+    _catalogTabsLoaded.raw = true;
+    countEl.innerText = scan.items.length;
+
+    if (scan.items.length === 0) {
+        body.innerHTML = `<tr><td colspan="4" class="text-muted">No KV keys written under <code>${escapeHtml(app)}/</code> yet.</td></tr>`;
+        return;
+    }
+
+    const catalogVars = new Set(Object.keys(_currentCatalog.vars || {}));
+
+    body.innerHTML = scan.items.map(it => {
+        const keyName = it.key;
+        const dev = _parseDeviceFromKey(app, keyName);
+        // Leaf name is the final path segment, which is the catalog var name.
+        const leaf = keyName.slice(keyName.lastIndexOf('/') + 1);
+        const scopeLabel = dev
+            ? `<span class="badge source-device">device: ${escapeHtml(dev)}</span>`
+            : `<span class="badge source-app">app</span>`;
+        const tracked = catalogVars.has(leaf);
+        const catalogLabel = tracked
+            ? `<span class="badge source-default">in catalog</span>`
+            : `<span class="badge source-unset" title="This key is not declared in the published catalog. Device firmware can still read it, but edits bypass the catalog contract.">off-catalog</span>`;
+        return `
+            <tr>
+                <td><code>${escapeHtml(keyName)}</code></td>
+                <td>${scopeLabel}</td>
+                <td>${it.bytes} B</td>
+                <td>${catalogLabel}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+
+// --- Key editor modal (M3b) ----------------------------------------------
+//
+// Opens scoped to one (app, key) pair. Reads current values at app and
+// device scope (no writes). Save/Unset are the only paths that mutate —
+// explicit user action each time. See invariant 1 in catalog_spec.md:
+// never materialize placeholder empty-string writes.
+
+let _editorContext = null;  // { app, keyName, var }
+
+function _kvPath(app, keyName, device) {
+    return device ? `${app}/${device}/${keyName}` : `${app}/${keyName}`;
+}
+
+// The admin POST /kv handler json.loads() the value string and falls back
+// to raw string on parse error. Encode per type so round-trips match the
+// CLI's msgpack shape (ints → msgpack int, strings → msgpack str, etc.).
+function _encodeForAdmin(varDesc, raw) {
+    switch (varDesc.type) {
+        case 'int':
+        case 'float':
+        case 'bool':
+            return String(raw);               // JSON-parseable: "60", "true"
+        case 'enum':
+        case 'string':
+        default:
+            return String(raw);               // raw string; admin falls through
+    }
+}
+
+// Client-side validation mirroring catalog.py coerce_value. Returns
+// {ok: true, value} or {ok: false, msg}.
+function _validateInput(varDesc, rawStr) {
+    const s = String(rawStr);
+    if (s === '') return { ok: false, msg: 'value required (use Unset to clear)' };
+    const t = varDesc.type;
+    if (t === 'int') {
+        if (!/^-?\d+$/.test(s)) return { ok: false, msg: `${t} expected integer, got ${JSON.stringify(s)}` };
+        const n = parseInt(s, 10);
+        if (Array.isArray(varDesc.range) && varDesc.range.length === 2) {
+            const [lo, hi] = varDesc.range;
+            if (n < lo || n > hi) return { ok: false, msg: `value ${n} outside recommended range [${lo}, ${hi}]` };
+        }
+        return { ok: true, value: n };
+    }
+    if (t === 'float') {
+        if (!/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(s)) return { ok: false, msg: `float expected, got ${JSON.stringify(s)}` };
+        const n = parseFloat(s);
+        if (Array.isArray(varDesc.range) && varDesc.range.length === 2) {
+            const [lo, hi] = varDesc.range;
+            if (n < lo || n > hi) return { ok: false, msg: `value ${n} outside recommended range [${lo}, ${hi}]` };
+        }
+        return { ok: true, value: n };
+    }
+    if (t === 'bool') {
+        const lc = s.toLowerCase();
+        if (['true', '1', 'yes', 'y', 'on'].includes(lc)) return { ok: true, value: true };
+        if (['false', '0', 'no', 'n', 'off'].includes(lc)) return { ok: true, value: false };
+        return { ok: false, msg: `bool expected (true/false), got ${JSON.stringify(s)}` };
+    }
+    if (t === 'enum') {
+        const vals = Array.isArray(varDesc.values) ? varDesc.values : [];
+        if (!vals.includes(s)) return { ok: false, msg: `enum value must be one of: ${vals.join(', ')}` };
+        return { ok: true, value: s };
+    }
+    // string
+    return { ok: true, value: s };
+}
+
+function _editControlHtml(scope, varDesc) {
+    const id = `editInput_${scope}`;
+    const t = varDesc.type;
+    if (t === 'enum' && Array.isArray(varDesc.values)) {
+        const opts = varDesc.values
+            .map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)
+            .join('');
+        return `<select id="${id}"><option value="">&mdash; select &mdash;</option>${opts}</select>`;
+    }
+    if (t === 'bool') {
+        return `<select id="${id}"><option value="">&mdash; select &mdash;</option><option value="true">true</option><option value="false">false</option></select>`;
+    }
+    if (t === 'int' || t === 'float') {
+        let attrs = 'type="number"';
+        if (t === 'float') attrs += ' step="any"';
+        if (Array.isArray(varDesc.range) && varDesc.range.length === 2) {
+            attrs += ` min="${escapeHtml(String(varDesc.range[0]))}" max="${escapeHtml(String(varDesc.range[1]))}"`;
+        }
+        return `<input id="${id}" ${attrs} placeholder="new value">`;
+    }
+    return `<input id="${id}" type="text" placeholder="new value">`;
+}
+
+function _renderCurrent(state, value) {
+    if (state === 'unset') return `<span class="text-muted">(unset)</span>`;
+    if (state === 'error') return `<span class="text-muted">(error: ${escapeHtml(String(value))})</span>`;
+    return `<code>${escapeHtml(JSON.stringify(value))}</code>`;
+}
+
+async function _fetchScopeValue(app, keyName, device) {
+    const path = _kvPath(app, keyName, device);
+    const { ok, data } = await fetchAPI(`/peek/kv/${path}`);
+    if (!ok) return { state: 'error', value: `HTTP ${data && data.detail ? data.detail : 'err'}` };
+    if (data.status === 'empty' || data.message === null || data.message === '') {
+        return { state: 'unset', value: null };
+    }
+    return { state: 'set', value: data.message };
+}
+
+function openKeyEditor(keyName) {
+    if (!_currentCatalog) return;
+    const v = _currentCatalog.vars[keyName];
+    if (!v) return;
+    _editorContext = { app: _currentCatalog.app, keyName, var: v };
+
+    const hasApp = Array.isArray(v.scope) && v.scope.includes('app');
+    const hasDevice = Array.isArray(v.scope) && v.scope.includes('device');
+
+    document.getElementById('keyEditorTitle').innerHTML =
+        `<code>${escapeHtml(keyName)}</code> <span class="badge badge-type">${escapeHtml(v.type)}</span>`;
+    document.getElementById('keyEditorMeta').innerHTML = `
+        <div><strong>App:</strong> <code>${escapeHtml(_currentCatalog.app)}</code></div>
+        <div><strong>Scope:</strong> ${_formatScope(v.scope)}</div>
+        <div><strong>Catalog default:</strong> ${_formatDefault(v)}</div>
+        <div><strong>Range / values:</strong> ${_formatRange(v)}</div>
+        ${v.help ? `<div class="key-editor-help">${escapeHtml(v.help.trim())}</div>` : ''}
+        <div class="form-hint-sm">Ranges are <em>recommended</em>, not enforced on-device — the firmware is the arbiter.</div>
+    `;
+
+    // App pane
+    const appPane = document.getElementById('keyEditorAppPane');
+    if (hasApp) {
+        appPane.innerHTML = `
+            <h4>App scope <span class="form-hint-sm">&mdash; <code>${escapeHtml(_currentCatalog.app)}/${escapeHtml(keyName)}</code></span></h4>
+            <div class="key-editor-row">
+                <div class="key-editor-current">Current: <span id="currentApp">&hellip;</span></div>
+                <div class="key-editor-edit">
+                    ${_editControlHtml('app', v)}
+                    <button class="primary-btn btn-sm" onclick="saveScope('app')">Save</button>
+                    <button class="btn-sm btn-danger" onclick="unsetScope('app')">Unset</button>
+                </div>
+                <div class="key-editor-error hidden" id="errorApp"></div>
+            </div>
+        `;
+        appPane.classList.remove('hidden');
+        _fetchScopeValue(_editorContext.app, keyName, null).then(res => {
+            document.getElementById('currentApp').innerHTML = _renderCurrent(res.state, res.value);
+        });
+    } else {
+        appPane.innerHTML = '';
+        appPane.classList.add('hidden');
+    }
+
+    // Device pane
+    const devPane = document.getElementById('keyEditorDevicePane');
+    if (hasDevice) {
+        devPane.innerHTML = `
+            <h4>Device scope</h4>
+            <div class="key-editor-row">
+                <div class="key-editor-device-picker">
+                    <input type="text" id="deviceIdInput" placeholder="device id (e.g. ricky)">
+                    <button class="btn-sm" onclick="loadDeviceScope()">Load</button>
+                </div>
+                <div class="key-editor-current">Current: <span id="currentDevice" class="text-muted">(enter device id and press Load)</span></div>
+                <div class="key-editor-edit hidden" id="deviceEditRow">
+                    ${_editControlHtml('device', v)}
+                    <button class="primary-btn btn-sm" onclick="saveScope('device')">Save</button>
+                    <button class="btn-sm btn-danger" onclick="unsetScope('device')">Unset</button>
+                </div>
+                <div class="key-editor-error hidden" id="errorDevice"></div>
+            </div>
+        `;
+        devPane.classList.remove('hidden');
+    } else {
+        devPane.innerHTML = '';
+        devPane.classList.add('hidden');
+    }
+
+    document.getElementById('keyEditorModal').style.display = 'block';
+}
+
+function closeKeyEditor() {
+    _editorContext = null;
+    document.getElementById('keyEditorModal').style.display = 'none';
+}
+
+async function loadDeviceScope() {
+    if (!_editorContext) return;
+    const devId = document.getElementById('deviceIdInput').value.trim();
+    if (!devId) return;
+    document.getElementById('currentDevice').innerHTML = '&hellip;';
+    const res = await _fetchScopeValue(_editorContext.app, _editorContext.keyName, devId);
+    document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
+    document.getElementById('deviceEditRow').classList.remove('hidden');
+}
+
+function _scopeDevice(scope) {
+    if (scope === 'app') return null;
+    const devId = document.getElementById('deviceIdInput').value.trim();
+    if (!devId) throw new Error('enter a device id before saving at device scope');
+    return devId;
+}
+
+async function saveScope(scope) {
+    if (!_editorContext) return;
+    const errEl = document.getElementById(scope === 'app' ? 'errorApp' : 'errorDevice');
+    errEl.classList.add('hidden');
+    try {
+        const device = _scopeDevice(scope);
+        const input = document.getElementById(`editInput_${scope}`);
+        const validation = _validateInput(_editorContext.var, input.value);
+        if (!validation.ok) {
+            errEl.innerText = validation.msg;
+            errEl.classList.remove('hidden');
+            return;
+        }
+        const path = _kvPath(_editorContext.app, _editorContext.keyName, device);
+        const body = { value: _encodeForAdmin(_editorContext.var, input.value) };
+        const res = await fetchAPI(`/kv/${path}`, 'POST', body);
+        if (!res.ok) {
+            errEl.innerText = `write failed: HTTP ${res.status}`;
+            errEl.classList.remove('hidden');
+            return;
+        }
+        // Re-fetch to show the stored (post-msgpack-round-trip) value.
+        const fresh = await _fetchScopeValue(_editorContext.app, _editorContext.keyName, device);
+        document.getElementById(scope === 'app' ? 'currentApp' : 'currentDevice').innerHTML =
+            _renderCurrent(fresh.state, fresh.value);
+        input.value = '';
+    } catch (e) {
+        errEl.innerText = e.message;
+        errEl.classList.remove('hidden');
+    }
+}
+
+async function unsetScope(scope) {
+    if (!_editorContext) return;
+    const errEl = document.getElementById(scope === 'app' ? 'errorApp' : 'errorDevice');
+    errEl.classList.add('hidden');
+    try {
+        const device = _scopeDevice(scope);
+        const path = _kvPath(_editorContext.app, _editorContext.keyName, device);
+        const human = device ? `${_editorContext.app}/${device}/${_editorContext.keyName}` : `${_editorContext.app}/${_editorContext.keyName}`;
+        if (!confirm(`Delete ${human}? The scope will fall back to the next layer (device → app → compiled-in default).`)) return;
+        const res = await fetchAPI(`/kv/${path}`, 'DELETE');
+        if (!res.ok) {
+            errEl.innerText = `delete failed: HTTP ${res.status}`;
+            errEl.classList.remove('hidden');
+            return;
+        }
+        document.getElementById(scope === 'app' ? 'currentApp' : 'currentDevice').innerHTML =
+            _renderCurrent('unset', null);
+    } catch (e) {
+        errEl.innerText = e.message;
+        errEl.classList.remove('hidden');
+    }
+}
+
 
 // 3. Activity Logs
 let logFilterClients = new Set();
@@ -580,5 +1261,18 @@ document.querySelectorAll('.nav-links a').forEach(link => {
     });
 });
 
+async function applyWhoami() {
+    // Hide nav entries the caller can't use. Backend still enforces —
+    // this is UX, not a security boundary.
+    const { ok, data } = await fetchAPI('/whoami');
+    if (!ok || !data) return;
+    if (!data.is_superuser) {
+        document.querySelectorAll('.nav-superuser').forEach(el => {
+            el.style.display = 'none';
+        });
+    }
+}
+
 // Init
+applyWhoami();
 fetchStats();

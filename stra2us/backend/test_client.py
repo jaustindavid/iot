@@ -39,32 +39,75 @@ def generate_signature(secret_hex, uri, body, timestamp):
     payload = uri.encode('utf-8') + body + str(timestamp).encode('utf-8')
     return hmac.new(secret_bytes, payload, hashlib.sha256).hexdigest()
 
-def make_request(method, path, body_data, client_id, secret, base_url, params=None):
+# --- Response signature verification ---
+# The server signs `/kv/*` and `/q/*` responses with `X-Response-Signature`
+# (HMAC-SHA256 over URI + body + ts, keyed by the same shared secret the
+# client used to sign its request). Missing headers are treated as a failure
+# unless `--no-verify-response` is passed, which lets us talk to pre-signing
+# servers during the rollout window.
+
+def verify_response(resp, uri, secret_hex, enforce, max_drift=300):
+    ts_hdr  = resp.headers.get("X-Response-Timestamp")
+    sig_hdr = resp.headers.get("X-Response-Signature")
+
+    if ts_hdr is None or sig_hdr is None:
+        if enforce:
+            logging.error(
+                "Response missing signature headers "
+                f"(X-Response-Timestamp={ts_hdr!r}, X-Response-Signature={sig_hdr!r}). "
+                "Server may be pre-signing; pass --no-verify-response to skip."
+            )
+            sys.exit(2)
+        return
+
+    try:
+        ts = int(ts_hdr)
+    except ValueError:
+        logging.error(f"Malformed X-Response-Timestamp: {ts_hdr!r}")
+        sys.exit(2)
+
+    now = int(time.time())
+    if abs(now - ts) > max_drift:
+        logging.error(f"Response timestamp drift {now - ts}s exceeds {max_drift}s — possible replay.")
+        sys.exit(2)
+
+    expected = generate_signature(secret_hex, uri, resp.content, ts)
+    if not hmac.compare_digest(expected, sig_hdr):
+        logging.error(
+            f"Response signature mismatch on {uri}. "
+            f"expected={expected[:16]}… got={sig_hdr[:16]}…"
+        )
+        sys.exit(2)
+
+def make_request(method, path, body_data, client_id, secret, base_url,
+                 params=None, verify_response_sig=True):
     uri = f"/{path}"
-    
+
     if body_data is not None:
         body = msgpack.packb(body_data)
     else:
         body = b""
-        
+
     timestamp = int(time.time())
     signature = generate_signature(secret, uri, body, timestamp)
-    
+
     headers = {
         "X-Client-ID": client_id,
         "X-Timestamp": str(timestamp),
         "X-Signature": signature,
         "Content-Type": "application/x-msgpack"
     }
-    
+
     # Ensure URL doesn't have trailing slash if path has leading one
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     try:
         with httpx.Client(timeout=10.0) as client:
             if method == "POST":
-                return client.post(url, params=params, content=body, headers=headers)
+                resp = client.post(url, params=params, content=body, headers=headers)
             elif method == "GET":
-                return client.get(url, params=params, headers=headers)
+                resp = client.get(url, params=params, headers=headers)
+            else:
+                raise ValueError(f"unsupported method {method}")
     except httpx.ConnectError:
         logging.error(f"FATAL: Could not connect to {base_url}.")
         if "127.0.0.1" in base_url or "localhost" in base_url:
@@ -73,6 +116,12 @@ def make_request(method, path, body_data, client_id, secret, base_url, params=No
     except httpx.RequestError as e:
         logging.error(f"Request failed: {e}")
         sys.exit(1)
+
+    # Only verify on success-class responses — 4xx errors from `verify_device_request`
+    # are raised before `signed_response` runs and therefore won't carry the headers.
+    if 200 <= resp.status_code < 300:
+        verify_response(resp, uri, secret, enforce=verify_response_sig)
+    return resp
 
 def try_parse_data(text):
     try:
@@ -93,7 +142,8 @@ def command_publish(args):
     params = {}
     if args.ttl is not None:
         params["ttl"] = args.ttl
-    resp = make_request("POST", f"q/{args.topic}", data, args.client_id, args.secret, args.url, params=params)
+    resp = make_request("POST", f"q/{args.topic}", data, args.client_id, args.secret, args.url,
+                        params=params, verify_response_sig=not args.no_verify_response)
     
     if resp.status_code == 200:
         logging.info(f"Published to {args.topic}: {data}")
@@ -122,7 +172,8 @@ def command_follow(args):
         while True:
             # Drain the queue fully before sleeping
             while True:
-                resp = make_request("GET", f"q/{args.topic}", None, args.client_id, args.secret, args.url, params=params)
+                resp = make_request("GET", f"q/{args.topic}", None, args.client_id, args.secret, args.url,
+                                    params=params, verify_response_sig=not args.no_verify_response)
 
                 if resp.status_code == 200:
                     msg = parse_response(resp)
@@ -142,7 +193,8 @@ def command_follow(args):
 
 def command_set(args):
     data = try_parse_data(args.value)
-    resp = make_request("POST", f"kv/{args.key}", data, args.client_id, args.secret, args.url)
+    resp = make_request("POST", f"kv/{args.key}", data, args.client_id, args.secret, args.url,
+                        verify_response_sig=not args.no_verify_response)
     
     if resp.status_code == 200:
         logging.info(f"Set {args.key} = {data}")
@@ -150,7 +202,8 @@ def command_set(args):
         logging.error(f"Failed to set: {resp.status_code} - {resp.text}")
 
 def command_get(args):
-    resp = make_request("GET", f"kv/{args.key}", None, args.client_id, args.secret, args.url)
+    resp = make_request("GET", f"kv/{args.key}", None, args.client_id, args.secret, args.url,
+                        verify_response_sig=not args.no_verify_response)
     
     if resp.status_code == 200:
         msg = parse_response(resp)
@@ -167,7 +220,9 @@ def main():
     parser.add_argument("--client-id", required=True, help="Registered Client ID")
     parser.add_argument("--secret", required=True, help="Client Secret (Hex)")
     parser.add_argument("--url", default=BASE_URL, help="Base URL of the service")
-    
+    parser.add_argument("--no-verify-response", action="store_true",
+                        help="Skip X-Response-Signature verification (for talking to pre-signing servers).")
+
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     # Publish Command

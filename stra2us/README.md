@@ -61,6 +61,11 @@ Then open `http://<your-ip>:8000/admin` in a browser.
 
 Full API documentation is in [`docs/api.md`](docs/api.md).
 
+Apps built on Stra2us can describe their KV variables with a
+per-app YAML *catalog* (`<app>.s2s.yaml`), consumed by the
+[reference CLI in `tools/`](tools/README.md). See
+[`docs/catalog_spec.md`](docs/catalog_spec.md) for the schema.
+
 ### Quick Reference
 
 | Endpoint | Auth | Description |

@@ -22,9 +22,12 @@ async def admin_auth_middleware(request: Request, call_next):
     if path.startswith("/admin") or path.startswith("/api/admin"):
         # Check cookie first
         cookie = request.cookies.get("admin_session")
-        if cookie and verify_session_token(cookie):
-            return await call_next(request)
-            
+        if cookie:
+            cookie_user = verify_session_token(cookie)
+            if cookie_user:
+                request.state.admin_user = cookie_user
+                return await call_next(request)
+
         # Check Basic Auth
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Basic "):
@@ -32,20 +35,20 @@ async def admin_auth_middleware(request: Request, call_next):
                 encoded_creds = auth_header.split(" ")[1]
                 decoded_creds = base64.b64decode(encoded_creds).decode("utf-8")
                 username, password = decoded_creds.split(":", 1)
-                
+
                 if verify_password(username, password):
-                    # Valid! Proceed with request
+                    # Valid — hand the username to downstream deps for ACL checks.
+                    request.state.admin_user = username
                     response = await call_next(request)
-                    # Issue session cookie
                     token = generate_session_token(username)
                     response.set_cookie(key="admin_session", value=token, httponly=True)
                     return response
             except Exception:
                 pass # Fall through to 401
-                
+
         # Not authenticated
         return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Admin Area"'})
-        
+
     return await call_next(request)
 
 @app.middleware("http")
@@ -111,10 +114,11 @@ app.include_router(device_router, tags=["device"])
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/admin", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True), name="static")
 
-# Mount Firmware OTA directory (provided via volume mount in Docker)
-FIRMWARE_DIR = "/firmware"
-if not os.path.exists(FIRMWARE_DIR):
-    os.makedirs(FIRMWARE_DIR, exist_ok=True)
+# Mount Firmware OTA directory. Default /firmware matches the Docker
+# volume mount in docker-compose.yml; override with STRA2US_FIRMWARE_DIR
+# for bare local dev or non-container deployments.
+FIRMWARE_DIR = os.environ.get("STRA2US_FIRMWARE_DIR", "/firmware")
+os.makedirs(FIRMWARE_DIR, exist_ok=True)
 app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 
 @app.get("/health")
