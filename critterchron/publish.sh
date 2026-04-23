@@ -10,12 +10,12 @@ then
   echo "publishing all ..."
   for CRIT in agents/*
   do
-    python tools/publish_ir.py $CRIT --server $STRA2US_HOST --client-id $STRA2US_CLIENT --secret $STRA2US_KEY $@
+    python tools/publish_ir.py $CRIT $@
   done
 elif [ -f agents/$arg.crit ]
 then
   echo ">> python tools/publish_ir.py agents/$arg.crit $@"
-  python tools/publish_ir.py agents/$arg.crit $@ --server $STRA2US_HOST --client-id $STRA2US_CLIENT --secret $STRA2US_KEY
+  python tools/publish_ir.py agents/$arg.crit $@
 else
   echo "agents/$arg.crit does not exist; nothing to do"
 fi

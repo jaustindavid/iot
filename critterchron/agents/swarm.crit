@@ -28,7 +28,7 @@ locust:
   diagonal: allowed
   diagonal_cost: 1.414
   penalty lit cell: 1.5        # prefer dark lanes — less disruptive
-  penalty occupied cell: 5
+  penalty occupied cell: 50
 
 --- behavior ---
 locust:
