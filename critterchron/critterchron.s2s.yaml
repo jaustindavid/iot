@@ -148,7 +148,11 @@ vars:
       Smoothed-brightness threshold at which the night palette engages.
       Schmitt hysteresis against `night_exit_brightness`. Defaults to
       MIN_BRIGHTNESS (per-device), i.e. the floor-clamp regime itself.
-      use 0 to disable
+      Sentinel: 0 disables night mode entirely (force day palette). The
+      smoothed brightness can't reach 0 because min_brightness is
+      floored at 1, so 0 had no legitimate "enter" meaning — reclaimed
+      as the disable signal. Live flip from positive → 0 exits night
+      mode immediately without waiting for bri to climb above exit.
 
   night_exit_brightness:
     type: int

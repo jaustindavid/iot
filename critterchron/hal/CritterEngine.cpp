@@ -1257,10 +1257,16 @@ void CritterEngine::processAgent(Agent& a) {
             return;
         }
 
-        // ---- seek [nearest] [agent|landmark] <target>
+        // ---- seek [nearest] [free] [agent|landmark] <target>
         //           [with state == <name>]
         //           [(on|not on) <k>]
         //           [timeout N] ----
+        //   `free`: drop candidates occupied by another live agent, and
+        //   claim the winning cell even when <target> is `current`
+        //   (classic seek only claims for `missing`/`extra`). Makes
+        //   `seek nearest free current` behave right in swarms — without
+        //   it every locust seeks the same Manhattan-nearest leaf and
+        //   pile-ups saturate A*.
         //   OR gradient form:
         //       seek (highest|lowest) marker <m> [(>|<) N]
         //                                        [on landmark <l>]
@@ -1401,6 +1407,8 @@ void CritterEngine::processAgent(Agent& a) {
 
             int i = 1;
             if (i < t && strEq(tok[i], "nearest")) ++i;
+            bool want_free = false;
+            if (i < t && strEq(tok[i], "free")) { want_free = true; ++i; }
             const char* target_kind = nullptr;  // "agent"/"landmark"/nullptr
             if (i < t && (strEq(tok[i], "agent") || strEq(tok[i], "landmark"))) {
                 target_kind = tok[i]; ++i;
@@ -1474,6 +1482,28 @@ void CritterEngine::processAgent(Agent& a) {
                     }
             }
 
+            // `free` occupancy filter: drop any cell where another live
+            // agent currently stands. Claims (above, in the tile-state
+            // branch) block *pending arrivals*; this blocks *current
+            // occupants*. Agent-targeted seeks skip this — the agent
+            // IS the target.
+            if (want_free && nc > 0 &&
+                    !(target_kind && strEq(target_kind, "agent"))) {
+                int w = 0;
+                for (int k = 0; k < nc; ++k) {
+                    bool occupied = false;
+                    for (uint16_t ai = 0; ai < agent_count_; ++ai) {
+                        const Agent& o = agents_[ai];
+                        if (!o.alive || o.id == a.id) continue;
+                        if (o.pos.x == cands[k].x && o.pos.y == cands[k].y) {
+                            occupied = true; break;
+                        }
+                    }
+                    if (!occupied) cands[w++] = cands[k];
+                }
+                nc = w;
+            }
+
             if (filter_mode && filter_kind) {
                 bool want_on = strEq(filter_mode, "on");
                 int w = 0;
@@ -1494,7 +1524,9 @@ void CritterEngine::processAgent(Agent& a) {
             }
 
             if (have && !(best.x == a.pos.x && best.y == a.pos.y)) {
-                if (target_type && (strEq(target_type, "missing") || strEq(target_type, "extra")))
+                if (target_type && (strEq(target_type, "missing") ||
+                                    strEq(target_type, "extra") ||
+                                    (want_free && strEq(target_type, "current"))))
                     grid_[best.x][best.y].claimant = a.id;
 
                 Point step;

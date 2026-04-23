@@ -495,6 +495,17 @@ static void telemetry_worker() {
             g_cfg.close();
             Log.info("ota_loaded publish=%d %s", s, msg);
             g_ota_pub_loaded = false;
+
+            // Nudge the next heartbeat to fire ~5s from now so the
+            // `script=<name>@<sha>` confirmation lands promptly instead
+            // of waiting up to `heartbeep` seconds (300s default) for
+            // the normal cadence. 5s (not 0s) gives `ota_loaded` room
+            // to land on the event stream as its own distinct record
+            // and avoids back-to-back publishes on the same socket.
+            // Next heartbeat success resets next_interval_ms to hb_ms
+            // at the bottom of the loop — no sticky state.
+            last_attempt_ms  = now;
+            next_interval_ms = 5000;
         }
 
         bool due = first || edge ||
@@ -762,7 +773,11 @@ void loop() {
 
         int min_b = g_cfg.get_int("min_brightness", MIN_BRIGHTNESS);
         int max_b = g_cfg.get_int("max_brightness", MAX_BRIGHTNESS);
-        if (min_b < 0)   min_b = 0;
+        // Floor at 1, not 0: bri=0 turns the panel off entirely and is
+        // reserved as a sentinel (see night_enter_brightness<=0 above).
+        // Catalog range is already [1,255] but belt-and-suspenders here
+        // so a pre-catalog KV or compiled-in 0 can't slip through.
+        if (min_b < 1)   min_b = 1;
         if (max_b > 255) max_b = 255;
         if (min_b > max_b) min_b = max_b;
         uint8_t target = g_light.update(raw, (uint8_t)min_b, (uint8_t)max_b);
@@ -792,16 +807,28 @@ void loop() {
         // even under adversarial input.
         int ne = g_cfg.get_int("night_enter_brightness", NIGHT_ENTER_BRIGHTNESS);
         int nx = g_cfg.get_int("night_exit_brightness",  NIGHT_EXIT_BRIGHTNESS);
-        if (ne < 0)   ne = 0;
-        if (ne > 255) ne = 255;
-        if (nx < ne + 1) nx = ne + 1;
-        if (nx > 255)    nx = 255;
-        if (!g_engine.nightMode() && bri <= (uint8_t)ne) {
-            g_engine.setNightMode(true);
-            Log.info("night: ON (bri=%u <= %d)", (unsigned)bri, ne);
-        } else if (g_engine.nightMode() && bri >= (uint8_t)nx) {
-            g_engine.setNightMode(false);
-            Log.info("night: OFF (bri=%u >= %d)", (unsigned)bri, nx);
+        // Sentinel: night_enter_brightness <= 0 disables night mode
+        // entirely. `bri` can't reach 0 (min_brightness floored >= 1
+        // below), so there was no legitimate reason to enter at 0 —
+        // reclaim it as "force day palette." If we're already in night
+        // mode when the sentinel lands (KV flipped live), exit
+        // immediately rather than wait for bri to climb above nx.
+        if (ne <= 0) {
+            if (g_engine.nightMode()) {
+                g_engine.setNightMode(false);
+                Log.info("night: OFF (disabled via night_enter_brightness<=0)");
+            }
+        } else {
+            if (ne > 255) ne = 255;
+            if (nx < ne + 1) nx = ne + 1;
+            if (nx > 255)    nx = 255;
+            if (!g_engine.nightMode() && bri <= (uint8_t)ne) {
+                g_engine.setNightMode(true);
+                Log.info("night: ON (bri=%u <= %d)", (unsigned)bri, ne);
+            } else if (g_engine.nightMode() && bri >= (uint8_t)nx) {
+                g_engine.setNightMode(false);
+                Log.info("night: OFF (bri=%u >= %d)", (unsigned)bri, nx);
+            }
         }
 
         if (now - last_light_log_ms >= 5000) {

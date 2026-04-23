@@ -191,6 +191,6 @@ doozer:
   set color = idle_y
 
   if random 20%:
-    wander avoiding current
+    wander avoiding any
   pause
   done

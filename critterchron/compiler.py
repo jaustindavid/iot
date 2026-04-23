@@ -854,7 +854,7 @@ class CritCompiler:
         # — marker-as-filter on an otherwise normal seek. Only the filter
         # part needs canonicalization; leave the rest alone.
         m = re.match(
-            r'^(?P<head>seek(?:\s+nearest)?(?:\s+(?:landmark|agent))?\s+\w+'
+            r'^(?P<head>seek(?:\s+nearest)?(?:\s+free)?(?:\s+(?:landmark|agent))?\s+\w+'
             r'(?:\s+with\s+state\s*==\s*\w+)?)'
             r'\s+on\s+(?P<m>\w+)'
             r'(?:\s*(?P<op>[<>])\s*(?P<n>\d+))?'
@@ -905,7 +905,7 @@ class CritCompiler:
         if_on_re = re.compile(r'^(if on )(\w+)(\s.*)?$')
         if_standing_re = re.compile(r'^(if standing on )(\w+)(\s.*)?$')
         if_exist_re = re.compile(r'^(if )(\w+)$')
-        seek_re = re.compile(r'^(seek\s+)(nearest\s+)?(\w+)(\s.*)?$')
+        seek_re = re.compile(r'^(seek\s+)(nearest\s+)?(free\s+)?(\w+)(\s.*)?$')
         despawn_re = re.compile(r'^despawn\s+(\w+)(\s.*)?$')
 
         for agent, insts in self.ir["behaviors"].items():
@@ -969,8 +969,9 @@ class CritCompiler:
                 if m:
                     seek_prefix = m.group(1)
                     nearest = m.group(2) or ''
-                    name = m.group(3)
-                    rest = m.group(4) or ''
+                    free = m.group(3) or ''
+                    name = m.group(4)
+                    rest = m.group(5) or ''
                     # `seek highest|lowest marker X` and `seek landmark
                     # X on marker Y` are already canonicalized by the
                     # marker pre-pass; classify() has no concept of
@@ -982,7 +983,7 @@ class CritCompiler:
                     kind = classify(name, inst)
                     insts[idx] = (
                         indent,
-                        f"{seek_prefix}{nearest}{kind} {name}{rest}{colon}",
+                        f"{seek_prefix}{nearest}{free}{kind} {name}{rest}{colon}",
                     )
                     continue
 
@@ -1024,10 +1025,12 @@ class CritCompiler:
         re.compile(r'(incr|decr)\s+marker\s+\w+(\s+\d+)?'),
         re.compile(
             # Existing target-first seek, with optional marker-as-filter
-            # tail: `seek [nearest] [agent|landmark] <name> [with state]`
+            # tail: `seek [nearest] [free] [agent|landmark] <name> [with state]`
             # followed optionally by `[not] on <pred> [op N]` and
             # `timeout N`. Marker filters look like `on marker X [op N]`.
-            r'seek(\s+nearest)?(\s+(agent|landmark))?\s+\w+'
+            # `free` is an engine-side occupancy filter; see
+            # CritterEngine.cpp classic-seek block.
+            r'seek(\s+nearest)?(\s+free)?(\s+(agent|landmark))?\s+\w+'
             r'(\s+with\s+state\s*==\s*\w+)?'
             r'(\s+(not\s+)?on\s+(marker\s+\w+(\s*[<>]\s*\d+)?|\w+))?'
             r'(\s+timeout\s+\d+)?'

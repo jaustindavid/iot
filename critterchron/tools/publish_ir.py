@@ -7,9 +7,13 @@
         [--secret <hex>]          # else env STRA2US_SECRET_HEX
         [--dry-run]               # encode + print summary, no network
         [--force]                 # upload even if src_sha256 matches remote
-        [--no-source]             # omit the SOURCE trailer (smaller blob;
-                                  #   needed to OTA onto RAM-tight devices
-                                  #   like rico where buffer < full blob)
+        [--source]                # include SOURCE trailer (roughly doubles
+                                  #   blob size; for human-readable inspection
+                                  #   via `curl <blob_url>`). Default: omit —
+                                  #   devices never read SOURCE at runtime and
+                                  #   the extra bytes regularly push blobs past
+                                  #   IR_OTA_BUFFER_BYTES, which silently kills
+                                  #   OTA on buffer-tight devices like rico.
 
 Key layout: `critterchron/scripts/<name>` holds the blob. Separate tool
 will set `critterchron/<device>/ir = <name>` to point a device at it.
@@ -121,11 +125,26 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="Upload even if the remote blob already matches")
-    ap.add_argument("--no-source", dest="include_source",
-                    action="store_false", default=True,
-                    help="Omit the SOURCE trailer from the published blob "
-                         "(smaller; needed for RAM-tight OTA targets)")
+    ap.add_argument("--source", dest="include_source",
+                    action="store_true", default=False,
+                    help="Include the SOURCE trailer in the published blob "
+                         "(human-readable inspection via curl; roughly "
+                         "doubles blob size). Default: omit — devices "
+                         "never read SOURCE at runtime.")
+    # Deprecated alias for the old default-on behavior. Kept one release
+    # so muscle memory / existing shell scripts don't break loudly; emits
+    # a stderr note when used. Do NOT document in --help (argparse.SUPPRESS).
+    # Semantically a no-op now: the new default is already source-off, so
+    # `--no-source` just reinforces it. Retire once no one's typing it.
+    ap.add_argument("--no-source", dest="_deprecated_no_source",
+                    action="store_true", default=False,
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args._deprecated_no_source:
+        print("note: --no-source is deprecated — dropping SOURCE is now the "
+              "default. Pass --source if you want the trailer included.",
+              file=sys.stderr)
 
     name    = args.name or os.path.splitext(os.path.basename(args.script))[0]
     key     = f"critterchron/scripts/{name}"
@@ -140,26 +159,42 @@ def main() -> int:
 
     size        = len(blob.encode("utf-8"))
     content_sha = _content_sha(blob)
+    source_tag  = "with source" if args.include_source else "no source"
     print(f"script:     {args.script}")
     print(f"name:       {name}")
     print(f"key:        {key}")
-    print(f"size:       {size} bytes")
+    print(f"size:       {size} bytes ({source_tag})")
     print(f"src_sha:    {src_sha}")
     print(f"content_sha:{content_sha}")
     print(f"ir_ver:     {ir_ver}")
 
     if size > DEFAULT_OTA_BUFFER_BYTES:
         overshoot = size - DEFAULT_OTA_BUFFER_BYTES
+        # Warning text branches on whether source is *already* off. If it
+        # is (the new default), `--no-source` can't help — only option is
+        # raising IR_OTA_BUFFER_BYTES. If source is on, suggest dropping
+        # it first, then the header bump as fallback.
+        if args.include_source:
+            remedy = (
+                "         Drop the SOURCE trailer (remove --source) —\n"
+                "         roughly halves blob size for most scripts — or\n"
+                "         raise IR_OTA_BUFFER_BYTES in the relevant\n"
+                "         device header.\n"
+            )
+        else:
+            remedy = (
+                "         Blob is already published without SOURCE, so no\n"
+                "         publisher-side fix is available. Raise\n"
+                "         IR_OTA_BUFFER_BYTES in the relevant device header.\n"
+            )
         print(
             f"\nWARNING: size exceeds default OTA buffer "
             f"({DEFAULT_OTA_BUFFER_BYTES} bytes) by {overshoot} bytes.\n"
             f"         Devices running the default IR_OTA_BUFFER_BYTES will\n"
             f"         reject this blob at fetch time and silently stay on\n"
             f"         the previously-loaded script (visible on serial only\n"
-            f"         as 'ir_poll: fetch failed'). Either raise\n"
-            f"         IR_OTA_BUFFER_BYTES in the relevant device header, or\n"
-            f"         re-run with --no-source to drop the SOURCE trailer\n"
-            f"         (~halves blob size for most scripts).\n",
+            f"         as 'ir_poll: fetch failed').\n"
+            f"{remedy}",
             file=sys.stderr,
         )
 
@@ -228,7 +263,7 @@ def main() -> int:
         print(f"       retry with --force to restore sidecar", file=sys.stderr)
         return 3
 
-    print(f"published: {client.base_url}/kv/{key}")
+    print(f"published: {client.base_url}/kv/{key}  ({size} bytes, {source_tag})")
     print(f"sidecar:   {client.base_url}/kv/{sha_key}")
     return 0
 

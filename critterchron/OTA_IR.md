@@ -310,7 +310,14 @@ python3 tools/publish_ir.py agents/thyme.crit [--name thyme]
                                               [--server https://…]
                                               [--dry-run]
                                               [--force]
+                                              [--source]
 ```
+
+By default the published blob omits the SOURCE trailer — devices never
+read it at runtime, and including it roughly doubles blob size, which
+regularly pushes scripts past `IR_OTA_BUFFER_BYTES` on buffer-tight
+targets (rico in particular). Pass `--source` when you want the
+human-readable trailer on the KV blob for `curl`-based inspection.
 
 Behavior:
 

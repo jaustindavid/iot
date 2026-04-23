@@ -27,8 +27,8 @@ locust:
   max nodes: 256
   diagonal: allowed
   diagonal_cost: 1.414
-  penalty lit cell: 1.5        # prefer dark lanes — less disruptive
-  penalty occupied cell: 50
+  penalty lit cell: 0.5      # prefer dark lanes (slightly)
+  penalty occupied cell: 10  # avoid other locusts
 
 --- behavior ---
 locust:
@@ -42,13 +42,26 @@ locust:
 
   # Otherwise paint an intended cell.
   if missing:
+    if random 5%:
+      pause 10
+    if random 25%:
+      pause 3
+    if random 50%:
+      pause
     seek nearest missing
     if standing on missing:
       draw leaf
       pause 6
       done
 
-  # Nothing needed — park on a leaf
-  seek current
-  pause 10
+  # Nothing needed — park on an unoccupied leaf. `free` drops
+  # candidates another locust already stands on AND claims the
+  # winning cell, so 16 locusts don't all converge on the same
+  # Manhattan-nearest leaf and saturate A*. Timeout bails to
+  # `wander` if nothing reachable.
+  if on current:
+    pause 10
+    done
+  seek nearest free current timeout 50
+  pause
   done

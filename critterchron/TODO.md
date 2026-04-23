@@ -127,40 +127,38 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   than wedging silently.
 
 - **Device registers loaded sha back to Stra2us on successful OTA.**
-  Today the only fleet-visibility signal for "what sha is this device
-  actually running" is the heartbeat (`script=<name>@<sha_prefix>`)
-  which fires every heartbeep interval (tens of seconds to minutes).
-  After a publish, the operator has to wait a full heartbeat to see
-  confirmation that a given device picked up the new sha — and
-  distinguishes "still on old sha" from "applied new sha, parse
-  failed, fell back" only by diffing two heartbeats.
+  ~~Today the only fleet-visibility signal for "what sha is this
+  device actually running" is the heartbeat (`script=<name>@<sha
+  _prefix>`) which fires every heartbeep interval.~~ **Partially
+  addressed 2026-04-23** via the lighter-weight heartbeat-nudge
+  approach: on successful `ir_apply_if_ready()` → `engine.reinit()`
+  (via the existing `g_ota_pub_loaded` flag path in
+  `critterchron_particle.cpp:487-510`), the tel thread resets
+  `last_attempt_ms` + sets `next_interval_ms = 5000` so the next
+  heartbeat fires ~5s after load instead of up to `heartbeep`
+  seconds later. The operator sees the confirming
+  `script=<name>@<sha>` within seconds instead of waiting for
+  cadence. Reuses the signal operators already grep — no new KV
+  keys, no new tooling.
 
-  Proposal: on successful `ir_apply_if_ready()` → `engine.reinit()`,
-  have the device write an explicit acknowledgment back to Stra2us,
-  e.g. `<app>/<device>/ir/loaded` containing `<sha>:<uptime_ms>` or
-  similar. Operator tooling can diff `<app>/scripts/<name>/sha`
-  (what was published) against every device's `ir/loaded` (what each
-  device is running) to get fleet-wide OTA confirmation without
-  waiting on heartbeat cadence. Cost: one KV write per OTA event —
-  negligible.
+  What this doesn't cover (still open if the need arises):
+  - **Single-KV-read fleet status.** The heartbeat-nudge still
+    requires iterating every device's heartbeat stream to see who's
+    on what sha; a dedicated `<app>/<device>/ir/loaded` key would
+    let a single GET-per-device (or even a wildcard read) produce a
+    fleet dashboard. Not urgent for small fleets.
+  - **Parse-failure visibility.** The nudge only fires on successful
+    reinit, so "fetched but rejected" is still only surfaced via
+    serial. Overlaps with the device-side-error-channel TODO above —
+    that's the right place for this signal, not a separate KV key.
+  - **Payload richness.** Heartbeat carries `sha_prefix` (8 chars);
+    a dedicated key could carry full sha + size + last error. Has
+    mattered zero times so far; skip until it does.
 
-  Open design choices:
-  - Key shape: per-device (`<app>/<device>/ir/loaded`) vs. a
-    publish-time poll endpoint (`<app>/devices/<sha>`) — per-device
-    probably wins for a small fleet.
-  - Payload: just sha, or sha + timestamp + size + last error? Start
-    minimal, extend if needed.
-  - When to write: only on successful apply, or also on
-    parse-failure with an error tag so we can see "fetched but
-    rejected"? Latter is more informative; overlaps with the
-    device-side-error-channel TODO above.
-  - Failure mode: if the Stra2us write itself fails, do we retry,
-    or fire-and-forget? Fire-and-forget is simpler; the next
-    heartbeat will still carry the sha and paper over a missed
-    register.
-
-  Not urgent — heartbeat works for now — but cheap once the need
-  to watch a fleet-wide OTA rollout arises.
+  If a fleet dashboard becomes real, the original per-device KV
+  proposal (`<app>/<device>/ir/loaded` containing `<sha>:<uptime_ms>`)
+  is still the right shape — it just composes with the nudge rather
+  than replacing it.
 - **Light-sensor calibration poisons itself; only reflash recovers.**
   Observed 2026-04-21: rachel sat at `bri=(1<125<128)` in a room the
   operator describes as "very dark, for hours" — a state the current
@@ -447,6 +445,71 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   value). Not worth chasing while devices are behaving; revisit if
   another device shows the symptom or during a quiet period.
 
+- **Seek grammar: `free` adjective for occupancy-aware candidate
+  filtering.** Observed 2026-04-23 on ricky running `swarm.crit`:
+  physics budget saturated at 43.7ms A* / 50ms budget with
+  `failed_seeks=4,819,286` over 23.5h uptime (~57/s across 16 agents).
+  Root cause: the "nothing needed — park on a leaf" fallback branch
+  in `swarm.crit:52` uses `seek current`, which picks the nearest
+  `intended && lit` tile *regardless of whether another agent is
+  standing on it*. When the grid is fully painted (the modal state),
+  all 16 locusts simultaneously seek the same pool of already-correct
+  leaves, many of which are occupied; with `penalty occupied cell: 50`
+  in the pathfinding config every route bumps the `max nodes: 256`
+  A* cap and counts as a failed seek. Today's tile-state filter
+  (`on <kind>` / `not on <kind>`, `CritterEngine.cpp:1419-1425`)
+  operates on paint state only — there's no way to say "don't pick
+  cells another agent occupies."
+
+  **Grammar.** Extend the prepositive-adjective slot (currently just
+  `nearest`) to accept `free`:
+  ```
+  seek [nearest] [free] [agent|landmark] <target>
+       [with state == V] [on K | not on K] [timeout N]
+  ```
+  Fixed order (`nearest` then `free`) keeps the parser trivial.
+  Semantic: both `nearest` and `free` are *candidate-picking* predicates
+  that bind tightly to the target noun; `on K` / `with state ==` /
+  `timeout` remain *search-parameter* postpositives. The grouping in
+  the grammar mirrors the semantic grouping.
+
+  **Engine changes** (~15 lines in `CritterEngine.cpp`):
+  1. Parser at line ~1402-1408: after the `nearest` check, add a
+     symmetrical `free` check. Record as a bool.
+  2. Candidate-collection loop at line 1469-1474: when `free` is set,
+     skip any (x, y) where some other live agent's `pos` equals (x, y).
+     O(agent_count × grid_area) per seek call — negligible for our
+     grid sizes, no hot-path concern.
+  3. Claim write at line 1497-1498: extend to include `current` when
+     `free` is set. Prevents two agents targeting the same empty leaf
+     in the same tick (the claim-dedup mechanism `missing`/`extra` already
+     uses; today `current` seeks never claim, which is the other half
+     of the pile-up pathology).
+
+  **Script update once landed.** `swarm.crit:52` and `swarm-slower.crit`:
+  ```
+  # Nothing needed — park on a free leaf
+  seek nearest free current timeout 50
+  pause 10
+  done
+  ```
+  `timeout 50` caps the search if the grid is genuinely saturated
+  (no free leaves) rather than burning A* cycles indefinitely.
+
+  **Verification.** Publish the updated swarm to ricky, let it run on
+  a fully-painted grid for 10 minutes, read `failed_seeks` and
+  `astar=(avg<max)` from the heartbeat. Expected: counter growth
+  rate drops by an order of magnitude, A* avg drops from ~44ms back
+  into the "mostly idle" regime (single-digit ms) when the grid is
+  settled. `seeks_fail` will still grow — the productive branches
+  (missing/extra) legitimately contest crowded tiles — just much
+  more slowly.
+
+  **Room to grow.** The prepositive-adjective slot is a natural
+  place for future candidate-pickers (`random`, `cheapest`,
+  `coolest` for dim-first on penalty-lit targets). Worth getting
+  the grammar shape right now; easy to extend later.
+
 - **Night-mode disable sentinel (`night_enter_brightness=0`).** Today
   the Schmitt trigger at `critterchron_particle.cpp:793-805` does a
   plain `bri <= ne` compare; writing `0` clamps to `ne=0, nx=1` and
@@ -513,6 +576,27 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   header format unchanged.
 
 # Completed
+
+- **2026-04-23 — `publish_ir.py` flips SOURCE to opt-in.** `--source`
+  replaces `--no-source` as the way to include the SOURCE trailer; the
+  new default drops it. Devices never read SOURCE at runtime — it's a
+  debug artifact for `curl`-based inspection — and including it was
+  the proximate cause of the 2026-04-21 silent-OTA-failure class (blob
+  exceeds `IR_OTA_BUFFER_BYTES=8192`, device rejects fetch at
+  `Stra2usClient.cpp:472`, publisher sees no signal). swarm.crit
+  shrinks from 2245→850 bytes, foreman.crit from 8895→4442 — no
+  longer trips the oversize warning on the default publish path.
+  `--no-source` kept as a hidden deprecated alias (argparse.SUPPRESS)
+  with a one-line stderr deprecation note; retire next release once
+  no one's typing it. Oversize warning now branches on whether SOURCE
+  was requested: if yes, recommend dropping it; if no (default path),
+  recommend raising `IR_OTA_BUFFER_BYTES` since no publisher-side fix
+  remains. Publish summary line names the path (`850 bytes (no
+  source)` vs `(with source)`) so the behavior change doesn't
+  surprise downstream `curl` inspection workflows. `OTA_IR.md`
+  updated; the broader "device-side error channel on the heartbeat"
+  item stays open as the right-sized fix for residual overflow cases
+  on tight-buffer targets like rico.
 
 - **2026-04-22 — OTA crash "first pull after boot freezes device hard"
   root-caused and fixed.** Symptom: system thread down, grid frozen,
