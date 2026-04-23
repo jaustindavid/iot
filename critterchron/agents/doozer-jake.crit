@@ -1,32 +1,17 @@
-# doozer_markers.crit — doozer, markers-layer retelling
+# doozer for Jake — doozer, markers-layer retelling
 #
 # Orthogonal rewrite of doozer.crit using the Tile Markers spec
 # (MARKERS_SPEC.md). Each pile cell carries a `heap` marker count;
 # doozers `incr` to deposit a brick, `decr` to withdraw. The `heap`
-# ramp color brightens the pile cell with more bricks — brightness
+# ramp color brightens the pile cell with more bricks
 # stands in for the old script's vertical stack of brick_1/2/3 tiles.
-#
-# Sizing (32x8 widescreen, peak clock ~80 lit cells):
-#   - Single `piles` landmark unioning 2 × 8 cells on the bottom row
-#     = 16 pile cells.
-#   - Per-cell soft cap of 5 enforced by `seek highest heap < 5 on
-#     landmark piles` in the returning branch. `incr` doesn't re-
-#     check; the seek already filtered out full cells, and brief
-#     races (peer filled the cell mid-seek) are tolerated — the
-#     overshoot decays on the next fetch cycle.
-#   - Total capacity = 16 × 5 = 80, matching peak clock demand.
-#
-# Departure from the original doozer.crit: the pile is not a visible
-# vertical stack of pixels — ramp brightness substitutes. Cleaner
-# semantics, half the opcodes, same narrative. No `bricks` stateful
-# avatar-on-the-pile; the pile *is* the data structure.
 
 --- colors ---
 doozer:    (255, 255, 0)
 bright_y:  (255, 255, 0)
 dull_y:    (64, 64, 0)
 idle_y:    (1, 1, 0)
-brick:     (16, 255, 0)
+brick:     (255, 96, 0)
 pile_bg:   (0, 0, 0)
 
 # Ramp coef tuned so a full 5-unit cell reads as (200, 20, 0) —
@@ -39,7 +24,7 @@ night:
   bright_y: (0, 0, 0)
   dull_y: (0, 0, 0)
   idle_y: (0, 0, 0)
-  brick: (0, 1, 0)
+  brick: (1, 0, 0)
   heap: ramp (0, 0, 0)
 
 --- landmarks ---
@@ -60,6 +45,7 @@ piles: pile_bg
   (0, max_y-4)
   (max_x, max_y-4)
 
+# used to orient doozers and keep the stacks organized
 bottom: pile_bg
   (0, max_y)
   (max_x, max_y)

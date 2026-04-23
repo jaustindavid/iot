@@ -3,18 +3,21 @@
 # Describes the tunable variables this app exposes through Stra2us. NOT a
 # code generator — the C++ source (hal/particle/src/) is the truth for
 # what the device actually reads; this file is the human-readable catalog
-# tooling uses for `list / show / set / validate`.
+# tooling uses for `list / show / set / validate / publish`.
 #
 # Authoritative rule for the on-device resolution order is in
 # hal/particle/src/Stra2usClient.cpp: first `<app>/<device>/<key>`, then
 # `<app>/<key>`, then the compiled-in default. Absent keys fall through;
 # **never** materialize placeholder entries to "pre-register" a key — an
 # empty-string placeholder wins the probe at device scope and breaks
-# fallback. See tools/s2s.py for the accompanying CLI.
+# fallback. See stra2us-cli (`pip install stra2us-cli` from the stra2us
+# repo `tools/` dir) for the CLI that reads this file.
 #
 # `type` / `default` drift between this file and the C++ get_int /
 # get_float call sites is enforced by test_s2s_catalog.py. When adding a
 # new knob to the device, add its entry here in the same commit.
+#
+# Schema reference: stra2us/docs/catalog_spec.md
 
 app: critterchron
 
@@ -108,14 +111,14 @@ vars:
     type: float
     default: 2.5
     scope: [app, device]
-    range: [1.0, 5.0]
+    range: [0.1, 5.0]
     help: |
       Exponent on normalized light reading before mapping to brightness.
       Higher = darker mid-range (stronger perceived dimming in twilight).
 
   min_brightness:
     type: int
-    default: per-device
+    default_per_device: true
     scope: [app, device]
     range: [1, 255]
     help: |
@@ -129,26 +132,27 @@ vars:
 
   max_brightness:
     type: int
-    default: per-device
+    default_per_device: true
     scope: [app, device]
-    range: [0, 255]
+    range: [1, 255]
     help: |
       Ceiling on the 0-255 sink brightness. Per-device default (rachel=64,
       ricky=128, rico=128, elk=128).
 
   night_enter_brightness:
     type: int
-    default: per-device
+    default_per_device: true
     scope: [app, device]
     range: [0, 255]
     help: |
       Smoothed-brightness threshold at which the night palette engages.
       Schmitt hysteresis against `night_exit_brightness`. Defaults to
       MIN_BRIGHTNESS (per-device), i.e. the floor-clamp regime itself.
+      use 0 to disable
 
   night_exit_brightness:
     type: int
-    default: per-device
+    default_per_device: true
     scope: [app, device]
     range: [0, 255]
     help: |
