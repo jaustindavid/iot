@@ -61,6 +61,9 @@ uint8_t       PF_TOP_HAS_DIAGONAL_COST = 0;
 uint8_t       IR_VERSION      = 0;
 uint32_t      RUNTIME_TICK_MS = 500;
 
+char          SCRIPT_NAME[IR_SCRIPT_NAME_MAX] = {0};
+char          SCRIPT_SHA[65]                  = {0};
+
 // ---------- sliced pools (owned by tables above) ----------
 
 static Point        LANDMARK_POINT_POOL[IR_MAX_LANDMARK_POINTS];
@@ -219,6 +222,8 @@ static void reset_tables() {
     PF_TOP_HAS_DIAGONAL_COST = 0;
     IR_VERSION = 0;
     RUNTIME_TICK_MS = 500;
+    SCRIPT_NAME[0] = '\0';
+    SCRIPT_SHA[0] = '\0';
     lm_pt_used = 0;
     ag_state_used = 0;
     insn_used = 0;
@@ -371,9 +376,13 @@ bool load(char* buf, size_t len) {
         return false;
     }
 
-    // 2. Metadata — key/value lines until "---". Only `ir_version` is
-    //    stored for runtime; the rest is dropped (name, src_sha256, …
-    //    belong to tooling, not the engine).
+    // 2. Metadata — key/value lines until "---". `ir_version` drives the
+    //    compatibility gate in begin(); `name` and `src_sha256` are copied
+    //    into SCRIPT_NAME / SCRIPT_SHA so the heartbeat can report a real
+    //    identity even on flash-only devices (NO_IR_OTA) or before the
+    //    first successful OTA apply on an OTA-capable device. The rest of
+    //    the metadata (encoded_at, encoder_version, …) is tooling-only and
+    //    intentionally dropped.
     while ((ln = cur.next()) != nullptr) {
         if (strcmp(ln, "---") == 0) break;
         if (ln[0] == '\0') continue;
@@ -383,7 +392,22 @@ bool load(char* buf, size_t len) {
         *sp = '\0';
         const char* key = ln;
         const char* val = sp + 1;
-        if (strcmp(key, "ir_version") == 0) IR_VERSION = (uint8_t)atoi(val);
+        if (strcmp(key, "ir_version") == 0) {
+            IR_VERSION = (uint8_t)atoi(val);
+        } else if (strcmp(key, "name") == 0) {
+            // Copy (not alias) — the buffer may be reused/freed after parse.
+            size_t n = 0;
+            while (val[n] && n + 1 < sizeof(SCRIPT_NAME)) {
+                SCRIPT_NAME[n] = val[n]; ++n;
+            }
+            SCRIPT_NAME[n] = '\0';
+        } else if (strcmp(key, "src_sha256") == 0) {
+            size_t n = 0;
+            while (val[n] && n + 1 < sizeof(SCRIPT_SHA)) {
+                SCRIPT_SHA[n] = val[n]; ++n;
+            }
+            SCRIPT_SHA[n] = '\0';
+        }
     }
     if (!ln) { set_err("missing --- after metadata"); return false; }
 

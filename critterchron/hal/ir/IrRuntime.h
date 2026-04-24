@@ -83,6 +83,12 @@
 #ifndef IR_DEFAULT_BUFFER_BYTES
 #define IR_DEFAULT_BUFFER_BYTES 6144
 #endif
+// Max length of a script name (from the blob's `name` metadata field). Also
+// used by Stra2usClient's OTA identity buffers — kept here so the engine and
+// the HAL agree on the cap without one having to include the other's header.
+#ifndef IR_SCRIPT_NAME_MAX
+#define IR_SCRIPT_NAME_MAX 48
+#endif
 
 namespace critter_ir {
 
@@ -260,6 +266,15 @@ extern uint8_t       PF_TOP_HAS_DIAGONAL_COST;
 // Parsed from the blob's `ir_version` metadata. Engine's begin() compares
 // to SUPPORTED_IR_VERSION and bails on mismatch.
 extern uint8_t       IR_VERSION;
+
+// Identity of the currently-loaded blob, copied out of the metadata header
+// at load() time (so the buffer can outlive or be reused after parse). Both
+// are NUL-terminated; empty string until a successful load(). The heartbeat
+// reads these as a fallback when the HAL's OTA-loaded identity is empty —
+// lets a flash-only / pre-first-OTA device still report its real script name
+// instead of a generic "default" placeholder.
+extern char          SCRIPT_NAME[IR_SCRIPT_NAME_MAX];
+extern char          SCRIPT_SHA[65];   // 64 hex chars + NUL
 
 // Runtime tick rate (ms) from the blob's TICK section. Compile-time
 // TICK_RATE_MS still lives in critter_ir.h for particle.cpp's constexpr

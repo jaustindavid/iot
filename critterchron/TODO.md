@@ -678,6 +678,56 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 # Completed
 
+- **2026-04-24 — P1 RAM recovery + heartbeat script-identity FR.**
+  Ronaldo was deathblinking (SOS+1, hard fault) seconds after the tel
+  thread spun up, with `free=1400` in the last pre-crash log — WICED +
+  cloud stack + the default 8KB `ir_ota_buf_` left no headroom for the
+  tel thread's allocations. Two orthogonal fixes:
+
+  (a) Buffer-sizing knobs in the device header. `NO_IR_OTA` opts out
+  of IR-OTA entirely (reclaims the full 8KB, device runs whatever was
+  flashed in at `make flash` time); `IR_OTA_BUFFER_BYTES=4096` keeps
+  OTA alive for body-only blobs (the common case, since publish_ir
+  flipped source to opt-in on 2026-04-23) and saves 4KB. Gated at the
+  Stra2usClient member level with `#ifndef NO_IR_OTA` so the buffer
+  vanishes from `.bss` under the opt-out; handoff fields stay in the
+  class so the public API is uniform and every call site short-
+  circuits naturally via `ir_pending_ready()` returning false.
+
+  (b) Heartbeat now shows the real compiled-in script identity as a
+  fallback when no OTA has yet applied. `critter_ir::SCRIPT_NAME` and
+  `SCRIPT_SHA` are captured from the blob's `name` / `src_sha256`
+  metadata at `load()` time; `Stra2usClient::ir_loaded_script()` /
+  `ir_loaded_sha()` fall back to those when the private `ir_loaded_*`
+  buffers are empty. Heartbeat renders `script=swarm@d466a095` instead
+  of `script=default` on flash-only and pre-first-OTA devices. Same
+  fallback threaded through `ir_poll`'s sidecar fast-path so a
+  freshly-flashed OTA-capable device whose compiled-in sha matches
+  the sidecar skips the redundant blob fetch on cold boot (used to
+  re-fetch+re-apply every reboot).
+
+  Soak evidence, both at `rst=70` / fresh boot, both running the
+  compiled-in swarm script at different sha (visible demo of the
+  OTA-lockout the knobs are supposed to provide):
+
+  - ricardo (NO_IR_OTA): `up=5718 mem=8088 script=swarm@d466a095
+    phys=(2400<4884) rend=(954<1199) agents=16 seeks_fail=0`
+  - rico (IR_OTA_BUFFER_BYTES=4096): `up=6331 mem=3992
+    script=swarm@6b25b67e phys=(2392<4045) rend=(911<1005) agents=16
+    seeks_fail=14`
+
+  Both stable past 90min uptime; `free` delta (8088 vs 3992) is the
+  ~4KB cost of keeping OTA alive at 4K buffer. Different `@sha8`
+  tails on the same `swarm` name are the operator-visible proof that
+  the FR distinguishes "running the older doozer" from "running the
+  latest" without server-side bookkeeping. Ronaldo (32x8, Drew's
+  room) took `NO_IR_OTA` as the safe choice for a device that was
+  actively dying; rico (16x16) stayed on 4K-buffer to keep the OTA
+  train running for the common case. Files touched:
+  `hal/ir/IrRuntime.{h,cpp}`, `hal/particle/src/Stra2usClient.{h,cpp}`,
+  `hal/devices/{rico,ronaldo}_raccoon.h`,
+  `hal/devices/device_name.h` (template knob docs).
+
 - **2026-04-24 — ESP32 `make flash` default flipped to OTA.** On
   `hal/esp32c3/Makefile`, `flash` is now the OTA path (no `PORT=`
   required) and `flash-usb` is the cable path (requires `PORT=`).

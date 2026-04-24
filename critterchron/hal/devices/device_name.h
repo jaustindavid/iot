@@ -74,6 +74,20 @@
 // scripts grow past ~4KB.
 // #define IR_OTA_BUFFER_BYTES 8192
 //
+// NO_IR_OTA — reclaim the full IR_OTA_BUFFER_BYTES (8192 default) as
+// static RAM by dropping IR-OTA capability entirely. The device runs
+// whatever script was compiled in at `make flash` time; remote IR swaps
+// are disabled. Heartbeat + Stra2us config pull still work — only the
+// ir_poll() fetch path is stubbed. Under this knob the heartbeat reports
+// `script=default` (the ir_loaded_ptr_ fallback), which is how an
+// operator spots flash-only devices in the fleet at a glance. Intended
+// for P1-class / RAM-constrained specialist roles where the device's
+// value is elsewhere (e.g. battery-backed RTC for blackout continuity)
+// and OTA scripting isn't worth 8KB of BSS pressure on WICED. To go
+// further and also drop heartbeat + config, omit STRA2US_HOST entirely
+// from the build — but that loses operator visibility too.
+// #define NO_IR_OTA
+//
 // TELEMETRY_STACK_BYTES — stack for the Stra2us telemetry thread. Default
 // 5120. Lower if you've profiled the thread's peak usage and have headroom.
 // #define TELEMETRY_STACK_BYTES 5120

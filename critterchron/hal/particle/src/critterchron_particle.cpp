@@ -397,6 +397,19 @@ static int telemetry_cycle() {
 //                           up to hb. Resets on any 2xx/4xx.
 //   WiFi edge (up)        — fire immediately, regardless of timers.
 static void telemetry_worker() {
+    // Capture thread-start timestamp so startup_delay_ms is relative to
+    // when the tel thread actually begins running, not to boot. The old
+    // `millis() < startup_delay_ms` form was silently bypassed on
+    // rescue-hold boots: the thread doesn't spin up until ~t=60s (after
+    // rescue elapses), `millis()` is already well past 15000, and the
+    // 15s network-settle grace never fires — so the tel thread starts
+    // pounding HTTP concurrent with the main thread processing the
+    // first cloud TIME response. Suspected trigger for the SOS-1
+    // (hard fault) deathblink first seen 2026-04-24 on a P1; heap at
+    // tel-thread start is ~1400 bytes free, and a failed allocation in
+    // the Particle cloud stack under that pressure presents as a hard
+    // fault rather than SOS-8 (the path doesn't null-check internally).
+    const unsigned long thread_start_ms  = millis();
     const unsigned long startup_delay_ms = 15000;
     const unsigned long retry_floor_ms   = 10000;
     unsigned long next_interval_ms = 0;           // 0 = fire asap
@@ -405,6 +418,15 @@ static void telemetry_worker() {
     unsigned long last_cloud_ms    = 0;           // 0 = never fired
     bool wifi_prev = false;
     bool first     = true;
+
+    // Heap breadcrumb #2 of 3: post-stack-allocation baseline. See the
+    // thread-creation site in the main loop for breadcrumb #1 (pre-
+    // allocation), and the end of the pre-registration block below for
+    // breadcrumb #3 (post key-cache warm-up). Together these reveal
+    // which stage of tel-thread startup costs how much heap, so the
+    // SOS-1 deathblink triage can point at a specific phase.
+    Log.info("tel heap: thread started, free=%lu",
+             (unsigned long)System.freeMemory());
 
     // Pre-register heartbeep + cloud_heartbeep + ir_poll_interval so cycle 1's
     // poll_all pulls them live. Otherwise they'd only be registered by the
@@ -418,6 +440,10 @@ static void telemetry_worker() {
     (void)g_cfg.get_int("night_enter_brightness",  NIGHT_ENTER_BRIGHTNESS);
     (void)g_cfg.get_int("night_exit_brightness",   NIGHT_EXIT_BRIGHTNESS);
 
+    Log.info("tel heap: after key pre-register, free=%lu",
+             (unsigned long)System.freeMemory());
+
+#ifndef NO_IR_OTA
     // OTA IR poll timer. Separate from the heartbeat cadence because pointer
     // changes propagate at human scale, not telemetry scale. Initialized so
     // the first poll fires on the first iteration after startup_delay_ms,
@@ -425,9 +451,10 @@ static void telemetry_worker() {
     // OTA targets promptly on reboot.
     unsigned long last_ir_poll_ms = 0;
     bool          ir_first        = true;
+#endif
 
     while (true) {
-        if (millis() < startup_delay_ms) { delay(100); continue; }
+        if (millis() - thread_start_ms < startup_delay_ms) { delay(100); continue; }
         unsigned long now = millis();
 
         // WiFi state flag is free to read — if we're offline we skip the
@@ -567,12 +594,18 @@ static void telemetry_worker() {
             backoff_ms = (backoff_ms * 2 < hb_ms) ? backoff_ms * 2 : hb_ms;
         }
 
+#ifndef NO_IR_OTA
         // OTA IR poll, on its own slow cadence. Runs after telemetry_cycle
         // rather than inside it so a stalled ir_poll can't delay the next
         // heartbeat — worst case we skip an OTA check, not a heartbeat.
         // First pass fires immediately on startup so a pointer set while the
         // device was offline still gets picked up on boot without a 20-min
         // wait.
+        //
+        // Skipped entirely under NO_IR_OTA (P1-class opt-out): the device
+        // runs its compiled-in script and never fetches. This also avoids
+        // the stray connect/close on a socket whose only purpose would be
+        // to call a no-op ir_poll() stub.
         int ir_int_s = g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
         if (ir_int_s < 60) ir_int_s = 60;
         unsigned long ir_int_ms = (unsigned long)ir_int_s * 1000UL;
@@ -583,6 +616,7 @@ static void telemetry_worker() {
             last_ir_poll_ms = now;
             ir_first = false;
         }
+#endif
 
         // Failsafe heartbeat to Particle cloud. Fires at most once per
         // cloud_heartbeep seconds, independent of the Stra2us status —
@@ -877,6 +911,16 @@ void loop() {
                      now - g_cloud_wait_start_ms);
 #if defined(STRA2US_HOST)
             if (g_tel_thread == nullptr) {
+                // Heap breadcrumb #1 of 3: pre-thread-creation baseline.
+                // See telemetry_worker() for #2 (post-stack-allocation)
+                // and #3 (post-key-pre-register). The delta from #1 to
+                // #2 is the thread stack's heap cost; the delta from #2
+                // to #3 is the key-cache warm-up cost. On a healthy P1
+                // boot, expect #1 ~= 6500, #2 ~= 1400, #3 somewhat
+                // lower; values well below that at any stage point at
+                // the SOS-1 deathblink's RAM-pressure hypothesis.
+                Log.info("tel heap: pre-thread-create, free=%lu",
+                         (unsigned long)System.freeMemory());
                 g_tel_thread = new Thread("telemetry", telemetry_worker,
                                           OS_THREAD_PRIORITY_DEFAULT,
                                           TELEMETRY_STACK_BYTES);

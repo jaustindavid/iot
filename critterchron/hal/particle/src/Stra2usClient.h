@@ -33,6 +33,11 @@
 #include "creds.h"
 #include "interface/Config.h"
 #include "hmac_sha256.h"
+// Pulled in for critter_ir::SCRIPT_NAME / SCRIPT_SHA — the heartbeat
+// accessors below fall back to them so a flash-only (NO_IR_OTA) or
+// pre-first-OTA device still reports its real compiled-in script identity
+// instead of a generic "default".
+#include "ir/IrRuntime.h"
 
 class Stra2usClient : public Config {
 public:
@@ -125,14 +130,24 @@ public:
     const char* ir_detected_to_sha()    const { return ir_detected_to_sha_;    }
     size_t      ir_detected_size()      const { return ir_detected_size_;      }
 
-    // Name of the script currently loaded on this device (empty string until
-    // the first successful apply). Used in the heartbeat payload so the
-    // server can see which script each device thinks it's running.
-    const char* ir_loaded_script() const { return ir_loaded_ptr_; }
-    // 64-char hex src_sha256 of the loaded blob (empty until first apply).
-    // Content-addressed identity: lets us detect re-publishes under the same
-    // name without any server-side version bookkeeping.
-    const char* ir_loaded_sha()    const { return ir_loaded_sha_; }
+    // Name of the script currently loaded on this device. Falls back to the
+    // compiled-in blob's metadata (critter_ir::SCRIPT_NAME, populated by
+    // loadDefault()) when no OTA has applied yet — so a flash-only
+    // (NO_IR_OTA) or pre-first-OTA device still reports the real script it's
+    // running instead of a generic placeholder. Used in the heartbeat
+    // payload so the server can tell "running older thyme" from "running
+    // default" at a glance across the fleet.
+    const char* ir_loaded_script() const {
+        return ir_loaded_ptr_[0] ? ir_loaded_ptr_ : critter_ir::SCRIPT_NAME;
+    }
+    // 64-char hex src_sha256 of the loaded blob. Same fallback rule as
+    // ir_loaded_script(): returns the compiled-in blob's sha when no OTA
+    // has overridden it. Content-addressed identity: lets us detect
+    // re-publishes under the same name without any server-side version
+    // bookkeeping.
+    const char* ir_loaded_sha() const {
+        return ir_loaded_sha_[0] ? ir_loaded_sha_ : critter_ir::SCRIPT_SHA;
+    }
 
 private:
     static constexpr size_t CACHE_CAP = 32;
@@ -208,6 +223,17 @@ private:
     // per-device in hal/devices/<name>.h — rico (OG Photon) drops it to
     // 6KB to reclaim WICED's heap headroom; Photon 2 / Argon can bump it
     // back up if scripts grow past 4KB.
+    //
+    // NO_IR_OTA opt-out: device headers can `#define NO_IR_OTA` to drop
+    // the 8KB ir_ota_buf_ entirely — reclaims the buffer for WICED /
+    // cloud-stack heap on memory-tight devices (P1-class) that run a
+    // compiled-in script and don't need IR-OTA. Heartbeat + config pull
+    // still work; only the ir_poll/ir_apply path is stubbed (see the
+    // matching guards in Stra2usClient.cpp and critterchron_particle.cpp).
+    // The handoff fields (ir_pending_len_ / ir_detected_flag_ / etc.)
+    // stay in the class so the public API is uniform; they simply never
+    // get written, so ir_pending_ready() / ir_detected_ready() always
+    // return false and every call site short-circuits naturally.
 #ifndef IR_OTA_BUFFER_BYTES
 #define IR_OTA_BUFFER_BYTES 8192
 #endif
@@ -220,7 +246,9 @@ private:
     // buffer + name + sha, then length (length last, after memory barriers
     // implicit in the blocking fetch path); main reads length then the rest
     // then zeros length. One-slot handoff — no mutex.
+#ifndef NO_IR_OTA
     char           ir_ota_buf_[IR_OTA_BUFFER_BYTES];
+#endif
     volatile size_t ir_pending_len_ = 0;
     char           ir_pending_ptr_[IR_SCRIPT_NAME_MAX] = {0};
     // 64-char hex + NUL. Extracted from the fetched blob's header *before*

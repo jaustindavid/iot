@@ -75,7 +75,8 @@ tick rate: 400ms
 
 --- pathfinding ---
 doozer:
-  max nodes: 1024
+  max nodes: 256
+  plan horizon: 32
   step rate: 1
   diagonal: allowed
   diagonal_cost: 1.414
@@ -116,6 +117,14 @@ doozer:
     incr heap
     incr heap # 25
     set state = idle
+
+  # randomly hesitate
+  if random 25%:
+    pause
+    if random 25%:
+      pause 2
+      if random 25%:
+        pause 4
 
   # --- carrying a brick: place it on a missing clock cell ---
   if state == carrying:
