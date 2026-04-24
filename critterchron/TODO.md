@@ -546,6 +546,93 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   separate trust boundaries (tool vs. HAL) policing the same invariant
   is fine; HAL is the one that actually runs on-device.
 
+- **Hotspot-mode fallback when WiFi is unreachable (ESP32).** On
+  Particle, WiFi creds live in DCT and DeviceOS handles the "can't
+  associate" case by holding in listening mode for serial/BLE
+  reconfiguration. ESP32 has no such service — the M2 plan is to
+  compile `WIFI_SSID` / `WIFI_PASSWORD` into `hal/devices/<name>.h`,
+  which means a moved/renamed/replaced home network turns the device
+  into a brick that requires a reflash to recover. Want a fallback:
+  when `WiFi.begin()` fails to associate within a budget (e.g. 60s),
+  flip to SoftAP mode with a deterministic SSID (`critterchron-<device
+  name>`, maybe a short PSK derived from `STRA2US_SECRET_HEX` so the
+  owner can precompute it) and stand up a tiny HTTP endpoint that
+  accepts new SSID/PSK. Write them to NVS; on reboot the station-mode
+  path tries NVS first, falls back to compiled-in creds, falls back to
+  hotspot. Visible state on the grid so an operator across the room
+  knows which mode the device is in — maybe re-use the amber rescue
+  chase for "hotspot up, awaiting config." Nice-to-have: advertise via
+  mDNS (`critterchron-<name>.local`) while in hotspot mode so the user
+  doesn't need to find its AP IP. Probably wants a physical trigger
+  too (hold a boot button during reset) to force hotspot mode even
+  when WiFi is fine, so you can rotate credentials without a flash.
+  Scope this as its own milestone (M2.5?) between plain-WiFi bring-up
+  and Stra2us integration — landing it before Stra2us means the very
+  first field-deployable ESP32 build is credential-recoverable.
+
+- **Pull-mode firmware OTA with signature verification (ESP32).** M5
+  ships `ArduinoOTA` push-mode only: `arduino-cli upload --port
+  <device>.local --protocol network` flashes over LAN. Fine for dev
+  (trusted network, hands-on operator), wrong shape for fleet-wide
+  rollouts — no authentication, no centralized "push new fw to every
+  device in the swarm" story, and it assumes the developer is on the
+  same LAN as every device. Want: a pull-OTA path where the device
+  periodically checks a staged firmware URL (Stra2us sidecar?
+  mirroring the IR-blob pattern — `<app>/fw/<target>/<sha>` pointer,
+  `<app>/fw/<target>.bin` blob), verifies HMAC-SHA256 over the binary
+  under the device's Stra2us secret, and flashes via
+  `Update.writeStream`. Makefile gets an `ota-stage` target that SCPs
+  the built .bin plus the sha sidecar to the staging server. Same
+  device-secret that already signs Stra2us traffic; no new key
+  material. Skip the trust-on-first-use shape — compiled-in secret is
+  the anchor. Nice-to-have: a publish topic (`fw_staged
+  target=esp32c3 sha=abcd1234`) so a tooling script can watch for
+  devices to pick up the update and report back.
+
+- **Auto-rollback on post-flash crash (ESP32).** M5's rescue-hold
+  window buys time to OTA a replacement when a previous boot crashed,
+  but doesn't roll back automatically. Arduino-ESP32's bootloader
+  supports A/B validation: the app must call
+  `esp_ota_mark_app_valid_cancel_rollback()` after a successful boot,
+  otherwise the bootloader reverts to the previous partition on next
+  reset. Want to wire this up — mark valid after N seconds of uptime
+  with WiFi associated and SNTP synced (or some similar "this fw
+  actually works" heuristic), and if we crash before that, the
+  bootloader reverts for us. Closes the "bad flash bricked the
+  device" failure mode without requiring an operator to notice and
+  push a replacement through the rescue-hold window. Interaction with
+  `esp_reset_reason()` / rescue mode needs thought: a device that
+  boots, crashes, reverts, boots successfully on the old fw should
+  probably still enter rescue mode (previous boot was a crash, even
+  if the currently-running fw is fine) so an operator can investigate
+  before re-attempting the bad flash.
+
+- **Drunken A*.** Pathfinding is too good — agents trace perfect,
+  straight Manhattan routes across the grid. Real critters wobble,
+  double back, pause, take the scenic route. Want a tunable way to
+  degrade pathing so the swarm reads as a bunch of tipsy animals
+  rather than a flock of guided missiles. Two sketches worth
+  prototyping:
+    1. *Cost jitter.* Add a small random perturbation to the g/h/f
+       cost in A*'s open-set ordering — say, `cost += rng.range(0,
+       drunkenness_eps)`. Non-optimal expansions get picked
+       occasionally, so paths meander but still reach the goal.
+       Cheap (one RNG call per expansion), deterministic per seed,
+       and `drunkenness_eps` is a natural Stra2us knob.
+    2. *Post-plan noise.* Plan the optimal path, then perturb the
+       *walk* — skip a tile with probability p, step orthogonally
+       for one tick with probability q, freeze for a tick with
+       probability r. Decouples the planner from the jitter so
+       A* stays fast and optimal; the drunkenness lives at step
+       time. Per-agent-type knob (a tanuki at the bar drunker than
+       a cheetah on duty) is the fun knob.
+    Leaning toward (2) because it composes with the existing
+    behavior IR without touching the planner core, but (1) is a
+    one-liner worth trying first to see how it reads visually. Both
+    want a `drunkenness` (or similar) Config key so the effect is
+    live-tunable — catalog it alongside `wobble_*` since it's the
+    same genre of "make it look organic" knob.
+
 ## Phase 2+ (per HAL_SPEC)
 
 - ~~**Phase 2 — Environmental polish:**~~ light sensor + brightness

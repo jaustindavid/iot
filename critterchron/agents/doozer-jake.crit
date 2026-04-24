@@ -11,7 +11,7 @@ doozer:    (255, 255, 0)
 bright_y:  (255, 255, 0)
 dull_y:    (64, 64, 0)
 idle_y:    (1, 1, 0)
-brick:     (255, 96, 0)
+brick:     (255, 32, 0)
 pile_bg:   (0, 0, 0)
 
 # Ramp coef tuned so a full 5-unit cell reads as (200, 20, 0) —
@@ -57,7 +57,7 @@ doozer starts at (0, 0),     state = starting
 doozer starts at (max_x, 0), state = starting
 
 --- simulation ---
-tick rate: 400ms
+tick rate: 50ms
 
 --- pathfinding ---
 doozer:

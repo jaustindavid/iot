@@ -42,7 +42,15 @@ except ImportError:
     sys.exit(2)
 
 ROOT = Path(__file__).resolve().parent
-HAL_SRC = ROOT / "hal" / "particle" / "src"
+# Every live HAL tree. Each platform's src/ owns its own copy of the
+# engine-facing files (WobblyTimeSource, LightSensor*, the .ino/.cpp
+# shim), so a new knob added on one platform but not mirrored to the
+# others still trips the lint on the platform that *does* read it.
+# Order matters for human output only — findings print sorted by path.
+HAL_SRCS = [
+    ROOT / "hal" / "particle" / "src",
+    ROOT / "hal" / "esp32"    / "src",
+]
 CATALOG = ROOT / "critterchron.s2s.yaml"
 
 # Match `get_int("key", <default-expr>)` / get_float across lines.
@@ -63,42 +71,53 @@ DEFINE_RE = re.compile(
 
 
 def collect_get_calls() -> list[dict]:
-    """Walk HAL source, return each get_int/get_float site we find."""
+    """Walk every HAL source tree, return each get_int/get_float site."""
     calls = []
-    for p in sorted(HAL_SRC.rglob("*")):
-        if p.suffix not in (".h", ".cpp", ".c", ".hpp"):
-            continue
-        text = p.read_text()
-        for m in CALL_RE.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
-            calls.append({
-                "file": p.relative_to(ROOT),
-                "line": line,
-                "fn": m.group("fn"),           # int | float
-                "key": m.group("key"),
-                "default_expr": m.group("default").strip(),
-            })
+    for hal_src in HAL_SRCS:
+        if not hal_src.is_dir():
+            continue  # platform HAL not checked out / doesn't exist
+        for p in sorted(hal_src.rglob("*")):
+            if p.suffix not in (".h", ".cpp", ".c", ".hpp", ".ino"):
+                continue
+            text = p.read_text()
+            for m in CALL_RE.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
+                calls.append({
+                    "file": p.relative_to(ROOT),
+                    "line": line,
+                    "fn": m.group("fn"),           # int | float
+                    "key": m.group("key"),
+                    "default_expr": m.group("default").strip(),
+                })
     return calls
 
 
 def collect_defines() -> dict[str, list[tuple[Path, str]]]:
-    """Grep `#define SYMBOL <literal>` across hal/particle/src/ only.
+    """Grep `#define SYMBOL <literal>` across every HAL src tree.
 
-    Scoped to the app-level source (NOT hal/devices/*.h) on purpose: the
+    Scoped to app-level source (NOT hal/devices/*.h) on purpose: the
     catalog's `default` field represents the app-level fallback a device
     sees when its header doesn't override. Per-device overrides are a
     separate concept from the catalog; treating them as conflicting
     sources of truth here would produce noise for exactly the keys we
-    intentionally scope per-device (brightness, night thresholds)."""
+    intentionally scope per-device (brightness, night thresholds).
+
+    Symbols that differ between platforms (e.g. if Particle defines
+    HEARTBEEP_DEFAULT=300 and ESP32 defines it=60) land as "ambiguous"
+    below and are skipped — the current parity is lockstep but the
+    machinery handles drift gracefully if it appears."""
     out: dict[str, list[tuple[Path, str]]] = {}
-    for p in sorted(HAL_SRC.rglob("*")):
-        if p.suffix not in (".h", ".cpp", ".c", ".hpp"):
+    for hal_src in HAL_SRCS:
+        if not hal_src.is_dir():
             continue
-        text = p.read_text()
-        for m in DEFINE_RE.finditer(text):
-            out.setdefault(m.group("sym"), []).append(
-                (p.relative_to(ROOT), m.group("val"))
-            )
+        for p in sorted(hal_src.rglob("*")):
+            if p.suffix not in (".h", ".cpp", ".c", ".hpp", ".ino"):
+                continue
+            text = p.read_text()
+            for m in DEFINE_RE.finditer(text):
+                out.setdefault(m.group("sym"), []).append(
+                    (p.relative_to(ROOT), m.group("val"))
+                )
     return out
 
 
@@ -163,9 +182,33 @@ def main(argv: list[str]) -> int:
                 f"{c['file']}:{c['line']}: get_{c['fn']}({key!r}, …) "
                 f"but catalog `type: {entry['type']}`"
             )
-        # Default cross-check. Skip per-device defaults and ops_only keys.
+        # Default cross-check. Skip keys whose default varies by scope
+        # (per-device headers, per-platform drivers) or whose reader
+        # doesn't go through the Config interface at all (ops_only).
+        #   `default: per-device`           — string sentinel (legacy)
+        #   `default_per_device: true`      — current convention for
+        #                                     keys whose literal default
+        #                                     lives in HAL source rather
+        #                                     than the catalog. Covers
+        #                                     both hal/devices/<name>.h
+        #                                     overrides (brightness,
+        #                                     night thresholds) and
+        #                                     per-platform driver headers
+        #                                     (light_exponent: 2.5 for
+        #                                     the CDS path, 0.5 for
+        #                                     BH1750, same key different
+        #                                     sensor math). stra2us-cli's
+        #                                     schema doesn't yet have a
+        #                                     dedicated `per-platform`
+        #                                     flag; reusing this one is
+        #                                     fine because the lint's
+        #                                     job here is just "don't
+        #                                     cross-check a literal that
+        #                                     doesn't exist in the YAML."
         catalog_default = entry.get("default")
-        if catalog_default == "per-device" or entry.get("ops_only"):
+        if (catalog_default == "per-device"
+                or entry.get("default_per_device")
+                or entry.get("ops_only")):
             continue
         kind, resolved = parse_default(c["default_expr"], defines)
         if kind == "literal" or kind == "symbol":

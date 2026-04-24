@@ -109,12 +109,40 @@ vars:
 
   light_exponent:
     type: float
-    default: 2.5
+    default_per_device: true   # actually per-platform — see note below
     scope: [app, device]
     range: [0.1, 5.0]
     help: |
       Exponent on normalized light reading before mapping to brightness.
       Higher = darker mid-range (stronger perceived dimming in twilight).
+      Semantics invert by sensor type, so the compiled-in default does too:
+        - CDS (Particle): raw→n is inverted (lower raw = more light),
+          so default 2.5 pushes mid-range darker. See hal/particle/src/
+          LightSensor.h.
+        - BH1750 (ESP32): direct (more lux = more light), so the
+          ESPHome-style sqrt (default 0.5) is the "bedroom" curve.
+          See hal/esp32/src/LightSensorBH1750.h.
+      Same key shared across drivers so a cross-device tune reaches both;
+      useful values just differ per platform, which is why there's no
+      single catalog default. Flagged `default_per_device` because the
+      stra2us-cli schema doesn't (yet) have a `default_per_platform` —
+      the semantics ("no single literal default; look in HAL source")
+      are the same, and the drift lint treats them identically.
+
+  light_lux_full:
+    type: float
+    default: 375.0
+    scope: [app, device]
+    range: [1.0, 65535.0]
+    help: |
+      Lux reading at which BH1750-driven brightness saturates at
+      max_brightness. Mapping is
+          target = min_b + clamp((lux / lux_full)^light_exponent, 0, 1) * span
+      375 ≈ "bright room" per the ESPHome BH1750 recipe this port models.
+      Smaller → reaches full bright sooner; larger → needs more light to
+      saturate. ESP32/BH1750-only knob — the CDS path auto-calibrates its
+      own bright/dark range and has no equivalent tunable. See
+      hal/esp32/src/LightSensorBH1750.h.
 
   min_brightness:
     type: int
