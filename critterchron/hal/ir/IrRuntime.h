@@ -158,8 +158,14 @@ struct PFConfig {
     uint8_t diagonal;          // 0/1
     float   diagonal_cost;
     int32_t step_rate;
+    // Number of cached A* plan steps the agent consumes before replanning.
+    // See CritterEngine::Agent::plan and stepTowardTarget() for the
+    // mechanism; clamped to [1, PLAN_MAX] on the engine side. Omitted
+    // from PF blocks means "engine default = 1".
+    int32_t plan_horizon;
     uint8_t has_max_nodes, has_penalty_lit, has_penalty_occupied,
-            has_diagonal, has_diagonal_cost, has_step_rate;
+            has_diagonal, has_diagonal_cost, has_step_rate,
+            has_plan_horizon;
 };
 
 struct Insn { uint8_t indent; const char* text; };

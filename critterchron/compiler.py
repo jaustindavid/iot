@@ -545,6 +545,14 @@ class CritCompiler:
         "penalty_occupied":       "penalty_occupied",
         "step rate":              "step_rate",
         "step_rate":              "step_rate",
+        # How many cached plan steps the agent will consume before replanning
+        # via A*. Integer in [1, PLAN_MAX]; default 1 (replan every tick, the
+        # historical behavior). Values > 1 trade reactivity for CPU but the
+        # runtime cost-budget surprise check (see stepTowardTarget) catches
+        # genuine world-drift mid-plan and forces a replan, so even horizon=4
+        # stays collision-safe in practice. See CritterEngine.h :: Agent.plan.
+        "plan horizon":           "plan_horizon",
+        "plan_horizon":           "plan_horizon",
         "diagonal":               "diagonal",
         "diagonal cost":          "diagonal_cost",
         "diagonal_cost":          "diagonal_cost",
@@ -607,16 +615,28 @@ class CritCompiler:
                 raise ValueError(
                     f"Pathfinding 'diagonal_cost' must be numeric, got {val_str!r}"
                 )
-        # Numeric keys (max_nodes, penalty_*, step_rate): int if possible, else float.
+        # Numeric keys (max_nodes, penalty_*, step_rate, plan_horizon):
+        # int if possible, else float.
         try:
-            return int(val_str)
+            parsed = int(val_str)
         except ValueError:
             try:
-                return float(val_str)
+                parsed = float(val_str)
             except ValueError:
                 raise ValueError(
                     f"Pathfinding {canonical!r} must be numeric, got {val_str!r}"
                 )
+        # plan_horizon is positive-integer only — fractional horizons make no
+        # sense, 0 or negative would disable the mechanism entirely. The
+        # engine clamps to [1, PLAN_MAX] defensively (see stepTowardTarget),
+        # so values above PLAN_MAX silently cap on-device; that's intentional
+        # forward-compat (PLAN_MAX can grow without breaking old scripts).
+        if canonical == "plan_horizon":
+            if not isinstance(parsed, int) or parsed < 1:
+                raise ValueError(
+                    f"Pathfinding 'plan_horizon' must be a positive integer, got {val_str!r}"
+                )
+        return parsed
 
     def _validate_pathfinding(self):
         pf = self.ir["pathfinding"]

@@ -24,6 +24,31 @@ namespace critterchron {
 
 struct Point { int8_t x, y; };
 
+// One step of a cached A* plan. `cost` is the g-cost delta A* charged at
+// plan time (1.0 on a clear ortho edge, up to ~1 + pen_lit + pen_occ on a
+// lit+occupied one, scaled by the diagonal multiplier for corner moves).
+// Stored so the runtime "did reality drift off A*'s estimate?" check can
+// compare the current edge cost against what A* budgeted — see
+// stepTowardTarget() for the reactivity mechanism. 8B with alignment;
+// PLAN_MAX copies live on each Agent.
+struct PlannedStep {
+    int8_t dx;
+    int8_t dy;
+    // (2B padding here for 4B alignment of cost)
+    float  cost;
+};
+
+// Cap on cached plan depth per agent. The `plan_horizon` pfInt knob
+// clamps to this. 4 is a deliberately modest upper bound: the whole point
+// of caching is to skip replans, but committing to more than ~4 steps
+// blind outruns the reactivity the cost-budget check gives back. Sized in
+// bytes, too: 4 × 8B = 32B/agent, × MAX_AGENTS=80 = 2.5KB of plan
+// scratch on-device. Bumpable if a future agent type wants longer
+// horizons and the RAM budget is there.
+#ifndef PLAN_MAX
+#define PLAN_MAX 4
+#endif
+
 struct Tile {
     uint8_t state    : 1;
     uint8_t intended : 1;
@@ -65,6 +90,16 @@ struct Agent {
     uint16_t type_idx;           // index into critter_ir::AGENT_TYPES
     uint16_t beh_idx;            // index into critter_ir::BEHAVIORS
     Point    pos, prev_pos;
+    // Delta of the most recent move (pos - prev-before-move). Fed back into
+    // aStarFirstStep as a backtrack-bias hint: the planner adds a small
+    // penalty to the edge that would reverse this step, breaking the A↔B
+    // oscillation that otherwise shows up under fresh-plan-per-step
+    // semantics when local geometry makes both neighbors look equally
+    // promising. prev_pos can't carry this signal because processAgent
+    // resets prev_pos = pos when the interpolation animation completes —
+    // which is exactly when the next A* call happens. Zero-initialized
+    // (by the memset at spawn) so the very first step has no bias.
+    Point    last_step;
     // Index into critter_ir::COLORS. Engine resolves to RGB via
     // resolveColor() at render and dump time — for static colors this is a
     // table lookup, for cycles it walks CYCLE_ENTRIES using render_frame_.
@@ -80,6 +115,22 @@ struct Agent {
     uint8_t  state_str_id;       // index into this agent type's states[] + 1; 0 = "none"
     bool     glitched;
     bool     alive;
+
+    // ---------- cached A* plan (plan_horizon knob) ----------
+    // When plan_horizon > 1, A* returns up to PLAN_MAX steps; the agent
+    // consumes them one per tick, replanning only when (a) plan exhausted,
+    // (b) target drifted (seek re-picked a different nearest), or (c) the
+    // next step's *current* cost exceeds what A* budgeted at plan time.
+    // (c) is the reactivity layer: an agent appearing in our path or a
+    // tile becoming lit after we planned both show up as cost overshoots.
+    // Default plan_horizon=1 keeps the current replan-every-tick behavior
+    // and makes all these fields no-ops (plan_len always 0→1→0).
+    PlannedStep plan[PLAN_MAX];
+    Point       plan_target;  // seek target at plan time; replan on drift
+    float       plan_slack;   // cumulative under-budget credit; non-negative
+                              // by construction (see stepTowardTarget)
+    uint8_t     plan_len;
+    uint8_t     plan_cursor;
 };
 
 struct HealthMetrics {
@@ -196,10 +247,37 @@ private:
     bool checkBoardCondition(const char* kind) const;
     bool occupiedByNonPainter(int x, int y, int16_t ignore_id = -1) const;
 
-    // Bounded A* with best-so-far fallback; returns first step (dx,dy) or
-    // {0,0} if no move. Populates `metrics_.failed_seeks` on budget exhaustion.
+    // Bounded A* with best-so-far fallback. Writes up to `max_steps` moves
+    // from the start of the reconstructed path into `out_steps[0..*out_len)`
+    // with their A*-budgeted g-cost deltas. Returns true iff at least one
+    // step was produced. `max_steps` is clamped to PLAN_MAX by the caller.
+    // Populates `metrics_.failed_seeks` on budget exhaustion.
+    bool aStarPlan(Point start, Point target, uint16_t type_idx,
+                   PlannedStep* out_steps, int max_steps, int& out_len,
+                   Point last_step = {0, 0});
+
+    // One-step convenience wrapper preserving the pre-horizon call shape.
+    // Not used by seek anymore (that path goes through stepTowardTarget for
+    // the plan-reuse machinery) but left in place for any future caller
+    // that genuinely wants a fresh one-shot first step.
     bool aStarFirstStep(Point start, Point target, uint16_t type_idx,
-                        Point& out_step);
+                        Point& out_step, Point last_step = {0, 0}) {
+        PlannedStep one;
+        int n = 0;
+        bool ok = aStarPlan(start, target, type_idx, &one, 1, n, last_step);
+        if (!ok || n == 0) { out_step = {0, 0}; return false; }
+        out_step = {one.dx, one.dy};
+        return true;
+    }
+
+    // Produce one move toward target: consume a cached plan step if valid,
+    // else replan via aStarPlan and execute its first step. Handles all
+    // agent-side bookkeeping (prev_pos, pos, last_step, step_duration,
+    // remaining_ticks, plan cache). Returns true on move, false on "no
+    // step available" (caller reverts to 1-tick retry). The reactivity
+    // mechanism (cost-budget surprise → replan) lives here, not inside
+    // aStarPlan — plans themselves are pure A* output.
+    bool stepTowardTarget(Agent& a, Point target);
 
     void despawn(Agent& a);
 
@@ -233,6 +311,10 @@ private:
     std::vector<float>                            pf_cost_;
     std::vector<int16_t>                          pf_from_;
     std::vector<std::pair<float, int>>            pf_heap_;
+    // Path reconstruction scratch — walked backward from the end node
+    // through from[] once per aStarPlan call to extract the first N steps.
+    // Bounded by grid size in worst case.
+    std::vector<int>                              pf_trail_;
 
     // Render scratch — owned so each render() reuses the same bytes. Composed
     // as (landmarks, lit tiles, agent-lerp) then flushed to the sink. Agents

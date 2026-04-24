@@ -226,7 +226,7 @@ def encode(ir: dict, meta: dict) -> str:
     per = pf.get("per_agent", OrderedDict())
     emit(f"PF {len(per)}")
     pf_keys = ("max_nodes", "penalty_lit", "penalty_occupied", "diagonal",
-               "diagonal_cost", "step_rate")
+               "diagonal_cost", "step_rate", "plan_horizon")
     for agent, block in per.items():
         _check_token(agent, "pf agent name")
         parts = [agent]
@@ -708,5 +708,5 @@ def _parse_pf_value(key: str, raw: str):
         if "." in raw or "e" in raw.lower():
             return float(raw)
         return int(raw)
-    # max_nodes, step_rate: always int.
+    # max_nodes, step_rate, plan_horizon: always int.
     return int(raw)

@@ -6,19 +6,19 @@
 # both C3-RISC-V and S3-Xtensa behind the same WiFi.h / FastLED API).
 #
 # Usage:
-#   make DEVICE=timmy_tanuki swarm         # encode IR + compile (no flash)
-#   make DEVICE=timmy_tanuki flash PORT=/dev/cu.usbmodem101
-#   make DEVICE=timmy_tanuki swarm flash PORT=/dev/cu.usbmodem101
-#   make DEVICE=timmy_tanuki flash-ota     # push OTA to $(DEVICE).local
-#   make DEVICE=timmy_tanuki swarm flash-ota
-#   make DEVICE=timmy_tanuki flash-ota OTA_HOST=192.168.1.42  # IP override
+#   make DEVICE=timmy_tanuki swarm                      # encode IR + compile (no flash)
+#   make DEVICE=timmy_tanuki flash                      # push OTA to $(DEVICE).local
+#   make DEVICE=timmy_tanuki swarm flash                # same, after rebuilding from swarm.crit
+#   make DEVICE=timmy_tanuki flash OTA_HOST=192.168.1.42  # IP override
+#   make DEVICE=timmy_tanuki flash-usb PORT=/dev/cu.usbmodem101  # USB cable (fresh boards, recovery)
 #   make clean
 #
-# Flashing is opt-in — bare `make <script>` only compiles. Add `flash` plus
-# a PORT= value on the command line when you actually want to push to
-# hardware. For OTA push over LAN use `flash-ota` — hostname defaults to
-# `$(DEVICE).local` (the ArduinoOTA listener's mDNS name, set in
-# critterchron_esp32.ino's setup()).
+# Flashing is opt-in — bare `make <script>` only compiles. Deployed devices
+# run on WiFi, so `flash` is the OTA path by default; `flash-ota` is
+# retained as an alias for muscle memory and scripts written before the
+# 2026-04-24 flip. Use `flash-usb` when the device hasn't joined WiFi yet
+# (fresh board, first flash with real creds), after an OTA that bricked
+# the radio, or when mDNS is blocked on the LAN.
 #
 # Assembly model (parallels hal/photon2/Makefile):
 #   1. Copy the cross-platform engine from ../ (CritterEngine, interface/, ir/)
@@ -99,7 +99,7 @@ ESP32_FILES    := $(filter-out critterchron_esp32.ino, \
 ESP32_COPIES   := $(addprefix $(SRC_DIR)/,$(ESP32_FILES)) \
                   $(SKETCH_DIR)/$(SKETCH_NAME).ino
 
-.PHONY: all flash flash-ota clean list $(DEVICES) $(SCRIPTS) compile assemble
+.PHONY: all flash flash-ota flash-usb clean list $(DEVICES) $(SCRIPTS) compile assemble
 
 default: list
 
@@ -108,8 +108,8 @@ list:
 	@echo "  platform:  $(PLATFORM) ($(FQBN))"
 	@echo "  devices:   $(DEVICES)"
 	@echo "  scripts:   $(SCRIPTS)"
-	@echo "  flash:     make DEVICE=<device> flash PORT=/dev/cu.usbmodemXXX"
-	@echo "  flash-ota: make DEVICE=<device> flash-ota  (pushes to <device>.local)"
+	@echo "  flash:     make DEVICE=<device> flash               (OTA; alias: flash-ota)"
+	@echo "  flash-usb: make DEVICE=<device> flash-usb PORT=/dev/cu.usbmodemXXX"
 
 # `make echo_ermine` shorthand for `make flash DEVICE=echo_ermine`.
 $(DEVICES):
@@ -145,20 +145,23 @@ $(FIRMWARE_BIN): $(ENGINE_COPIES) $(ESP32_COPIES) $(SKETCH_DIR)/creds.h $(SRC_DI
 
 $(SRC_DIR)/ir/critter_ir.h: ;
 
-flash: $(FIRMWARE_BIN)
+flash-usb: $(FIRMWARE_BIN)
 ifeq ($(PORT),)
-	@echo "error: set PORT=/dev/cu.usbmodemXXX to flash (try: ls /dev/cu.*)" >&2
+	@echo "error: set PORT=/dev/cu.usbmodemXXX to flash over USB (try: ls /dev/cu.*)" >&2
+	@echo "       (for the common OTA path, drop PORT and run: make DEVICE=$(DEVICE) flash)" >&2
 	@exit 1
 endif
-	@echo "== Flashing $(DEVICE) via $(PORT) =="
+	@echo "== USB-flashing $(DEVICE) via $(PORT) =="
 	$(ARDUINO_CLI) upload --fqbn $(FQBN) --port $(PORT) \
 		--input-dir $(dir $(FIRMWARE_BIN)) \
 		$(SKETCH_DIR)
 
-# OTA push over LAN. Default hostname = $(DEVICE).local — matches the
-# ArduinoOTA listener's mDNS name in critterchron_esp32.ino's setup().
-# Override with `OTA_HOST=<ip>` if mDNS isn't resolving (some networks
-# block multicast) or if you want to target a specific device by IP.
+# OTA push over LAN — the default `flash` path since 2026-04-24. Deployed
+# devices are on WiFi, so cables-as-default was backwards. Default
+# hostname = $(DEVICE).local — matches the ArduinoOTA listener's mDNS
+# name in critterchron_esp32.ino's setup(). Override with `OTA_HOST=<ip>`
+# if mDNS isn't resolving (some networks block multicast) or if you want
+# to target a specific device by IP.
 #
 # Calls espota.py directly rather than going through `arduino-cli upload
 # --protocol network`. arduino-cli's network-port discovery requires the
@@ -191,7 +194,7 @@ OTA_PORT ?= 3232
 # to reach the device. Override with `OTA_HOST_IP=<ip>` if needed.
 OTA_HOST_IP ?= $(shell route -n get $(OTA_HOST) 2>/dev/null | awk '/interface:/ {print $$2}' | xargs -I{} ipconfig getifaddr {} 2>/dev/null)
 
-flash-ota: $(FIRMWARE_BIN)
+flash: $(FIRMWARE_BIN)
 ifeq ($(ESPOTA_PY),)
 	@echo "error: espota.py not found under $(ESP32_CORE_ROOT); is the esp32 core installed?" >&2
 	@exit 1
@@ -202,6 +205,11 @@ endif
 		$(if $(OTA_HOST_IP),--host_ip=$(OTA_HOST_IP),) \
 		--file=$(FIRMWARE_BIN) \
 		--progress --debug
+
+# Back-compat alias. Pre-2026-04-24, `flash` was USB-only and OTA pushes
+# went through this name. Kept so existing scripts and muscle memory keep
+# working; new invocations should prefer plain `flash`.
+flash-ota: flash
 
 # --- Source assembly ---
 assemble: $(ENGINE_COPIES) $(ESP32_COPIES)

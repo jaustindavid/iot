@@ -186,28 +186,24 @@ def main(argv: list[str]) -> int:
         # (per-device headers, per-platform drivers) or whose reader
         # doesn't go through the Config interface at all (ops_only).
         #   `default: per-device`           — string sentinel (legacy)
-        #   `default_per_device: true`      — current convention for
-        #                                     keys whose literal default
-        #                                     lives in HAL source rather
-        #                                     than the catalog. Covers
-        #                                     both hal/devices/<name>.h
-        #                                     overrides (brightness,
-        #                                     night thresholds) and
-        #                                     per-platform driver headers
-        #                                     (light_exponent: 2.5 for
-        #                                     the CDS path, 0.5 for
-        #                                     BH1750, same key different
-        #                                     sensor math). stra2us-cli's
-        #                                     schema doesn't yet have a
-        #                                     dedicated `per-platform`
-        #                                     flag; reusing this one is
-        #                                     fine because the lint's
-        #                                     job here is just "don't
-        #                                     cross-check a literal that
-        #                                     doesn't exist in the YAML."
+        #   `default_per_device: true`      — default lives in a
+        #                                     hal/devices/<name>.h
+        #                                     override (brightness
+        #                                     floors, night thresholds).
+        #   `default_per_platform: true`    — default lives in a
+        #                                     per-HAL driver header
+        #                                     (e.g. light_exponent:
+        #                                     2.5 for the CDS path in
+        #                                     hal/particle/src/
+        #                                     LightSensor.h, 0.5 for
+        #                                     BH1750 in hal/esp32/src/
+        #                                     LightSensorBH1750.h).
+        #                                     See stra2us docs/
+        #                                     catalog_spec.md §2.3.
         catalog_default = entry.get("default")
         if (catalog_default == "per-device"
                 or entry.get("default_per_device")
+                or entry.get("default_per_platform")
                 or entry.get("ops_only")):
             continue
         kind, resolved = parse_default(c["default_expr"], defines)

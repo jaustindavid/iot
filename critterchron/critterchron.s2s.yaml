@@ -109,7 +109,7 @@ vars:
 
   light_exponent:
     type: float
-    default_per_device: true   # actually per-platform — see note below
+    default_per_platform: true
     scope: [app, device]
     range: [0.1, 5.0]
     help: |
@@ -123,11 +123,8 @@ vars:
           ESPHome-style sqrt (default 0.5) is the "bedroom" curve.
           See hal/esp32/src/LightSensorBH1750.h.
       Same key shared across drivers so a cross-device tune reaches both;
-      useful values just differ per platform, which is why there's no
-      single catalog default. Flagged `default_per_device` because the
-      stra2us-cli schema doesn't (yet) have a `default_per_platform` —
-      the semantics ("no single literal default; look in HAL source")
-      are the same, and the drift lint treats them identically.
+      useful values just differ per platform — hence no catalog literal.
+      See stra2us docs/catalog_spec.md §2.3 for the per-platform origin.
 
   light_lux_full:
     type: float

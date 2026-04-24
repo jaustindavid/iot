@@ -713,6 +713,7 @@ bool load(char* buf, size_t len) {
                     else if (strcmp(k, "diagonal") == 0)       { P.diagonal         = (uint8_t)atoi(v); P.has_diagonal    = 1; }
                     else if (strcmp(k, "diagonal_cost") == 0)  { P.diagonal_cost    = (float)atof(v); P.has_diagonal_cost = 1; }
                     else if (strcmp(k, "step_rate") == 0)      { P.step_rate        = atoi(v); P.has_step_rate        = 1; }
+                    else if (strcmp(k, "plan_horizon") == 0)   { P.plan_horizon     = atoi(v); P.has_plan_horizon     = 1; }
                     // Unknown keys: ignored. Forward-compat with future PF
                     // fields; the old encoder would have rejected them too
                     // but we're on the receiver end here.

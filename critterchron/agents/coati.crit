@@ -37,10 +37,11 @@ tick rate: 100ms
 
 --- pathfinding ---
 coati:
-  max nodes: 256
+  max nodes: 128
+  plan horizon: 16
   step rate: 1
   diagonal: allowed
-  diagonal_cost: 1.414
+  diagonal cost: 1.414
 
 --- behavior ---
 coati:

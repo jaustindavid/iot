@@ -327,6 +327,7 @@ int32_t CritterEngine::pfInt(uint16_t type_idx, const char* key, int32_t fallbac
         if (strEq(key, "penalty_lit")      && c.has_penalty_lit)      return c.penalty_lit;
         if (strEq(key, "penalty_occupied") && c.has_penalty_occupied) return c.penalty_occupied;
         if (strEq(key, "step_rate")        && c.has_step_rate)        return c.step_rate;
+        if (strEq(key, "plan_horizon")     && c.has_plan_horizon)     return c.plan_horizon;
     }
     int all = pfConfigIndex("all");
     if (all >= 0) {
@@ -335,6 +336,7 @@ int32_t CritterEngine::pfInt(uint16_t type_idx, const char* key, int32_t fallbac
         if (strEq(key, "penalty_lit")      && c.has_penalty_lit)      return c.penalty_lit;
         if (strEq(key, "penalty_occupied") && c.has_penalty_occupied) return c.penalty_occupied;
         if (strEq(key, "step_rate")        && c.has_step_rate)        return c.step_rate;
+        if (strEq(key, "plan_horizon")     && c.has_plan_horizon)     return c.plan_horizon;
     }
     return fallback;
 }
@@ -884,9 +886,11 @@ bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
 // A*
 // =======================================================================
 
-bool CritterEngine::aStarFirstStep(Point start, Point target, uint16_t type_idx,
-                                   Point& out_step) {
-    out_step = {0, 0};
+bool CritterEngine::aStarPlan(Point start, Point target, uint16_t type_idx,
+                              PlannedStep* out_steps, int max_steps, int& out_len,
+                              Point last_step) {
+    out_len = 0;
+    if (max_steps < 1) return false;
     if (start.x == target.x && start.y == target.y) return false;
 
     const bool diag = pfDiagonal(type_idx);
@@ -934,18 +938,139 @@ bool CritterEngine::aStarFirstStep(Point start, Point target, uint16_t type_idx,
     };
     q_push({hfn(start), idx(start.x, start.y)});
 
-    int nodes = 0;
-    int best_node = idx(start.x, start.y);
-    float best_h = hfn(start);
+    int   nodes     = 0;
+    const int start_idx = idx(start.x, start.y);
+    // best_node/best_h track the best partial progress if A* doesn't reach
+    // target before running out of budget. Deliberately *not* pre-seeded with
+    // start — that was a latent bug: if no popped node ever had h strictly
+    // below hfn(start) (e.g. agent at a local heuristic minimum inside the
+    // budget-reachable neighborhood, which is easy to hit with small
+    // max_nodes + occupancy/lit penalties steering A* sideways), best_node
+    // stayed at start, firstStepFrom(start) returned {0,0}, aStarFirstStep
+    // returned false, caller held the agent in place with 1-tick retry, and
+    // the next tick re-derived the same stuck state. Agent hangs forever.
+    // Now: only non-start pops are candidates, and if no pop ever beats the
+    // heuristic, we fall back to the frontier scan below.
+    int   best_node = -1;
+    float best_h    = std::numeric_limits<float>::infinity();
 
-    auto firstStepFrom = [&](int end) -> Point {
+    // Reconstruct the planned path from `end` back to start, writing up to
+    // max_steps entries of (dx, dy, per-edge cost) into out_steps starting
+    // at out_steps[0]. Returns the count written. The per-edge cost comes
+    // straight from A*'s cost[] array (g-cost delta between predecessor
+    // and successor) — this is exactly what the runtime cost-budget check
+    // in stepTowardTarget compares against. Used for both the "reached
+    // target" and "best-partial-progress" exits; partial-progress callers
+    // cap to 1 step because speculative plans past the partial-endpoint
+    // are more guess than plan.
+    auto planFromEnd = [&](int end, int cap) -> int {
+        pf_trail_.clear();
         int cur = end;
-        int prev = idx(start.x, start.y);
-        while (cur != prev && from[cur] != -1 && from[cur] != prev)
-            cur = from[cur];
-        if (cur == prev) return {0, 0};
-        return {static_cast<int8_t>(cur % W - start.x),
-                static_cast<int8_t>(cur / W - start.y)};
+        // Guard both by start arrival and by total steps — a malformed
+        // from[] (shouldn't happen, but…) can't loop us forever.
+        while (cur != start_idx && from[cur] != -1
+                && (int)pf_trail_.size() < N) {
+            pf_trail_.push_back(cur);
+            int next = from[cur];
+            if (next == cur) break;
+            cur = next;
+        }
+        if (pf_trail_.empty() || cur != start_idx) return 0;
+
+        int path_len = (int)pf_trail_.size();
+        int n = std::min(path_len, cap);
+        // pf_trail_ is ordered end→start; reverse while emitting so
+        // out_steps[0] is the first move the agent takes from `start`.
+        for (int i = 0; i < n; ++i) {
+            int node = pf_trail_[path_len - 1 - i];
+            int prev = (i == 0) ? start_idx : pf_trail_[path_len - i];
+            int nx = node % W, ny = node / W;
+            int px = prev % W, py = prev / W;
+            out_steps[i].dx   = static_cast<int8_t>(nx - px);
+            out_steps[i].dy   = static_cast<int8_t>(ny - py);
+            // cost delta is pure A*-charged edge cost; includes the
+            // backtrack bias iff i == 0 and this edge reversed last_step,
+            // which is harmless (runtime check stays consistent with
+            // plan-time accounting either way).
+            out_steps[i].cost = cost[node] - cost[prev];
+        }
+        return n;
+    };
+
+    // Precompute the "backtrack tile" — the neighbor of start that would
+    // reverse last_step. -1 when we have no last-step signal (fresh agent,
+    // just spawned, just wandered with dx=dy=0). When partial-progress
+    // mode has to pick *any* step and two alternatives look equal-ish by
+    // heuristic, preferring a non-backtrack tile is what actually breaks
+    // the A↔B cycle — the edge-cost bias above only shapes A* internal
+    // expansion, not the best-partial-progress selection below.
+    const int backtrack_idx =
+        (last_step.x != 0 || last_step.y != 0)
+          ? ((start.y - last_step.y) * W + (start.x - last_step.x))
+          : -1;
+    auto is_backtrack_step = [&](PlannedStep s) {
+        return backtrack_idx >= 0
+            && s.dx == -last_step.x && s.dy == -last_step.y;
+    };
+
+    // Shared fallback for "A* gave up before reaching target." Prefers the
+    // best_node the main loop tracked; if that's missing (no heuristic
+    // progress at all), scan the start's adjacent tiles for whichever one
+    // A* managed to relax (cost < infinity) with the lowest h. "Step
+    // wherever A* at least reached" beats standing still.
+    //
+    // Anti-oscillation: if the first step toward the chosen node reverses
+    // last_step, rescan the start-adjacent frontier for any non-backtrack
+    // neighbor A* relaxed. Accept the backtrack only when literally no
+    // other neighbor was reached — no-walls grid + tight budget can still
+    // technically hit that case if everything around start is lit+occupied.
+    // Returns false only when no neighbor at all was explored.
+    auto step_from_best = [&]() -> bool {
+        auto frontier_pick = [&](bool allow_backtrack) -> int {
+            int bn = -1;
+            float fb_h = std::numeric_limits<float>::infinity();
+            for (int m = 0; m < nmoves; ++m) {
+                int nx = start.x + moves[m].dx, ny = start.y + moves[m].dy;
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                int ni = idx(nx, ny);
+                if (cost[ni] == std::numeric_limits<float>::infinity()) continue;
+                if (!allow_backtrack && ni == backtrack_idx) continue;
+                float nh = hfn({static_cast<int8_t>(nx), static_cast<int8_t>(ny)});
+                if (bn < 0 || nh < fb_h) { fb_h = nh; bn = ni; }
+            }
+            return bn;
+        };
+
+        // Partial-progress exits always emit a *single* step. Committing
+        // to a multi-step plan past a speculative endpoint would amplify
+        // guess error — the first step beyond it was never A*-validated
+        // at all.
+        int bn = best_node;
+        if (bn < 0) {
+            bn = frontier_pick(/*allow_backtrack=*/false);
+            if (bn < 0) bn = frontier_pick(/*allow_backtrack=*/true);
+            if (bn < 0) return false;
+        }
+        int n = planFromEnd(bn, 1);
+        if (n == 0 || is_backtrack_step(out_steps[0])) {
+            // best_node's first step walks us backward. Retry via the
+            // adjacency scan with backtrack excluded.
+            int alt = frontier_pick(/*allow_backtrack=*/false);
+            if (alt >= 0) {
+                int an = planFromEnd(alt, 1);
+                if (an > 0 && !is_backtrack_step(out_steps[0])) {
+                    out_len = 1;
+                    return true;
+                }
+            }
+            // No clean alternative. If the original step is a legitimate
+            // (non-zero) backtrack, take it — staying put is worse than
+            // oscillating one tick while the world changes around us.
+            if (n > 0) { out_len = 1; return true; }
+            return false;
+        }
+        out_len = n;   // n == 1 in the partial-progress path
+        return true;
     };
 
     while (!pf_heap_.empty()) {
@@ -955,21 +1080,26 @@ bool CritterEngine::aStarFirstStep(Point start, Point target, uint16_t type_idx,
         ++nodes;
 
         if (cx == target.x && cy == target.y) {
-            Point s = firstStepFrom(ci);
-            if (s.x == 0 && s.y == 0) return false;
-            out_step = s;
+            int n = planFromEnd(ci, max_steps);
+            if (n == 0) return false;
+            out_len = n;
             return true;
         }
 
         float h = hfn({static_cast<int8_t>(cx), static_cast<int8_t>(cy)});
-        if (h < best_h) { best_h = h; best_node = ci; }
+        // Best-partial-progress eligibility excludes both start itself
+        // (covered above — see the latent-bug comment) AND the backtrack
+        // tile. Skipping backtrack here means the partial-progress return
+        // path can't pick "retreat one square" as its answer — which was
+        // the oscillation: both ends of an A↔B pair saw the opposite as
+        // the closest-h neighbor within budget and flipped each tick.
+        if (ci != start_idx && ci != backtrack_idx && h < best_h) {
+            best_h = h; best_node = ci;
+        }
 
         if (nodes >= max_nodes) {
             ++metrics_.failed_seeks;
-            Point s = firstStepFrom(best_node);
-            if (s.x == 0 && s.y == 0) return false;
-            out_step = s;
-            return true;
+            return step_from_best();
         }
 
         for (int m = 0; m < nmoves; ++m) {
@@ -985,6 +1115,20 @@ bool CritterEngine::aStarFirstStep(Point start, Point target, uint16_t type_idx,
                 if (agents_[k].pos.x == nx && agents_[k].pos.y == ny) { any_agent = true; break; }
             }
             if (any_agent) nc += pen_occ;
+            // Backtrack bias: only applied to edges leaving the start node,
+            // and only against the tile the agent just came from. 2.0 is
+            // tuned to beat the symmetric-geometry tie (lateral move costs
+            // 1; backtrack costs 1+2=3) while still losing to genuinely
+            // blocked-elsewhere paths (a lit+occupied neighbor at 1+10+20
+            // dwarfs the bias). Interior A* expansion is untouched so
+            // longer planned paths that happen to wrap back past the start
+            // still cost correctly. See Agent::last_step for the signal.
+            if (ci == start_idx
+                    && (last_step.x != 0 || last_step.y != 0)
+                    && nx == start.x - last_step.x
+                    && ny == start.y - last_step.y) {
+                nc += 2.0f;
+            }
             int ni = idx(nx, ny);
             if (nc < cost[ni]) {
                 cost[ni] = nc;
@@ -994,9 +1138,111 @@ bool CritterEngine::aStarFirstStep(Point start, Point target, uint16_t type_idx,
         }
     }
 
-    Point s = firstStepFrom(best_node);
-    if (s.x == 0 && s.y == 0) return false;
-    out_step = s;
+    // Heap drained without reaching target. Rare on a connected no-walls
+    // grid (target eventually pops even with heavy penalties), but same
+    // fallback applies if it ever does.
+    return step_from_best();
+}
+
+// Commit one move toward `target` for agent `a`, reusing a cached plan
+// when it's still valid or replanning via aStarPlan. The two validity
+// checks are:
+//   (1) Target drift — seek re-picks nearest each tick; if that moved,
+//       the old plan heads somewhere we're no longer chasing.
+//   (2) Cost-budget surprise — the next cached step's *current* edge cost
+//       (lit / occupied by another agent now, even if it wasn't at plan
+//       time) is compared against what A* charged when the plan was made,
+//       with a running `plan_slack` accumulator soaking up small under-
+//       budget windfalls. A step whose real cost exceeds planned + slack
+//       means reality drifted off model → replan.
+//
+// The mechanism composes cleanly: at plan_horizon=1 the plan is always
+// consumed in one tick and (2) never fires (slack starts at 0, plan is
+// fresh). At higher horizons, (2) is what gives back the reactivity the
+// horizon otherwise trades away.
+bool CritterEngine::stepTowardTarget(Agent& a, Point target) {
+    const bool diag = pfDiagonal(a.type_idx);
+    const float dcost = diag ? pfDiagonalCost(a.type_idx) : 1.0f;
+    const int32_t pen_lit = pfInt(a.type_idx, "penalty_lit", PF_DEF_PENALTY_LIT);
+    const int32_t pen_occ = pfInt(a.type_idx, "penalty_occupied", PF_DEF_PENALTY_OCCUPIED);
+    const int32_t step_rate = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
+
+    // Compute the *current* edge cost for stepping from `a.pos` by
+    // (dx, dy). Mirrors the cost function inside aStarPlan exactly so
+    // plan-time and runtime accounting stay on the same ruler.
+    auto edge_cost_now = [&](int8_t dx, int8_t dy, int nx, int ny) -> float {
+        float c = (dx != 0 && dy != 0) ? dcost : 1.0f;
+        if (grid_[nx][ny].state) c += pen_lit;
+        for (uint16_t k = 0; k < agent_count_; ++k) {
+            if (!agents_[k].alive || agents_[k].id == a.id) continue;
+            if (agents_[k].pos.x == nx && agents_[k].pos.y == ny) {
+                c += pen_occ;
+                break;
+            }
+        }
+        return c;
+    };
+
+    auto commit_step = [&](int8_t dx, int8_t dy) {
+        int nx = a.pos.x + dx;
+        int ny = a.pos.y + dy;
+        a.prev_pos = a.pos;
+        a.pos = {static_cast<int8_t>(nx), static_cast<int8_t>(ny)};
+        a.last_step = {dx, dy};
+        a.step_duration   = (int16_t)step_rate;
+        a.remaining_ticks = (int16_t)step_rate;
+    };
+
+    // ---- try cached plan ----
+    if (a.plan_len > 0 && a.plan_cursor < a.plan_len) {
+        // Target drift: compare against stored plan_target.
+        if (a.plan_target.x != target.x || a.plan_target.y != target.y) {
+            a.plan_len = 0;  // fall through to replan
+        } else {
+            const PlannedStep& ps = a.plan[a.plan_cursor];
+            int nx = a.pos.x + ps.dx;
+            int ny = a.pos.y + ps.dy;
+            if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) {
+                // Shouldn't happen (A* bounds-checked at plan time) but
+                // if the grid shrank mid-plan or the agent teleported via
+                // a scripted `step`, bail out and replan.
+                a.plan_len = 0;
+            } else {
+                float actual = edge_cost_now(ps.dx, ps.dy, nx, ny);
+                if (actual > ps.cost + a.plan_slack) {
+                    // Surprise. Replan.
+                    a.plan_len = 0;
+                } else {
+                    a.plan_slack += ps.cost - actual;  // stays >= 0 by construction
+                    ++a.plan_cursor;
+                    commit_step(ps.dx, ps.dy);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // ---- replan ----
+    int32_t horizon = pfInt(a.type_idx, "plan_horizon", 1);
+    if (horizon < 1) horizon = 1;
+    if (horizon > PLAN_MAX) horizon = PLAN_MAX;
+
+    int plan_len = 0;
+    bool ok = aStarPlan(a.pos, target, a.type_idx,
+                        a.plan, (int)horizon, plan_len, a.last_step);
+    if (!ok || plan_len <= 0) {
+        a.plan_len = 0;
+        a.step_duration   = 1;
+        a.remaining_ticks = 1;
+        return false;
+    }
+    a.plan_len     = static_cast<uint8_t>(plan_len);
+    a.plan_cursor  = 1;                 // cursor advances over the step we execute below
+    a.plan_target  = target;
+    a.plan_slack   = 0.0f;
+
+    const PlannedStep& first = a.plan[0];
+    commit_step(first.dx, first.dy);
     return true;
 }
 
@@ -1214,6 +1460,13 @@ void CritterEngine::processAgent(Agent& a) {
             if (ny < 0) ny = 0; else if (ny >= GRID_HEIGHT) ny = GRID_HEIGHT - 1;
             a.prev_pos = a.pos;
             a.pos = {static_cast<int8_t>(nx), static_cast<int8_t>(ny)};
+            a.last_step = {static_cast<int8_t>(a.pos.x - a.prev_pos.x),
+                           static_cast<int8_t>(a.pos.y - a.prev_pos.y)};
+            // Scripted non-seek move invalidates any cached seek plan —
+            // the plan's deltas were relative to a different starting
+            // position and its cost accounting was against an older
+            // world state. Cheap to clear; cheap to replan on next seek.
+            a.plan_len = 0;
             int32_t sr = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
             a.step_duration   = (int16_t)sr;
             a.remaining_ticks = (int16_t)sr;
@@ -1246,6 +1499,9 @@ void CritterEngine::processAgent(Agent& a) {
                 Point np = cands[d(rng_)];
                 a.prev_pos = a.pos;
                 a.pos = np;
+                a.last_step = {static_cast<int8_t>(a.pos.x - a.prev_pos.x),
+                               static_cast<int8_t>(a.pos.y - a.prev_pos.y)};
+                a.plan_len = 0;  // see comment at `step` — scripted move invalidates plan
                 int32_t sr = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
                 a.step_duration = (int16_t)sr;
                 a.remaining_ticks = (int16_t)sr;
@@ -1378,21 +1634,13 @@ void CritterEngine::processAgent(Agent& a) {
                 }
 
                 if (have && !(best.x == a.pos.x && best.y == a.pos.y)) {
-                    Point step;
+                    // astar_us_ now covers the plan-reuse path too — the
+                    // cost-budget check is cheap but inside the same
+                    // envelope, and on replan it's dominated by aStarPlan
+                    // the way it always was. Same timing semantics.
                     uint32_t astar_t0 = now_us();
-                    bool moved = aStarFirstStep(a.pos, best, a.type_idx, step);
+                    (void)stepTowardTarget(a, best);
                     astar_us_ += now_us() - astar_t0;
-                    if (moved) {
-                        a.prev_pos = a.pos;
-                        a.pos = {static_cast<int8_t>(a.pos.x + step.x),
-                                 static_cast<int8_t>(a.pos.y + step.y)};
-                        int32_t sr = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
-                        a.step_duration   = (int16_t)sr;
-                        a.remaining_ticks = (int16_t)sr;
-                    } else {
-                        a.step_duration   = 1;
-                        a.remaining_ticks = 1;
-                    }
                     a.pc = pc;   // stay on this seek
                     return;
                 }
@@ -1529,21 +1777,9 @@ void CritterEngine::processAgent(Agent& a) {
                                     (want_free && strEq(target_type, "current"))))
                     grid_[best.x][best.y].claimant = a.id;
 
-                Point step;
                 uint32_t astar_t0 = now_us();
-                bool moved = aStarFirstStep(a.pos, best, a.type_idx, step);
+                (void)stepTowardTarget(a, best);
                 astar_us_ += now_us() - astar_t0;
-                if (moved) {
-                    a.prev_pos = a.pos;
-                    a.pos = {static_cast<int8_t>(a.pos.x + step.x),
-                             static_cast<int8_t>(a.pos.y + step.y)};
-                    int32_t sr = pfInt(a.type_idx, "step_rate", PF_DEF_STEP_RATE);
-                    a.step_duration = (int16_t)sr;
-                    a.remaining_ticks = (int16_t)sr;
-                } else {
-                    a.step_duration = 1;
-                    a.remaining_ticks = 1;
-                }
                 a.pc = pc;   // stay on this seek
                 return;
             }

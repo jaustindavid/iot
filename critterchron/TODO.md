@@ -4,7 +4,7 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
-- **`step (dx, dy)` bounds-aware variant.** The current opcode clamps to
+- **Guarded `step (dx, dy) if free` opcode.** The current opcode clamps to
   grid edges, but coati's bobbing at the pool is "literally move here, no
   questions asked" — if another agent is on the target cell, or the
   target happens to be off-grid, the animation is silently degraded.
@@ -656,13 +656,58 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 3 — WobblyTime**~~ (landed 2026-04-19). `TimeSource` decorator
   around the Particle time source. Tuning via Stra2us KV lands with
   phase 4.
-- **Phase 5 — OTA IR.** Ship IR bytes via Stra2us KV; swap the static
-  `critter_ir.h` blob for a flash-loaded buffer.   *NB: compile in a
-  default IR blob, in case stra2us is not available on first boot.*
-- **Phase 6 — ESP32 port.** FastLED-backed `LedSink`. Engine + device
-  header format unchanged.
+- **Phase 5 — OTA IR persistence.** KV pull + in-RAM apply is live on
+  both HALs today (Particle pre-2026-04-22, ESP32 2026-04-23 via the
+  `.ino`-ladder M4): devices poll `critterchron/<device>/ir`, fetch
+  the blob, verify content_sha, and swap the in-RAM IR tables via
+  `critter_ir::load()`. What's still missing: every cold boot snaps
+  back to the compiled-in `critter_ir.h` default, so the first
+  `ir_poll` after boot eats a fetch+apply cycle to re-converge on
+  whatever the device was already running. Phase 5 closes that by
+  persisting the OTA'd bytes to flash (NVS on ESP32, DCT/EEPROM on
+  Particle) after a successful apply, and having
+  `CritterEngine::begin()` try the flash copy first and only fall
+  through to `loadDefault()` on empty / corrupt / parse-fail. *NB:
+  the compiled-in blob stays pristine as the "never been online"
+  fallback — we write to a separate flash region, not over `.rodata`.*
+  *Numbering note: "Phase N" is the HAL_SPEC roadmap axis; "M N" in
+  this file also refers to the ESP32-bring-up ladder (see the ESP32
+  Hotspot / OTA-pull-mode / Auto-rollback entries above). They aren't
+  1:1 — Phase 5 ≠ ESP32-ladder M5.*
+- ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-24 — ESP32 `make flash` default flipped to OTA.** On
+  `hal/esp32c3/Makefile`, `flash` is now the OTA path (no `PORT=`
+  required) and `flash-usb` is the cable path (requires `PORT=`).
+  `flash-ota` stays as a one-line alias for `flash` so muscle memory
+  and existing scripts keep working. Rationale is the common-case-is-
+  default argument: deployed devices are the norm, cables are the
+  exception. Verified via `make -n` dry-runs: `flash` → `espota.py`
+  invocation, `flash-ota` → same, `flash-usb` → `arduino-cli upload
+  --port ...`. `make list` output and usage-comment block at the top
+  of the Makefile updated to match. Photon side untouched — Particle
+  OTA goes through the cloud via `particle flash`, not a Makefile
+  concern. The `flash-usb` recipe emits a stderr hint pointing at
+  the OTA path when invoked, so a drive-by operator who types the
+  old muscle-memory command sees the new convention.
+
+- **2026-04-24 — Phase 6 ESP32 port closed.** timmy_tanuki
+  (ESP32-C3-DevKitM-1, 32x8 WS2812B on GPIO10, BH1750 on I2C) runs
+  the shared engine + IR tree clean via `hal/esp32/src/FastLEDSink.h`,
+  a full-parity sink alongside `NeoPixelSink.h` (same rotation table,
+  same serpentine math, same nonzero-preserving per-channel brightness
+  scale). `hal/CritterEngine.*` and `hal/ir/*` stayed platform-gate-free
+  — the "engine + device header format unchanged" clause of the
+  milestone spec held through the port. Single reference device is the
+  scope bar; future S3 / plain-ESP32 variants are post-Phase-6. M1-M4
+  of the internal ESP32-bring-up ladder (pixels, WiFi/SNTP, Stra2us,
+  OTA IR pull) are all landed; the ladder's M5 (ArduinoOTA push +
+  rescue-hold) is also landed per the .ino, with residual follow-ups
+  (pull-mode firmware OTA, auto-rollback on post-flash crash,
+  hotspot-mode WiFi recovery) tracked as independent near-term items
+  above — they outlive "the port" as a milestone.
 
 - **2026-04-23 — `publish_ir.py` flips SOURCE to opt-in.** `--source`
   replaces `--no-source` as the way to include the SOURCE trailer; the
