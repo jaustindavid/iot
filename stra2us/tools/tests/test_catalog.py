@@ -104,6 +104,51 @@ def test_default_and_per_device_mutually_exclusive(tmp_path):
         load_catalog(p)
 
 
+def test_default_and_per_platform_mutually_exclusive(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          foo:
+            type: float
+            scope: [app]
+            default: 2.5
+            default_per_platform: true
+    """)
+    with pytest.raises(CatalogError, match="default_per_platform"):
+        load_catalog(p)
+
+
+def test_per_device_and_per_platform_mutually_exclusive(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          foo:
+            type: float
+            scope: [app]
+            default_per_device: true
+            default_per_platform: true
+    """)
+    with pytest.raises(CatalogError, match="default_per_platform"):
+        load_catalog(p)
+
+
+def test_default_per_platform_alone_ok(tmp_path):
+    """Motivating case: critterchron's `light_exponent` — Particle/CDS
+    driver defaults to 2.5, ESP32/BH1750 defaults to 0.5. Catalog says
+    "look in hal/<platform>/src/" rather than lying about one literal."""
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          light_exponent:
+            type: float
+            scope: [app, device]
+            default_per_platform: true
+    """)
+    cat = load_catalog(p)
+    assert cat.vars["light_exponent"].default_per_platform is True
+    assert cat.vars["light_exponent"].default is None
+
+
 def test_range_requires_numeric(tmp_path):
     p = _write(tmp_path, """
         app: testapp

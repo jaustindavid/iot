@@ -78,8 +78,9 @@ Each entry under `vars:` is a map with the following fields.
 |----------------------|----------|------------------|---------|
 | `type`               | yes      | string           | One of `int`, `float`, `string`, `bool`, `enum`. Governs parsing and validation. See §2.1. |
 | `scope`              | yes      | list of string   | Non-empty subset of `["app", "device"]`. Which KV levels this key may be set at. See §3. |
-| `default`            | no       | number / string  | Compiled-in fallback value. Informational — displayed in the UI, cross-checked by the drift lint. Omit when `default_per_device: true`. |
-| `default_per_device` | no       | bool             | When `true`, the compiled-in default is set in per-device headers rather than app-wide code. The drift lint skips the default cross-check for keys with this flag. Mutually exclusive with `default`. |
+| `default`            | no       | number / string  | Compiled-in fallback value. Informational — displayed in the UI, cross-checked by the drift lint. Mutually exclusive with `default_per_device` and `default_per_platform`. See §2.3. |
+| `default_per_device` | no       | bool             | When `true`, the compiled-in default lives in per-device headers (one literal per unit) rather than app-wide code. The drift lint skips the default cross-check for keys with this flag. Mutually exclusive with `default` and `default_per_platform`. See §2.3. |
+| `default_per_platform` | no     | bool             | When `true`, the compiled-in default lives in per-HAL source (one literal per platform — e.g. ESP32 vs Particle) rather than app-wide code. The drift lint resolves per-platform, looking in each HAL's source tree. Mutually exclusive with `default` and `default_per_device`. See §2.3. |
 | `range`              | no       | `[lo, hi]`       | Numeric types only. **Recommended** bounds — advisory to tooling, not enforced on-device. See invariant 2 in §4. |
 | `values`             | cond.    | list             | Required for `type: enum`. List of allowed string values. |
 | `format`             | no       | string           | UI hint for how to render the control. See §2.2. Does not change validation. |
@@ -114,6 +115,32 @@ it through in `catalog` listings. Recognized values:
 
 Apps may use any string here; unknown values fall back to the default
 control for the underlying `type`.
+
+### 2.3 Where the compiled-in default lives
+
+`default`, `default_per_device`, and `default_per_platform` are the
+three *mutually exclusive* ways a variable can declare where its
+compiled-in fallback comes from. At most one may be set; zero is also
+legal (e.g. `ops_only` keys like `ir` that have no fallback at all).
+
+| Flag                     | Literal count | Location the drift lint looks in                  | Example |
+|--------------------------|---------------|---------------------------------------------------|---------|
+| `default: <value>`       | 1             | The catalog itself (and matching `#define` / const in firmware). | `heartbeep: 300` |
+| `default_per_device: true` | N (one per unit) | Per-device headers, e.g. `hal/devices/<device>.h`. | A per-unit brightness floor that varies by physical build. |
+| `default_per_platform: true` | N (one per platform) | Per-HAL source, e.g. `hal/<platform>/src/*.cpp`. | `light_exponent`: Particle/CDS driver defaults to 2.5, ESP32/BH1750 to 0.5 because the upstream normalization is inverted. |
+
+The distinction matters for the drift lint, not for the server. The
+server sees all three forms as "the catalog says nothing enforceable
+about the default"; only tooling that walks firmware source cares
+which tree to search.
+
+Rationale for making `default_per_platform` a sibling flag rather than
+folding it into `default_per_device`: the two are semantically
+different. `default_per_device` means *every unit could in principle
+be different and converge over the fleet's life*. `default_per_platform`
+means *there are exactly N literals, one per HAL, and they will stay
+different as long as the drivers differ*. Conflating them mis-routes
+the drift lint to the wrong source tree.
 
 ---
 
@@ -336,8 +363,9 @@ wonders why we stopped short.
   on the device to ignore writes, or exclude it from the catalog.
 - **Per-device catalogs.** The catalog is per-*app*. Device-specific
   differences (brightness floor, grid geometry) are expressed by
-  `scope: [device]` + `default_per_device: true`, not by separate
-  per-device files.
+  `scope: [device]` + `default_per_device: true` (per-unit) or
+  `default_per_platform: true` (per-HAL), not by separate per-device
+  files.
 - **Secret values.** The catalog is for operator-tunable
   configuration. If an app stashes secrets in KV, the catalog is
   the wrong place to document them.

@@ -42,6 +42,7 @@ class Var(BaseModel):
     scope: list[Scope] = Field(min_length=1)
     default: int | float | str | bool | None = None
     default_per_device: bool = False
+    default_per_platform: bool = False
     range: tuple[int | float, int | float] | None = None
     values: list[str] | None = None
     format: str | None = None
@@ -61,10 +62,23 @@ class Var(BaseModel):
     def _cross_field_checks(self) -> "Var":
         t = self.type
 
-        # default vs default_per_device mutually exclusive.
-        if self.default is not None and self.default_per_device:
+        # At most one of {default, default_per_device, default_per_platform}.
+        # Each flag signals a different origin for the compiled-in default:
+        #   - `default`              : lives in the catalog as a literal
+        #   - `default_per_device`   : lives in per-device headers (one per unit)
+        #   - `default_per_platform` : lives in per-HAL source (one per platform)
+        # Zero-set is legal (ops_only keys like `ir` have no literal default).
+        set_origins = [
+            name for name, is_set in (
+                ("default", self.default is not None),
+                ("default_per_device", self.default_per_device),
+                ("default_per_platform", self.default_per_platform),
+            ) if is_set
+        ]
+        if len(set_origins) > 1:
             raise ValueError(
-                "use either `default` or `default_per_device: true`, not both"
+                "at most one of `default`, `default_per_device: true`, "
+                f"`default_per_platform: true` may be set (got: {set_origins})"
             )
 
         # `range` is numeric-only.

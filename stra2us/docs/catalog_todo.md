@@ -21,6 +21,7 @@ file is where we capture the in-flight thinking that shapes it.
 | 2026-04-22 | M2 landed: `catalog publish` + `catalog fetch` via `/kv/_catalog/{app}`. | Smoke-tested round-trip byte-equal against local redis+uvicorn; 29 offline + 3 live tests green. |
 | 2026-04-22 | `STRA2US_FIRMWARE_DIR` env override in backend (default still `/firmware`). | Hardcoded `/firmware` blocked non-Docker local dev; one-line, zero behavior change for the compose path. |
 | 2026-04-23 | Static catalog-drift lint stays in critterchron for now; no upstream to `stra2us_cli`. | CritterChron is the only consumer today; its `test_s2s_catalog.py` (~210 lines) is the proven shape. Wait for a 2nd app before generalizing. |
+| 2026-04-24 | Added `default_per_platform: true` as third mutually-exclusive sibling of `default` / `default_per_device`. | Critterchron's `light_exponent` needed it (Particle/CDS defaults to 2.5, ESP32/BH1750 to 0.5 because the upstream `n` normalization is inverted). `default_per_device` was lying about the source of truth. |
 
 ## Active — M2 worklist
 
@@ -72,6 +73,13 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   hint consumption lands in M3.
 - Catalog diff viewer / history stream — predicated on versioning
   decision above.
+- **Critterchron follow-up: flip `light_exponent` to
+  `default_per_platform: true`.** Schema support shipped 2026-04-24
+  (see decisions log). CritterChron's `critterchron.s2s.yaml`
+  currently apologizes in a YAML comment that `default_per_device`
+  is the wrong flag for this key. Flipping the flag also unblocks
+  the drift lint (when it lands in `stra2us_cli`) to route to
+  `hal/<platform>/src/` instead of `hal/devices/*.h`. Filed 2026-04-24.
 - **Devices tab should derive its list from HMAC client ACLs, not
   path-segment scanning.** Current implementation
   (`fetchCatalogDevices` + `_parseDeviceFromKey` in
