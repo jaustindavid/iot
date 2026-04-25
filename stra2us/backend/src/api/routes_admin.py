@@ -347,47 +347,57 @@ def _log_resource_from_action(action: str) -> Optional[str]:
 
 @router.get("/logs")
 async def get_logs(
+    request: Request,
     limit: int = 200,
     client_id: Optional[List[str]] = Query(None),
     admin_ctx: dict = Depends(get_admin_context),
 ):
     redis = get_redis_client()
-    # ACL filter is always applied per entry, so always over-fetch to give
-    # a scoped admin a full page after denied entries drop out.
-    fetch_count = min(limit * 10, 5000)
-    records = await redis.xrevrange("system:activity_log", max="+", min="-", count=fetch_count)
+    phases = PerfPhases(request)
+    # Over-fetch insurance for scoped admins: their ACL filter may drop
+    # most entries, so we pull more than asked to leave a full page after
+    # filtering. Wildcard admins skip this — every entry passes their
+    # filter, so the multiplier is pure deserialization tax (the dominant
+    # cost of this endpoint at any meaningful stream size).
+    acl_perms = admin_ctx.get("acl", {}).get("permissions", [])
+    is_wildcard = any(p.get("prefix") == "*" for p in acl_perms)
+    fetch_count = limit if is_wildcard else min(limit * 10, 5000)
+
+    with phases.phase("xrevrange"):
+        records = await redis.xrevrange("system:activity_log", max="+", min="-", count=fetch_count)
 
     logs = []
-    for msg_id, fields in records:
-        cid = fields.get(b"client_id", b"unknown")
-        if isinstance(cid, bytes):
-            cid = cid.decode("utf-8")
+    with phases.phase("filter_loop"):
+        for msg_id, fields in records:
+            cid = fields.get(b"client_id", b"unknown")
+            if isinstance(cid, bytes):
+                cid = cid.decode("utf-8")
 
-        if client_id and cid not in client_id:
-            continue
-
-        action = fields.get(b"action", b"")
-        status = fields.get(b"status", b"")
-        action_str = action.decode("utf-8") if isinstance(action, bytes) else action
-
-        # ACL filter: only show log entries whose target the caller can read.
-        # Firmware hits and other non-ACL-scoped actions pass through — they
-        # aren't per-app resources.
-        resource = _log_resource_from_action(action_str)
-        if resource is not None:
-            try:
-                await check_acl(admin_ctx, resource, mode="read")
-            except HTTPException:
+            if client_id and cid not in client_id:
                 continue
 
-        logs.append({
-            "timestamp": int(fields.get(b"timestamp", b"0")),
-            "client_id": cid,
-            "action":    action_str,
-            "status":    status.decode("utf-8") if isinstance(status, bytes) else status,
-        })
-        if len(logs) >= limit:
-            break
+            action = fields.get(b"action", b"")
+            status = fields.get(b"status", b"")
+            action_str = action.decode("utf-8") if isinstance(action, bytes) else action
+
+            # ACL filter: only show log entries whose target the caller can read.
+            # Firmware hits and other non-ACL-scoped actions pass through — they
+            # aren't per-app resources.
+            resource = _log_resource_from_action(action_str)
+            if resource is not None:
+                try:
+                    await check_acl(admin_ctx, resource, mode="read")
+                except HTTPException:
+                    continue
+
+            logs.append({
+                "timestamp": int(fields.get(b"timestamp", b"0")),
+                "client_id": cid,
+                "action":    action_str,
+                "status":    status.decode("utf-8") if isinstance(status, bytes) else status,
+            })
+            if len(logs) >= limit:
+                break
 
     return logs
 
