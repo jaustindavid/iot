@@ -127,8 +127,6 @@ vars:
       cross-check for keys whose default is marked per-device. Range
       lower bound is 1, not 0: zero would turn the panel off entirely
       and is reserved as a sentinel elsewhere (see `night_enter_brightness`).
-      The HAL still clamps `min_b < 0 → 0` today; see TODO for the
-      belt-and-suspenders floor.
 
   max_brightness:
     type: int

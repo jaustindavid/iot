@@ -408,7 +408,12 @@ async def restore_keys(payload: BackupPayload, force: bool = Query(False), _: di
 # --- Topic Stream Monitor ---
 
 @router.get("/stream/q/{topic}")
-async def stream_monitor(topic: str, limit: int = 50, _: dict = Depends(require_admin_queue("read"))):
+async def stream_monitor(
+    topic: str,
+    limit: int = 50,
+    client_id: Optional[List[str]] = Query(None),
+    _: dict = Depends(require_admin_queue("read")),
+):
     """Read-only scan of the last N messages from a topic stream.
     Uses XREVRANGE — does not advance any subscriber cursor.
     """
@@ -430,20 +435,23 @@ async def stream_monitor(topic: str, limit: int = 50, _: dict = Depends(require_
         if now > exp:
             continue
 
+        cid = fields.get(b"client_id", b"unknown")
+        if isinstance(cid, bytes):
+            cid = cid.decode("utf-8")
+
+        if client_id and cid not in client_id:
+            continue
+
         raw_payload = fields.get(b"payload", b"")
         try:
             data = msgpack.unpackb(raw_payload, raw=False)
         except Exception:
             data = raw_payload.hex()
 
-        client_id = fields.get(b"client_id", b"unknown")
-        if isinstance(client_id, bytes):
-            client_id = client_id.decode("utf-8")
-
         messages.append({
             "id": msg_id,
             "received_at": received_at,
-            "client_id": client_id,
+            "client_id": cid,
             "data": data,
         })
 

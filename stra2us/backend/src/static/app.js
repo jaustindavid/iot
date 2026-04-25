@@ -708,15 +708,12 @@ function _effectiveCell(res) {
     return `<code>${escapeHtml(JSON.stringify(res.value))}</code>`;
 }
 
-// Open the M3b key editor from a device-effective row, pre-filling the
-// device id so the Device pane is ready to save.
+// Open the M3b key editor from a device-effective row, locked to that
+// device. The app-scope pane is suppressed in this entry path because the
+// operator came in via a specific device — exposing app-wide writes here
+// is a foot-gun.
 function openKeyEditorForDevice(keyName, deviceId) {
-    openKeyEditor(keyName);
-    const input = document.getElementById('deviceIdInput');
-    if (input) {
-        input.value = deviceId;
-        loadDeviceScope();
-    }
+    openKeyEditor(keyName, { lockedDevice: deviceId });
 }
 
 async function fetchCatalogRaw() {
@@ -875,14 +872,16 @@ async function _fetchScopeValue(app, keyName, device) {
     return { state: 'set', value: data.message };
 }
 
-function openKeyEditor(keyName) {
+function openKeyEditor(keyName, opts = {}) {
     if (!_currentCatalog) return;
     const v = _currentCatalog.vars[keyName];
     if (!v) return;
+    const lockedDevice = opts.lockedDevice || null;
     _editorContext = { app: _currentCatalog.app, keyName, var: v };
 
     const hasApp = Array.isArray(v.scope) && v.scope.includes('app');
     const hasDevice = Array.isArray(v.scope) && v.scope.includes('device');
+    const showAppPane = hasApp && !lockedDevice;
 
     document.getElementById('keyEditorTitle').innerHTML =
         `<code>${escapeHtml(keyName)}</code> <span class="badge badge-type">${escapeHtml(v.type)}</span>`;
@@ -897,7 +896,7 @@ function openKeyEditor(keyName) {
 
     // App pane
     const appPane = document.getElementById('keyEditorAppPane');
-    if (hasApp) {
+    if (showAppPane) {
         appPane.innerHTML = `
             <h4>App scope <span class="form-hint-sm">&mdash; <code>${escapeHtml(_currentCatalog.app)}/${escapeHtml(keyName)}</code></span></h4>
             <div class="key-editor-row">
@@ -914,6 +913,15 @@ function openKeyEditor(keyName) {
         _fetchScopeValue(_editorContext.app, keyName, null).then(res => {
             document.getElementById('currentApp').innerHTML = _renderCurrent(res.state, res.value);
         });
+    } else if (lockedDevice && hasApp) {
+        appPane.innerHTML = `
+            <div class="form-hint-sm key-editor-scope-note">
+                Editing the device-level override for <code>${escapeHtml(lockedDevice)}</code>.
+                To make an app-wide change, close this and edit from the catalog's
+                <strong>Variables</strong> tab.
+            </div>
+        `;
+        appPane.classList.remove('hidden');
     } else {
         appPane.innerHTML = '';
         appPane.classList.add('hidden');
@@ -922,15 +930,24 @@ function openKeyEditor(keyName) {
     // Device pane
     const devPane = document.getElementById('keyEditorDevicePane');
     if (hasDevice) {
+        const pickerHtml = lockedDevice
+            ? `<div class="key-editor-device-picker">
+                   <strong>Device:</strong> <code>${escapeHtml(lockedDevice)}</code>
+                   <input type="hidden" id="deviceIdInput" value="${escapeHtml(lockedDevice)}">
+               </div>`
+            : `<div class="key-editor-device-picker">
+                   <input type="text" id="deviceIdInput" placeholder="device id (e.g. ricky)">
+                   <button class="btn-sm" onclick="loadDeviceScope()">Load</button>
+               </div>`;
+        const initialCurrent = lockedDevice
+            ? '&hellip;'
+            : '(enter device id and press Load)';
         devPane.innerHTML = `
             <h4>Device scope</h4>
             <div class="key-editor-row">
-                <div class="key-editor-device-picker">
-                    <input type="text" id="deviceIdInput" placeholder="device id (e.g. ricky)">
-                    <button class="btn-sm" onclick="loadDeviceScope()">Load</button>
-                </div>
-                <div class="key-editor-current">Current: <span id="currentDevice" class="text-muted">(enter device id and press Load)</span></div>
-                <div class="key-editor-edit hidden" id="deviceEditRow">
+                ${pickerHtml}
+                <div class="key-editor-current">Current: <span id="currentDevice" class="text-muted">${initialCurrent}</span></div>
+                <div class="key-editor-edit ${lockedDevice ? '' : 'hidden'}" id="deviceEditRow">
                     ${_editControlHtml('device', v)}
                     <button class="primary-btn btn-sm" onclick="saveScope('device')">Save</button>
                     <button class="btn-sm btn-danger" onclick="unsetScope('device')">Unset</button>
@@ -939,6 +956,11 @@ function openKeyEditor(keyName) {
             </div>
         `;
         devPane.classList.remove('hidden');
+        if (lockedDevice) {
+            _fetchScopeValue(_editorContext.app, keyName, lockedDevice).then(res => {
+                document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
+            });
+        }
     } else {
         devPane.innerHTML = '';
         devPane.classList.add('hidden');
@@ -1147,6 +1169,42 @@ const monitorClientColors = {};
 let monitorInterval = null;
 let monitorSeenIds = new Set();
 let monitorActive = false;
+let monitorFilterClients = new Set();
+let monitorKnownClients = [];
+let monitorClientsLoaded = false;
+
+async function loadMonitorClients() {
+    if (monitorClientsLoaded) return;
+    const { data: clients } = await fetchAPI('/keys');
+    monitorKnownClients = clients.map(c => c.client_id).sort();
+    monitorClientsLoaded = true;
+    renderMonitorChips();
+}
+
+function renderMonitorChips() {
+    const container = document.getElementById('monitorFilterChips');
+    if (!container) return;
+    container.innerHTML = monitorKnownClients.map(id => {
+        const eid = escapeHtml(id);
+        const active = monitorFilterClients.has(id) ? ' active' : '';
+        return `<button class="filter-chip${active}" data-client="${eid}">${eid}</button>`;
+    }).join('');
+
+    container.querySelectorAll('.filter-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const clientId = chip.dataset.client;
+            if (monitorFilterClients.has(clientId)) {
+                monitorFilterClients.delete(clientId);
+            } else {
+                monitorFilterClients.add(clientId);
+            }
+            renderMonitorChips();
+            // Filter is server-side; reset feed so newly-included history backfills.
+            monitorClear();
+            if (monitorActive) monitorPoll();
+        });
+    });
+}
 
 function monitorClientColor(clientId) {
     if (!monitorClientColors[clientId]) {
@@ -1166,7 +1224,13 @@ async function monitorPoll() {
     const topic = document.getElementById('monitorTopic').value.trim();
     if (!topic) return;
 
-    const res = await fetch(`${API_BASE}/stream/q/${topic}`);
+    let url = `${API_BASE}/stream/q/${topic}`;
+    if (monitorFilterClients.size > 0) {
+        const params = new URLSearchParams();
+        for (const id of monitorFilterClients) params.append('client_id', id);
+        url += `?${params.toString()}`;
+    }
+    const res = await fetch(url);
     if (!res.ok) return;
     const messages = await res.json();
 
@@ -1232,6 +1296,7 @@ function monitorStart() {
     status.textContent = 'Live';
     status.className = 'monitor-status-live';
 
+    loadMonitorClients();
     monitorPoll();
     monitorInterval = setInterval(monitorPoll, 2000);
 }
