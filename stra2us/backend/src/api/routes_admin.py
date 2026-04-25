@@ -254,6 +254,46 @@ async def scan_kv(
     return {"prefix": prefix, "count": len(items), "truncated": len(items) >= limit, "items": items}
 
 
+@router.get("/catalog/{app}/devices")
+async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_context)):
+    """HMAC clients with access to <app>'s namespace.
+
+    A device, for catalog-UI purposes, is a client that can read or write
+    under <app>. That covers the three real-world ACL shapes: an exact
+    app-match (`<app>:rw`), a wildcard (`*:rw`), or a deeper sub-prefix
+    (`<app>/<device>:rw`). Returned device IDs are client IDs — and by
+    convention also the second path segment in <app>/<device>/<key> KV
+    writes, which is what the per-device effective-value view depends on.
+    """
+    await check_acl(admin_ctx, f"kv/{app}", mode="read")
+
+    redis = get_redis_client()
+    acl_keys = await redis.keys("client:*:acl")
+    devices: set[str] = set()
+    app_subprefix = f"{app}/"
+    for k in acl_keys:
+        if isinstance(k, bytes):
+            k = k.decode("utf-8")
+        parts = k.split(":")
+        if len(parts) < 3:
+            continue
+        client_id = parts[1]
+        raw = await redis.get(k)
+        if not raw:
+            continue
+        try:
+            acl = json.loads(raw)
+        except Exception:
+            continue
+        for perm in acl.get("permissions", []):
+            prefix = perm.get("prefix", "")
+            if prefix == "*" or prefix == app or prefix.startswith(app_subprefix):
+                devices.add(client_id)
+                break
+
+    return {"app": app, "devices": sorted(devices)}
+
+
 @router.get("/peek/kv/{key:path}")
 async def peek_kv(key: str, _: dict = Depends(require_admin_kv("read"))):
     redis = get_redis_client()

@@ -601,42 +601,33 @@ async function fetchCatalogDevices() {
     const countEl = document.getElementById('catalogDevicesCount');
     listEl.innerHTML = '<div class="text-muted">Loading&hellip;</div>';
 
-    // Devices in stra2us are identified by KV-path convention, not by
-    // per-device HMAC credentials — shared/app-scoped clients are the
-    // norm. Any middle path segment under `<app>/*/…` counts as a device.
-    const scan = await _scanAppKeys(app);
-    if (!scan.ok) {
-        listEl.innerHTML = '<div class="text-muted">Failed to scan app keys.</div>';
+    // A device is any HMAC client that can read/write under <app>:
+    // exact `<app>` ACL, wildcard `*`, or a deeper `<app>/...` sub-prefix.
+    // Device IDs are client IDs — by convention also the path segment
+    // used in <app>/<device>/<key> overrides, which is what the
+    // effective-value table below joins against.
+    const { ok, data } = await fetchAPI(`/catalog/${encodeURIComponent(app)}/devices`);
+    if (!ok) {
+        listEl.innerHTML = '<div class="text-muted">Failed to list devices.</div>';
         countEl.innerText = '--';
         return;
     }
 
-    const deviceOverrides = {};
-    for (const it of scan.items) {
-        const dev = _parseDeviceFromKey(app, it.key);
-        if (!dev) continue;
-        deviceOverrides[dev] = (deviceOverrides[dev] || 0) + 1;
-    }
-
-    const devices = Object.keys(deviceOverrides).sort();
+    const devices = Array.isArray(data.devices) ? data.devices : [];
     countEl.innerText = devices.length;
     _catalogTabsLoaded.devices = true;
 
     if (devices.length === 0) {
-        listEl.innerHTML = `<div class="text-muted">No per-device overrides written yet. Devices appear here once something like <code>${escapeHtml(app)}/&lt;device&gt;/&lt;key&gt;</code> has been set.</div>`;
+        listEl.innerHTML = `<div class="text-muted">No HMAC clients have access to <code>${escapeHtml(app)}</code>. Issue a client whose ACL grants <code>${escapeHtml(app)}</code> (or a wildcard) to populate this list.</div>`;
         return;
     }
 
-    listEl.innerHTML = devices.map(dev => {
-        const n = deviceOverrides[dev];
-        return `
-            <div class="catalog-app-row" onclick="openDeviceDetail('${escapeHtml(dev)}')">
-                <span class="catalog-app-name">${escapeHtml(dev)}</span>
-                <span class="catalog-app-meta">${n} override${n === 1 ? '' : 's'}</span>
-                <span class="catalog-app-chevron">&rsaquo;</span>
-            </div>
-        `;
-    }).join('');
+    listEl.innerHTML = devices.map(dev => `
+        <div class="catalog-app-row" onclick="openDeviceDetail('${escapeHtml(dev)}')">
+            <span class="catalog-app-name">${escapeHtml(dev)}</span>
+            <span class="catalog-app-chevron">&rsaquo;</span>
+        </div>
+    `).join('');
 }
 
 let _currentDeviceDetailId = null;

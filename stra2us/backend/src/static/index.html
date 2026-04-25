@@ -228,7 +228,7 @@
                         <div id="catalogDevicesListPane">
                             <div class="card glass-panel form-card">
                                 <h3>Devices seen for this app <span id="catalogDevicesCount" class="badge">0</span></h3>
-                                <p class="form-hint">Devices are inferred from any KV key of the form <code>&lt;app&gt;/&lt;device&gt;/&lt;name&gt;</code>. A device only appears here once it has at least one per-device override written.</p>
+                                <p class="form-hint">Devices are HMAC clients with access to this app's namespace — ACL prefix <code>&lt;app&gt;</code>, wildcard <code>*</code>, or a deeper <code>&lt;app&gt;/&hellip;</code> sub-prefix. Per-device override values join on the client ID.</p>
                                 <div id="catalogDevicesList" class="catalog-app-list"></div>
                             </div>
                         </div>
