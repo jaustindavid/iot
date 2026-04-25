@@ -254,46 +254,6 @@ async def scan_kv(
     return {"prefix": prefix, "count": len(items), "truncated": len(items) >= limit, "items": items}
 
 
-@router.get("/catalog/{app}/devices")
-async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_context)):
-    """Devices known to be scoped under <app> via HMAC client ACLs.
-
-    Authoritative source: a device is a client whose ACL grants permission
-    on a prefix of the form `<app>/<device>` or `<app>/<device>/...`. This
-    is intentionally narrower than path-segment scanning of <app>/*/* keys,
-    which picks up non-device namespaces (`scripts`, `cache`, etc.) and
-    omits revoked devices' orphan data — for KV-level visibility callers
-    should fall back to /kv_scan and the Raw tab.
-    """
-    await check_acl(admin_ctx, f"kv/{app}", mode="read")
-
-    redis = get_redis_client()
-    acl_keys = await redis.keys("client:*:acl")
-    devices: set[str] = set()
-    app_prefix = f"{app}/"
-    for k in acl_keys:
-        raw = await redis.get(k)
-        if not raw:
-            continue
-        try:
-            acl = json.loads(raw)
-        except Exception:
-            continue
-        for perm in acl.get("permissions", []):
-            prefix = perm.get("prefix", "")
-            if not prefix or prefix == "*" or not prefix.startswith(app_prefix):
-                continue
-            rest = prefix[len(app_prefix):]
-            if not rest:
-                continue
-            slash = rest.find("/")
-            device = rest if slash < 0 else rest[:slash]
-            if device:
-                devices.add(device)
-
-    return {"app": app, "devices": sorted(devices)}
-
-
 @router.get("/peek/kv/{key:path}")
 async def peek_kv(key: str, _: dict = Depends(require_admin_kv("read"))):
     redis = get_redis_client()
