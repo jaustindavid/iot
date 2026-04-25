@@ -331,6 +331,24 @@ def cmd_put(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Raw KV delete — bypasses catalog. Idempotent."""
+    try:
+        client = _build_client(args)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        client.delete(args.key)
+    except Stra2usError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 4
+
+    print(f"del: {client.base_url}/kv/{args.key}")
+    return 0
+
+
 def cmd_set(args: argparse.Namespace) -> int:
     cat = _load(args)
     scope, device = _parse_target(args.target)
@@ -444,6 +462,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="inline string value; written as msgpack str",
     )
 
+    # ----- del -----
+    sp_del = sub.add_parser(
+        "del",
+        help="delete a KV entry; idempotent (no error if key didn't exist)",
+    )
+    sp_del.add_argument("key", help="full KV path")
+
     # ----- set -----
     sp_set = sub.add_parser(
         "set", help="write a catalog-declared key to KV"
@@ -483,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_show(args)
         if args.verb == "put":
             return cmd_put(args)
+        if args.verb == "del":
+            return cmd_delete(args)
         if args.verb == "set":
             return cmd_set(args)
     except CatalogError as e:

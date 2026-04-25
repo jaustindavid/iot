@@ -139,6 +139,18 @@ Write a persistent key-value entry.
 
 ---
 
+### `DELETE /kv/{key}` — Delete KV Value
+
+Idempotent — succeeds whether or not the key existed. The HMAC client
+needs write access on `kv/<key>`. Mirrors `DELETE /api/admin/kv/{key}`
+on the admin route, but reachable from device credentials so an HMAC
+caller (e.g. a publish/retract tool) doesn't need to hold an admin
+session to clear keys it wrote.
+
+**Response `200 OK`:** signed envelope wrapping `{"status": "ok"}`.
+
+---
+
 ### `GET /kv/{key}` — Read KV Value
 
 Read a persistent key-value entry.

@@ -115,6 +115,14 @@ class Stra2usClient:
             )
         return r
 
+    def delete(self, key: str) -> None:
+        """DELETE /kv/<key>. Idempotent — succeeds whether the key existed."""
+        r = self._request("DELETE", self._kv_uri(key), b"", None)
+        if not (200 <= r.status_code < 300):
+            raise Stra2usError(
+                f"DELETE {key} → {r.status_code}: {r.text[:200]}"
+            )
+
     def get(self, key: str):
         """GET /kv/<key>. Returns decoded value, or None on 404.
 

@@ -190,3 +190,18 @@ async def read_kv(
         return signed_msgpack(context, request, {"status": "not_found"})
 
     return signed_response(context, request, val)
+
+@router.delete("/kv/{key:path}")
+async def delete_kv(
+    key: str,
+    request: Request,
+    context: dict = Depends(verify_device_request)
+):
+    """Idempotent: succeeds whether or not the key existed. Mirrors the
+    admin-side DELETE; the device path was added so HMAC clients (e.g.
+    a publish-tool wanting to retract a script blob) can clear keys
+    without holding an admin credential."""
+    await check_acl(context, f"kv/{key}", mode="write")
+    redis = get_redis_client()
+    await redis.delete(f"kv:{key}")
+    return signed_msgpack(context, request, {"status": "ok"})
