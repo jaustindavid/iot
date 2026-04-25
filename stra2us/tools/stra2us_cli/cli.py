@@ -294,6 +294,43 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_put(args: argparse.Namespace) -> int:
+    """Raw KV write — bypasses catalog validation. For binary blobs and
+    keys not modeled in the catalog (e.g. compiled IR scripts written to
+    `<app>/scripts/<name>`). Use `set` instead for catalog-declared keys
+    so type/range/scope are checked."""
+    if (args.file is None) == (args.value is None):
+        print("error: pass exactly one of --file or --value", file=sys.stderr)
+        return 2
+
+    if args.file is not None:
+        try:
+            with open(args.file, "rb") as f:
+                value: object = f.read()
+        except OSError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+    else:
+        value = args.value
+
+    try:
+        client = _build_client(args)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        client.put(args.key, value)
+    except Stra2usError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 4
+
+    size = len(value) if isinstance(value, (bytes, str)) else "?"
+    kind = "bytes" if isinstance(value, bytes) else "string"
+    print(f"put: {client.base_url}/kv/{args.key} ({size} {kind})")
+    return 0
+
+
 def cmd_set(args: argparse.Namespace) -> int:
     cat = _load(args)
     scope, device = _parse_target(args.target)
@@ -388,6 +425,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_show.add_argument("key", nargs="?", help="catalog key (omit for all)")
 
+    # ----- put -----
+    sp_put = sub.add_parser(
+        "put",
+        help="write a raw KV value (bytes from a file or inline string); bypasses catalog validation",
+    )
+    sp_put.add_argument(
+        "key",
+        help="full KV path, e.g. critterchron/scripts/thyme",
+    )
+    put_input = sp_put.add_mutually_exclusive_group(required=True)
+    put_input.add_argument(
+        "--file",
+        help="read raw bytes from this path; written as msgpack bin",
+    )
+    put_input.add_argument(
+        "--value",
+        help="inline string value; written as msgpack str",
+    )
+
     # ----- set -----
     sp_set = sub.add_parser(
         "set", help="write a catalog-declared key to KV"
@@ -425,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
             return _dispatch_catalog(args)
         if args.verb == "show":
             return cmd_show(args)
+        if args.verb == "put":
+            return cmd_put(args)
         if args.verb == "set":
             return cmd_set(args)
     except CatalogError as e:
