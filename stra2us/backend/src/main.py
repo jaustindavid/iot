@@ -15,6 +15,8 @@ import base64
 from fastapi import Request, Response
 from core.redis_client import get_redis_client
 from core.admin_auth import verify_password, generate_session_token, verify_session_token
+from core.perf_log import DEFAULT_THRESHOLD_MS, write_perf_entry
+
 
 @app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
@@ -93,6 +95,52 @@ async def activity_log_middleware(request: Request, call_next):
             await redis.xtrim("system:activity_log", minid=min_id)
 
     return response
+
+
+@app.middleware("http")
+async def perf_log_middleware(request: Request, call_next):
+    """Times every dynamic request; appends to system:perf_log when
+    total_ms >= STRA2US_PERF_LOG_THRESHOLD_MS. Defined last so it wraps
+    auth and activity-log work — total_ms reflects user-perceived latency.
+    Static assets, the health/root probes, and the perf-log read endpoint
+    are skipped (noise / self-reference)."""
+    path = request.url.path
+    skip = (
+        path.startswith("/admin/")
+        or path.startswith("/firmware/")
+        or path == "/api/admin/perf_log"
+        or path in ("/", "/health")
+    )
+    if skip:
+        return await call_next(request)
+
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        total_ms = (time.perf_counter() - start) * 1000.0
+        if total_ms >= DEFAULT_THRESHOLD_MS:
+            phases = getattr(request.state, "perf_phases", None)
+            client_id = (
+                getattr(request.state, "admin_user", None)
+                or request.headers.get("X-Client-ID")
+                or (request.client.host if request.client else "unknown")
+            )
+            try:
+                await write_perf_entry(
+                    method=request.method,
+                    path=path,
+                    total_ms=total_ms,
+                    status_code=status_code,
+                    client_id=client_id,
+                    phases=phases,
+                )
+            except Exception as e:
+                # Never let perf logging break a request.
+                print(f"[PERF_LOG] write failed: {e}", flush=True)
 
 
 # Allow CORS for development convenience

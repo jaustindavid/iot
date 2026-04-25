@@ -16,6 +16,7 @@ from api.dependencies import (
     check_acl,
 )
 from core.admin_auth import HTPASSWD_FILE
+from core.perf_log import PerfPhases, PERF_LOG_STREAM
 import os
 
 router = APIRouter()
@@ -213,6 +214,7 @@ async def peek_queue(topic: str, _: dict = Depends(require_admin_queue("read")))
 
 @router.get("/kv_scan")
 async def scan_kv(
+    request: Request,
     prefix: str = Query(..., min_length=1),
     limit: int = 500,
     admin_ctx: dict = Depends(get_admin_context),
@@ -223,9 +225,11 @@ async def scan_kv(
     names with their stored byte size; callers fetch values via /peek/kv/*.
     """
     redis = get_redis_client()
+    phases = PerfPhases(request)
     # redis keys are stored under the `kv:` namespace; match that.
     pattern = f"kv:{prefix}*"
-    raw_keys = await redis.keys(pattern)
+    with phases.phase("redis_keys"):
+        raw_keys = await redis.keys(pattern)
 
     # Filter by the caller's ACL — check_acl raises on deny, so catch it
     # per-key rather than letting a single unreadable entry fail the scan.
@@ -234,11 +238,13 @@ async def scan_kv(
         if isinstance(k, bytes):
             k = k.decode("utf-8")
         name = k.split(":", 1)[1]
-        try:
-            await check_acl(admin_ctx, f"kv/{name}", mode="read")
-        except HTTPException:
-            continue
-        size = await redis.strlen(k)
+        with phases.phase("acl_filter"):
+            try:
+                await check_acl(admin_ctx, f"kv/{name}", mode="read")
+            except HTTPException:
+                continue
+        with phases.phase("strlen_loop"):
+            size = await redis.strlen(k)
         items.append({"key": name, "bytes": size})
         if len(items) >= limit:
             break
@@ -246,6 +252,46 @@ async def scan_kv(
     # `truncated` now means "the caller's visible result set was capped",
     # not the raw redis KEYS output — UI already treats it as a hint.
     return {"prefix": prefix, "count": len(items), "truncated": len(items) >= limit, "items": items}
+
+
+@router.get("/catalog/{app}/devices")
+async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_context)):
+    """Devices known to be scoped under <app> via HMAC client ACLs.
+
+    Authoritative source: a device is a client whose ACL grants permission
+    on a prefix of the form `<app>/<device>` or `<app>/<device>/...`. This
+    is intentionally narrower than path-segment scanning of <app>/*/* keys,
+    which picks up non-device namespaces (`scripts`, `cache`, etc.) and
+    omits revoked devices' orphan data — for KV-level visibility callers
+    should fall back to /kv_scan and the Raw tab.
+    """
+    await check_acl(admin_ctx, f"kv/{app}", mode="read")
+
+    redis = get_redis_client()
+    acl_keys = await redis.keys("client:*:acl")
+    devices: set[str] = set()
+    app_prefix = f"{app}/"
+    for k in acl_keys:
+        raw = await redis.get(k)
+        if not raw:
+            continue
+        try:
+            acl = json.loads(raw)
+        except Exception:
+            continue
+        for perm in acl.get("permissions", []):
+            prefix = perm.get("prefix", "")
+            if not prefix or prefix == "*" or not prefix.startswith(app_prefix):
+                continue
+            rest = prefix[len(app_prefix):]
+            if not rest:
+                continue
+            slash = rest.find("/")
+            device = rest if slash < 0 else rest[:slash]
+            if device:
+                devices.add(device)
+
+    return {"app": app, "devices": sorted(devices)}
 
 
 @router.get("/peek/kv/{key:path}")
@@ -403,6 +449,49 @@ async def restore_keys(payload: BackupPayload, force: bool = Query(False), _: di
             results["restored"].append(client.client_id)
 
     return results
+
+
+# --- Performance log (over-threshold requests) ---
+
+@router.get("/perf_log")
+async def get_perf_log(
+    limit: int = 200,
+    path_prefix: Optional[str] = None,
+    min_ms: float = 0.0,
+    _: dict = Depends(require_admin_superuser),
+):
+    """Tail the system:perf_log stream. Superuser-only — perf data isn't
+    a per-resource concern (no ACL filter applies) and reveals internal
+    paths an ops view should see but app-scoped admins shouldn't need."""
+    redis = get_redis_client()
+    fetch_count = min(limit * 5, 5000)
+    records = await redis.xrevrange(PERF_LOG_STREAM, max="+", min="-", count=fetch_count)
+
+    out = []
+    for msg_id, fields in records:
+        path = fields.get(b"path", b"").decode("utf-8")
+        if path_prefix and not path.startswith(path_prefix):
+            continue
+        total_ms = float(fields.get(b"total_ms", b"0"))
+        if total_ms < min_ms:
+            continue
+        entry = {
+            "timestamp": int(fields.get(b"timestamp", b"0")),
+            "method":    fields.get(b"method", b"").decode("utf-8"),
+            "path":      path,
+            "total_ms":  total_ms,
+            "status":    int(fields.get(b"status", b"0")),
+            "client_id": fields.get(b"client_id", b"").decode("utf-8"),
+        }
+        if b"phase_breakdown" in fields:
+            try:
+                entry["phases"] = json.loads(fields[b"phase_breakdown"])
+            except Exception:
+                pass
+        out.append(entry)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # --- Topic Stream Monitor ---

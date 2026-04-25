@@ -68,36 +68,6 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   hint consumption lands in M3.
 - Catalog diff viewer / history stream — predicated on versioning
   decision above.
-- **Devices tab should derive its list from HMAC client ACLs, not
-  path-segment scanning.** Current implementation
-  (`fetchCatalogDevices` + `_parseDeviceFromKey` in
-  [backend/src/static/app.js](../backend/src/static/app.js)) groups
-  any middle path segment under `<app>/*/…` as a "device", which
-  picks up non-device namespaces (`scripts`, `cache`, etc.) that
-  happen to share that depth. Real source of truth: a device has an
-  HMAC credential with an ACL prefix covering `<app>/<device>`.
-  Concrete plan:
-    - Add a backend endpoint like `GET /api/admin/catalog/{app}/devices`
-      that scans `client:*:acl`, collects permissions whose prefix is
-      exactly `<app>/<device>` or `<app>/<device>/…` (first segment
-      equals `<app>`, has a second segment), and returns unique
-      `<device>` values. Wildcard (`*`) and bare-`<app>` prefixes
-      contribute nothing — they're not device-scoped.
-    - Gate the endpoint on the caller's ACL covering `<app>` (same
-      policy as the rest of catalog read). **Not** superuser-only —
-      a scoped admin for `<app>` should see their own devices.
-    - UI swaps `_scanAppKeys`-based device discovery for this endpoint
-      in `fetchCatalogDevices`. Keep the scan behavior in the Raw tab
-      where it belongs.
-  Edge cases to note in the implementation:
-    - Revoked devices leave data behind in `<app>/<device>/*` but
-      disappear from the list. That's probably correct (dead devices
-      shouldn't clutter), but the Raw tab will still show the
-      orphaned keys, which is the right safety valve.
-    - A setup with only a single wildcard client (no per-device
-      credentials) shows an empty list. UI should say "no
-      per-device credentials configured" rather than look broken.
-  Filed 2026-04-23.
 - **Show "last updated" timestamp in Catalogs list.** On the
   admin-UI Catalogs / Published Apps view, display when each
   `_catalog/<app>` was last published. Redis strings don't carry a

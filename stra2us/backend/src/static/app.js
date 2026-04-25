@@ -601,40 +601,31 @@ async function fetchCatalogDevices() {
     const countEl = document.getElementById('catalogDevicesCount');
     listEl.innerHTML = '<div class="text-muted">Loading&hellip;</div>';
 
-    const scan = await _scanAppKeys(app);
-    if (!scan.ok) {
-        listEl.innerHTML = '<div class="text-muted">Failed to scan app keys.</div>';
+    // Source of truth is HMAC client ACLs — a device is a client with a
+    // prefix permission on <app>/<device>. Orphan KV from revoked devices
+    // is intentionally not surfaced here; the Raw tab is the safety valve.
+    const { ok, data } = await fetchAPI(`/catalog/${encodeURIComponent(app)}/devices`);
+    if (!ok) {
+        listEl.innerHTML = '<div class="text-muted">Failed to list devices.</div>';
         countEl.innerText = '--';
         return;
     }
 
-    // Group per-device overrides.
-    const deviceOverrides = {};  // { deviceId: count }
-    for (const it of scan.items) {
-        const dev = _parseDeviceFromKey(app, it.key);
-        if (!dev) continue;
-        deviceOverrides[dev] = (deviceOverrides[dev] || 0) + 1;
-    }
-
-    const devices = Object.keys(deviceOverrides).sort();
+    const devices = Array.isArray(data.devices) ? data.devices : [];
     countEl.innerText = devices.length;
     _catalogTabsLoaded.devices = true;
 
     if (devices.length === 0) {
-        listEl.innerHTML = `<div class="text-muted">No per-device overrides written yet. Devices appear here once something like <code>${escapeHtml(app)}/&lt;device&gt;/&lt;key&gt;</code> has been set.</div>`;
+        listEl.innerHTML = `<div class="text-muted">No per-device HMAC credentials configured for <code>${escapeHtml(app)}</code>. Issue a client whose ACL grants <code>${escapeHtml(app)}/&lt;device&gt;</code> to populate this list.</div>`;
         return;
     }
 
-    listEl.innerHTML = devices.map(dev => {
-        const n = deviceOverrides[dev];
-        return `
-            <div class="catalog-app-row" onclick="openDeviceDetail('${escapeHtml(dev)}')">
-                <span class="catalog-app-name">${escapeHtml(dev)}</span>
-                <span class="catalog-app-meta">${n} override${n === 1 ? '' : 's'}</span>
-                <span class="catalog-app-chevron">&rsaquo;</span>
-            </div>
-        `;
-    }).join('');
+    listEl.innerHTML = devices.map(dev => `
+        <div class="catalog-app-row" onclick="openDeviceDetail('${escapeHtml(dev)}')">
+            <span class="catalog-app-name">${escapeHtml(dev)}</span>
+            <span class="catalog-app-chevron">&rsaquo;</span>
+        </div>
+    `).join('');
 }
 
 let _currentDeviceDetailId = null;
