@@ -22,6 +22,7 @@ file is where we capture the in-flight thinking that shapes it.
 | 2026-04-22 | `STRA2US_FIRMWARE_DIR` env override in backend (default still `/firmware`). | Hardcoded `/firmware` blocked non-Docker local dev; one-line, zero behavior change for the compose path. |
 | 2026-04-23 | Static catalog-drift lint stays in critterchron for now; no upstream to `stra2us_cli`. | CritterChron is the only consumer today; its `test_s2s_catalog.py` (~210 lines) is the proven shape. Wait for a 2nd app before generalizing. |
 | 2026-04-24 | Added `default_per_platform: true` as third mutually-exclusive sibling of `default` / `default_per_device`. | Critterchron's `light_exponent` needed it (Particle/CDS defaults to 2.5, ESP32/BH1750 to 0.5 because the upstream `n` normalization is inverted). `default_per_device` was lying about the source of truth. |
+| 2026-04-25 | GET on missing KV stays at HTTP 200 with `{"status": "not_found"}`; not switching to 404. | Status envelope is already the contract on the device path; CLI and UI handle it; flipping to 404 would force every consumer to special-case error vs. unset and buys nothing. |
 
 ## Active — M2 worklist
 
@@ -47,17 +48,11 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   existing server surface; needs a narrow prefix-scan endpoint
   (`GET /kv/?prefix=_catalog/`, admin-auth) **or** the UI carries a
   configured list of apps. Revisit when M3 lands; MVP-UI can hardcode.
-- **ACLs on `_catalog/*`.** Should only privileged clients be able to
-  write there. Uses existing `check_acl` machinery. Concrete ACL
-  entries to add are an ops decision, not a design one.
 - **Server-side schema validation.** Currently CLI-only. If we ever
   want advisory-reject on upload (invariant 2 + FR open-question-#2's
   "enforce" concept), the server would need pyyaml + pydantic — adds
   deps, worth a discussion. Low priority; CLI validation is already
   tight.
-- **Server 200-vs-404 on missing KV.** See `catalog_fr.md` team-note
-  #1. Candidate cleanup for M2 since we'll be touching this path
-  anyway. Non-blocking — CLI already handles both shapes.
 - **CritterChron migration.** When M2 is stable, hand back a migrated
   `critterchron.s2s.yaml` (the 4 keys using `default: per-device`
   need to flip to `default_per_device: true`). Ship with a short
@@ -73,13 +68,6 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   hint consumption lands in M3.
 - Catalog diff viewer / history stream — predicated on versioning
   decision above.
-- **Critterchron follow-up: flip `light_exponent` to
-  `default_per_platform: true`.** Schema support shipped 2026-04-24
-  (see decisions log). CritterChron's `critterchron.s2s.yaml`
-  currently apologizes in a YAML comment that `default_per_device`
-  is the wrong flag for this key. Flipping the flag also unblocks
-  the drift lint (when it lands in `stra2us_cli`) to route to
-  `hal/<platform>/src/` instead of `hal/devices/*.h`. Filed 2026-04-24.
 - **Devices tab should derive its list from HMAC client ACLs, not
   path-segment scanning.** Current implementation
   (`fetchCatalogDevices` + `_parseDeviceFromKey` in
@@ -120,17 +108,6 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   `published_at` key into the catalog YAML itself at publish time
   (round-trips through fetch, but mutates user-authored content).
   Leaning (a) — cleanest, no schema change. Filed 2026-04-23.
-- **Catalog → Devices tab stale after edit.** When a key is edited
-  via the modal from inside the Devices tab, closing the dialog
-  doesn't refresh the Devices view — the effective-value table keeps
-  showing the pre-edit values. The write lands (leaving and
-  re-entering the Devices tab reflects it correctly). Likely the
-  editor's success handler only refreshes the Variables tab or the
-  top-level catalog data, not the per-device effective table. Fix
-  will probably live in the `saveKv`/editor close path in
-  [backend/src/static/app.js](../backend/src/static/app.js) —
-  re-call `fetchCatalogDevices(app)` (or equivalent) when the
-  active catalog tab is Devices. Filed 2026-04-23, light severity.
 - **Catalog drift lint as `stra2us_cli lint` subcommand.** Today
   critterchron ships its own `test_s2s_catalog.py` that greps
   `get_int("k", default)` / `get_float(...)` across HAL C++, resolves

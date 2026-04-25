@@ -637,9 +637,12 @@ async function fetchCatalogDevices() {
     }).join('');
 }
 
+let _currentDeviceDetailId = null;
+
 function closeDeviceDetail() {
     document.getElementById('catalogDevicesListPane').classList.remove('hidden');
     document.getElementById('catalogDeviceDetailPane').classList.add('hidden');
+    _currentDeviceDetailId = null;
 }
 
 // Resolve an effective value for one var at one device, mirroring the
@@ -647,6 +650,7 @@ function closeDeviceDetail() {
 async function openDeviceDetail(deviceId) {
     if (!_currentCatalog) return;
     const app = _currentCatalog.app;
+    _currentDeviceDetailId = deviceId;
     document.getElementById('catalogDevicesListPane').classList.add('hidden');
     document.getElementById('catalogDeviceDetailPane').classList.remove('hidden');
     document.getElementById('catalogDeviceDetailTitle').innerHTML =
@@ -877,7 +881,7 @@ function openKeyEditor(keyName, opts = {}) {
     const v = _currentCatalog.vars[keyName];
     if (!v) return;
     const lockedDevice = opts.lockedDevice || null;
-    _editorContext = { app: _currentCatalog.app, keyName, var: v };
+    _editorContext = { app: _currentCatalog.app, keyName, var: v, lockedDevice };
 
     const hasApp = Array.isArray(v.scope) && v.scope.includes('app');
     const hasDevice = Array.isArray(v.scope) && v.scope.includes('device');
@@ -970,8 +974,15 @@ function openKeyEditor(keyName, opts = {}) {
 }
 
 function closeKeyEditor() {
+    const ctx = _editorContext;
     _editorContext = null;
     document.getElementById('keyEditorModal').style.display = 'none';
+    // If the editor was locked to a device and that device's detail pane
+    // is open behind the modal, re-resolve effective values so any edits
+    // are reflected without making the user leave and re-enter the tab.
+    if (ctx && ctx.lockedDevice && _currentDeviceDetailId === ctx.lockedDevice) {
+        openDeviceDetail(ctx.lockedDevice);
+    }
 }
 
 async function loadDeviceScope() {
