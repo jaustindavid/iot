@@ -44,7 +44,7 @@ critterchron/
     CritterEngine.h / .cpp        ← IR interpreter, rendering, A*
     interface/
       LedSink.h                   ← the one engine↔platform seam
-      TimeSource.h                ← abstract "now()" (RTC, WobblyTime later)
+      CritTimeSource.h            ← abstract "now()" (RTC, WobblyTime later)
     photon2/
       critterchron_photon2.cpp    ← setup/loop, NeoPixel sink, light sensor
     esp32/                        ← future; empty for now
@@ -100,7 +100,7 @@ coati's convention so nothing in `src/` references a device by name.
 
 ---
 
-## 4. Platform seam: `LedSink` (+ `TimeSource`)
+## 4. Platform seam: `LedSink` (+ `CritTimeSource`)
 
 ### 4.1 `LedSink` — brightness + geometry ownership on the sink
 ```cpp
@@ -127,17 +127,24 @@ This also keeps the coati-style loading spinner out of the engine: the
 platform shim can draw directly into the sink pre-sync, since the sink
 is both the brightness and output boundary.
 
-### 4.2 `TimeSource` — new, small
+### 4.2 `CritTimeSource` — new, small
 ```cpp
-struct TimeSource {
+struct CritTimeSource {
     virtual bool   valid() const = 0;         // cloud sync state
     virtual time_t wall_now() const = 0;      // UTC seconds
     virtual float  zone_offset_hours() const = 0;
-    virtual ~TimeSource() = default;
+    virtual ~CritTimeSource() = default;
 };
 ```
 Phase 1 impl = Particle `Time.*`. Phase 2 wraps it in `WobblyTime`. The
 engine calls only through this interface for `sync_time()`.
+
+Originally named `TimeSource`; renamed 2026-04-25 after Particle DeviceOS
+6.x added `enum class TimeSource : uint8_t` to `spark_wiring_time.h`,
+which collided with our struct on Photon 2 / Argon (both DeviceOS 6.x;
+Photon Gen 2 was untouched because it's pinned to a 3.x LTS without the
+enum). The `Crit` prefix is the namespace marker we use anywhere a
+plausibly-generic name might collide with vendor headers.
 
 The key is to keep both interfaces **pure virtual + platform-provided** so
 the engine is unit-testable on host.
@@ -311,7 +318,7 @@ add a `fade` layer later if the language adopts it.
   `engine.py`, renderer with rotation + zigzag. No fades.
 - `LedSink` + `NeoPixelSink` on Particle; sink owns brightness scaling
   against a fixed `MAX_BRIGHTNESS`.
-- `TimeSource` backed by `Time.*`; local-wall-clock shift identical to the
+- `CritTimeSource` backed by `Time.*`; local-wall-clock shift identical to the
   coati fix (`local_now = utc + zone*3600`).
 - `photon2/critterchron_photon2.cpp`: setup/loop with physics tick +
   render tick (ms constants from device header), pre-sync spinner
@@ -358,7 +365,7 @@ correct font layout and convergence.
   `TIMEZONE_OFFSET_HOURS`). Physics tick stays script-owned.
 
 ### Phase 3 — WobblyTime *(small)*
-- Implement `WobblyTime` as a `TimeSource` decorator around the Particle
+- Implement `WobblyTime` as a `CritTimeSource` decorator around the Particle
   time source. Same parameters (`wobble_min/max_seconds`, `fast_rate`,
   `slow_rate`) as the coati impl; source can be lifted mostly verbatim.
 
@@ -414,7 +421,7 @@ Existing `.crit` files should continue to parse and run unchanged.
 - Per-device header + Makefile symlink to `creds.h`.
 - HAL tree lives at `critterchron/hal/` with `hal/photon2/` (and later
   `hal/esp32/`) platform subdirs. Single repo, small number of HALs.
-- `LedSink` + `TimeSource` platform seams. **Sink owns brightness
+- `LedSink` + `CritTimeSource` platform seams. **Sink owns brightness
   scaling**; the engine writes full-intensity colors.
 - `done` = restart-next-tick; parser enforces top-level yield
   termination; `if:` bodies may fall through.

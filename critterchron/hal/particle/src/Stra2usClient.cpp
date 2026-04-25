@@ -1,9 +1,17 @@
 #if defined(PLATFORM_ID)
 
 #include "Stra2usClient.h"
+#include "ErrLog.h"
 #include "ir/IrRuntime.h"
 #include "sha256.h"
 #include <string.h>
+
+// Error-channel shorthand. ErrLog lives in `critterchron::`; the OTA path
+// records into `g_errlog`, telemetry_cycle drains one per heartbeat. See
+// hal/ErrLog.h for the contract; sites below mirror their pre-existing
+// Log.warn/error calls (record() emits to serial too, dev-side unchanged).
+using critterchron::g_errlog;
+using critterchron::ErrCat;
 
 Stra2usClient::Stra2usClient(const char* host, int port,
                              const char* client_id, const char* secret_hex,
@@ -681,7 +689,8 @@ void Stra2usClient::ir_poll() {
     // hit the oversize-crash path. -1 leaves room for the NUL the
     // msgpack unwrap appends after the payload.
     if (have_size && sidecar_size > sizeof(ir_ota_buf_) - 1) {
-        Log.warn("ir_poll: %s size=%u exceeds buffer=%u; skipping fetch",
+        g_errlog.record(ErrCat::OtaFetch,
+                 "%s size=%u>buf=%u",
                  new_ptr,
                  (unsigned)sidecar_size,
                  (unsigned)(sizeof(ir_ota_buf_) - 1));
@@ -728,7 +737,7 @@ void Stra2usClient::ir_poll() {
     Log.info("ir_poll: fetching blob %s", script_key);
     size_t blob_len = 0;
     if (!kv_fetch_str_(script_key, ir_ota_buf_, sizeof(ir_ota_buf_), blob_len)) {
-        Log.warn("ir_poll: fetch failed for %s", script_key);
+        g_errlog.record(ErrCat::OtaFetch, "fetch failed: %s", script_key);
         return;
     }
     // Blob is in ir_ota_buf_ and accounted for. Log length here so a
@@ -740,7 +749,8 @@ void Stra2usClient::ir_poll() {
 
     char new_sha[65];
     if (!compute_content_sha_(ir_ota_buf_, blob_len, new_sha)) {
-        Log.error("ir_poll: malformed blob for %s (no encoded_at/END); ignoring", new_ptr);
+        g_errlog.record(ErrCat::OtaFetch,
+                 "malformed blob: %s (no encoded_at/END)", new_ptr);
         return;
     }
     // ASCII "..." not UTF-8 "…" — the serial monitor doesn't decode UTF-8
@@ -752,7 +762,8 @@ void Stra2usClient::ir_poll() {
     // sidecar (older publisher or transient fetch error), we trust the
     // blob's own content_sha as the identity.
     if (have_sidecar && strcmp(new_sha, sidecar_sha) != 0) {
-        Log.error("ir_poll: sidecar/blob content_sha mismatch for %s (sidecar=%.8s blob=%.8s); skipping",
+        g_errlog.record(ErrCat::OtaFetch,
+                 "sha mismatch %s sc=%.8s blob=%.8s",
                   new_ptr, sidecar_sha, new_sha);
         return;
     }
@@ -820,7 +831,7 @@ bool Stra2usClient::ir_apply_if_ready() {
                             ? critter_ir::BEHAVIORS[0].insn_count : 0),
                  (unsigned long)critter_ir::RUNTIME_TICK_MS);
     } else {
-        Log.error("ir_apply: parse failed for %s: %s",
+        g_errlog.record(ErrCat::OtaApply, "parse failed %s: %s",
                   ir_pending_ptr_, critter_ir::lastLoadError());
     }
     // Free the slot regardless: a bad blob shouldn't keep us retrying the

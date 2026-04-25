@@ -169,9 +169,17 @@ struct PFConfig {
     // mechanism; clamped to [1, PLAN_MAX] on the engine side. Omitted
     // from PF blocks means "engine default = 1".
     int32_t plan_horizon;
+    // Post-plan stagger: float in [0.0, 1.0]. At value d, probability d/2
+    // freezes the agent for a tick and d/2 steps orthogonally to the
+    // planned move. A* itself stays deterministic — goal convergence is
+    // preserved, only the walk is noisy. 0.0 (default) is planner-optimal
+    // behavior. Range enforced at compile time by the Python compiler;
+    // engine-side clamp is defensive. See drunkenPerturb() in
+    // CritterEngine.cpp for the mechanism.
+    float   drunkenness;
     uint8_t has_max_nodes, has_penalty_lit, has_penalty_occupied,
             has_diagonal, has_diagonal_cost, has_step_rate,
-            has_plan_horizon;
+            has_plan_horizon, has_drunkenness;
 };
 
 struct Insn { uint8_t indent; const char* text; };

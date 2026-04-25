@@ -4,6 +4,46 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **One-shot device provisioning script.** Breaking out a fresh device is
+  currently a 3-step manual sequence that's easy to botch — the too-big
+  OTA buffer on ricardo traces directly to copying a similar device's
+  header and not thinking about RAM class. A `tools/provision.py` should
+  bundle:
+  1. **Name + claim to Particle**: accept `--name ronaldo_raccoon` (or
+     whatever), invoke `particle device rename <id> <name>`. No product
+     enrollment — we tried Particle Cloud products + group-based OTA
+     and gave up (see "Particle products, abandoned" below); provisioning
+     is strictly about getting the device bootable and personally
+     claimed.
+  2. **Seed device header** from a template keyed on hardware class
+     (Photon / Photon 2 / Argon / P1), injecting name, geometry
+     (`--grid 32x8`), pin (`--matrix-pin D0`), and defaults sized to the
+     class — in particular `NO_IR_OTA` / `IR_OTA_BUFFER_BYTES` defaults
+     baked into the P1 template so future P1s don't repeat
+     ricardo/ronaldo's 8KB-buffer mistake. Hardware class drives the
+     default knobs, not the device name.
+  3. **Create Stra2us key + ACL**: generate `STRA2US_SECRET_HEX`,
+     register it with the stra2us server under `<name>`, write into the
+     device header alongside the identity block.
+  Header-template approach probably wants a small templates dir
+  (`hal/devices/templates/{photon,photon2,argon,p1}.h.j2` or plain .h
+  with {{name}} markers) so the RAM-class defaults live in one place
+  per class.
+
+- **Particle products, abandoned.** Briefly built out Particle Cloud
+  product/group OTA in `tools/particle_release.py` + `fleet.yaml`:
+  canary/production groups, date-encoded versions, reconcile diff. Torn
+  out on 2026-04-24 after realizing grid size is baked into each binary,
+  so "one product per hardware platform" (the shape Particle's model
+  enforces — one binary per product) would need one product per distinct
+  geometry × platform combo. At five-plus geometries across three
+  platforms that's ≥5 products for a handful of devices, with manual
+  grid-aware tagging on top. Push-based `make DEVICE=<x> flash` from a
+  laptop wins until the fleet is large enough to dwarf the setup cost.
+  If we revisit: the pivot point is probably grid-aware binary
+  selection, not the product machinery itself. Prior work lives in
+  git history under the `particle_release.py` / `fleet.yaml` paths.
+
 - **Guarded `step (dx, dy) if free` opcode.** The current opcode clamps to
   grid edges, but coati's bobbing at the pool is "literally move here, no
   questions asked" — if another agent is on the target cell, or the
@@ -11,59 +51,81 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   Fine for pool-bobbing at known-safe coordinates; wants a guarded form
   (`step (dx, dy) if free` or similar) before it's trusted in unknown
   contexts. `coati.crit:37` / `coati.crit:63` tag the locations.
-- **Device-side error channel on the heartbeat.** Today an OTA failure
-  (malformed blob, sha mismatch, parse error) only surfaces as a
-  `Log.error` on serial — useless for remote troubleshooting on deployed
-  devices. Capture the most recent error string(s) in a small ring buffer
-  on the device and pipe them into the heartbeat payload, one or two per
-  heartbeat max so we don't flood the channel. Rate-limit: not more than
-  1/heartbeat, drop oldest on overflow. Same hook probably useful for
-  sensor read failures, watchdog resets, etc. — any non-fatal `Log.error`
-  the device wants an operator to know about without shipping a serial
-  cable.
-- **Synchronous bootstrap OTA before sim start.** Today the boot flow is
-  wifi → cloud → compiled-in default starts rendering → telemetry
-  thread's `ir_poll()` eventually (up to `IR_POLL_INTERVAL_DEFAULT`
-  seconds later) pulls the target blob → main thread applies on next
-  tick boundary. Visible on elk_cheetah as "boot into swarm for a few
-  seconds, then snap to the intended script" — ugly UX especially for
-  freshly-flashed devices where the compiled-in default is stale.
-  Desired: after cloud-connect succeeds, BEFORE dropping the
-  spinner/breathing-cyan and starting the tick loop, drive one
-  synchronous fetch+apply cycle with strict feedback. Proposed API on
-  `Stra2usClient`:
-  ```
-  enum class IrBootstrapResult { Loaded, NoPointer, AlreadyLoaded,
-                                 NetworkFailed, BlobCorrupt, Timeout };
-  IrBootstrapResult ir_bootstrap_sync(uint32_t budget_ms);
-  ```
-  Runs on the main thread BEFORE the telemetry thread is armed — no
-  locking needed. Does NOT call `engine.reinit()`; caller orchestrates
-  so lifecycle stays visible at the call site (mirrors
-  `critterchron_particle.cpp:665-674`). Implementation is mostly
-  extraction — factor pointer+sidecar+blob+content_sha fetch logic out
-  of `ir_poll()` into a shared helper, `ir_poll()` stages into the
-  pending slot, `ir_bootstrap_sync()` calls `critter_ir::load()`
-  inline. `g_engine.begin()` runs first unconditionally (compiled-in
-  default) so a failed bootstrap never leaves the engine uninitialized
-  — worst case is two loads + two reinits at boot (<20ms).
+- **Boot-window staleness flash (low priority).** *Re-scoped 2026-04-25
+  after auditing what's actually unsolved. The original entry pitched a
+  full "synchronous bootstrap" refactor with a new `IrBootstrapResult`
+  enum and helper extraction; that turned out to be overkill once the
+  rest of the OTA polish landed. Documenting the actual gap and the
+  minimal fix here, plus why it's low priority.*
 
-  **Open design wrinkle — visual feedback during OTA.** A sudden
-  unannounced swap ("surprise! new clock") is jarring, particularly on
-  fresh flashes where the user is watching the device come up. Want
-  some on-grid indication that the OTA fetch is in progress — ideas
-  to consider: keep the breathing-cyan spinner through the bootstrap
-  fetch (Particle `RGB.control(true)`), paint a progress indicator on
-  the grid (e.g. a small chevron or pulsing pixel), or flash the grid
-  briefly on the transition. Same wrinkle applies to post-boot OTAs
-  (normal operation): today the swap is invisible from the grid,
-  which is fine when nothing's wrong but confusing when the user has
-  just hit publish and is waiting for confirmation. Worth deciding
-  the indication language once and using it in both contexts. The
-  `RGB.control` LED is probably the right primary signal (always
-  visible, doesn't steal grid real estate, matches Particle's own
-  system-state conventions); a brief grid fade-to-black-and-back at
-  the swap point would be a nice secondary cue.
+  **Original concern.** Fresh-flashed device boots, runs compiled-in
+  (stale) IR for a stretch, then snaps to the intended script. Ugly
+  UX, particularly when an operator is watching the device come up.
+
+  **What's already solved (three-pronged "less surprising" goal):**
+  1. **Signaling on the display** ✅ — `draw_spinner` (cyan) covers
+     the cloud-wait window before any sim runs; `draw_ota_streamer`
+     (5s of green vertical streamers) covers the post-boot OTA swap
+     window. Both in `critterchron_particle.cpp:754, 778`.
+  2. **Error messages remote** ✅ — heartbeat error channel landed
+     2026-04-25. OTA fetch/apply failures (oversized, malformed, sha
+     mismatch, parse-fail, reinit-fail) all surface as
+     `err=<cat>:<msg>` in the next heartbeat. See `hal/ErrLog.{h,cpp}`.
+  3. **Guarding the swap** ✅ — `g_ota_loading` state pauses physics
+     and renders the streamer for `OTA_LOADING_MS=5000` before
+     applying, so a swap is never silent or sudden.
+
+  **The remaining gap.** Spinner stops at `Particle.connected()`, but
+  the tel thread has a deliberate 15s `startup_delay_ms` (heap-pressure
+  protection — was added to avoid SOS-1 deathblink on P1 when the tel
+  thread allocates concurrently with the main-thread cloud handshake).
+  So between cloud-connect and the first `ir_poll()`, the device
+  renders compiled-in IR for ~15-20s with no visual cue it might still
+  be catching up. *That window* is where the staleness flash lives. The
+  signaling stops one stage too early.
+
+  **Why this is low priority.** Reboots are infrequent (goal: never
+  reboot). A device that's been up for weeks already converged to the
+  current IR via the regular `ir_poll()` cadence; the staleness flash
+  only hits on cold-boot or post-rescue-hold. So in the steady-state
+  fleet, this window almost never appears.
+
+  **Minimal fix (~5 lines) if it ever becomes worth closing.** Drop one
+  inline `g_cfg.ir_poll()` call into the main thread between
+  `Particle.connected() == true` and `Thread(...telemetry_worker...)`
+  spawn. ir_poll is reentrant-safe and already does the right thing
+  — stages a pending blob if the cloud has new IR, no-ops if we're
+  current. The existing `g_ota_loading` state machine handles the
+  visible swap on the next main-loop iteration with the established
+  green-streamer cue. No new API, no helper extraction, no enum.
+  ```cpp
+  if (Particle.connected()) {
+      g_cloud_seen = true;
+      Particle.syncTime();
+      last_sync_minute = -1;
+
+      // First ir_poll inline on main thread — runs before tel thread
+      // is armed, so no concurrency with tel's startup_delay_ms heap-
+      // protection window. The existing g_ota_loading state takes
+      // over on the next main-loop iter if a pending blob lands.
+      g_cfg.connect();
+      g_cfg.ir_poll();
+      g_cfg.close();
+
+      if (g_tel_thread == nullptr) { /* unchanged */ }
+  }
+  ```
+  Spinner's last frame stays on the panel during the 1-3s blocking
+  fetch (slight rotation pause; reads as "still working"). Closes the
+  staleness window from ~15-20s to ~3s.
+
+  **Why not the original ir_bootstrap_sync API?** The big refactor
+  (helper extraction, `IrBootstrapResult` enum, separate orchestration)
+  was solving a problem (server-distinguishable "bootstrapped" lifecycle
+  event) that we don't actually have demand for. The 5-line tweak
+  addresses the visible UX gap, reuses every existing mechanism, and
+  is reversible. If the lifecycle-event distinction ever turns into
+  real demand, the refactor can layer on top.
 - ~~**Publish warns when blob exceeds OTA buffer size.**~~ Landed
   2026-04-22. `tools/publish_ir.py` now emits a multi-line stderr
   warning when the encoded blob exceeds 8192 bytes, naming the
@@ -411,13 +473,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   of every other Phase-2+ item. Natural to pair with any markers
   work already touching the IR version.
 
-- **blink** or other color pattern on conditions.  ~~Maybe add a type of
-  color which blinks or changes, and let agents set themselves or a tile
-  to the color?~~ Landed 2026-04-19 as `cycle` colors + `set color =` —
-  `agents/rainbow.crit` is the hello-world. Still open: canned animated
-  color palettes (fire, rainbow-standard) if any script wants them without
-  redefining.
-
 - ~~**Fix `light=(...)` heartbeat ordering.**~~ Landed 2026-04-22. Now
   prints `light=(cal_bright<raw<cal_dark)` to match the `min<cur<max`
   convention every other heartbeat triplet uses, so the `<` symbols
@@ -444,107 +499,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   didn't match the raw range, prime suspect for a persisted cal
   value). Not worth chasing while devices are behaving; revisit if
   another device shows the symptom or during a quiet period.
-
-- **Seek grammar: `free` adjective for occupancy-aware candidate
-  filtering.** Observed 2026-04-23 on ricky running `swarm.crit`:
-  physics budget saturated at 43.7ms A* / 50ms budget with
-  `failed_seeks=4,819,286` over 23.5h uptime (~57/s across 16 agents).
-  Root cause: the "nothing needed — park on a leaf" fallback branch
-  in `swarm.crit:52` uses `seek current`, which picks the nearest
-  `intended && lit` tile *regardless of whether another agent is
-  standing on it*. When the grid is fully painted (the modal state),
-  all 16 locusts simultaneously seek the same pool of already-correct
-  leaves, many of which are occupied; with `penalty occupied cell: 50`
-  in the pathfinding config every route bumps the `max nodes: 256`
-  A* cap and counts as a failed seek. Today's tile-state filter
-  (`on <kind>` / `not on <kind>`, `CritterEngine.cpp:1419-1425`)
-  operates on paint state only — there's no way to say "don't pick
-  cells another agent occupies."
-
-  **Grammar.** Extend the prepositive-adjective slot (currently just
-  `nearest`) to accept `free`:
-  ```
-  seek [nearest] [free] [agent|landmark] <target>
-       [with state == V] [on K | not on K] [timeout N]
-  ```
-  Fixed order (`nearest` then `free`) keeps the parser trivial.
-  Semantic: both `nearest` and `free` are *candidate-picking* predicates
-  that bind tightly to the target noun; `on K` / `with state ==` /
-  `timeout` remain *search-parameter* postpositives. The grouping in
-  the grammar mirrors the semantic grouping.
-
-  **Engine changes** (~15 lines in `CritterEngine.cpp`):
-  1. Parser at line ~1402-1408: after the `nearest` check, add a
-     symmetrical `free` check. Record as a bool.
-  2. Candidate-collection loop at line 1469-1474: when `free` is set,
-     skip any (x, y) where some other live agent's `pos` equals (x, y).
-     O(agent_count × grid_area) per seek call — negligible for our
-     grid sizes, no hot-path concern.
-  3. Claim write at line 1497-1498: extend to include `current` when
-     `free` is set. Prevents two agents targeting the same empty leaf
-     in the same tick (the claim-dedup mechanism `missing`/`extra` already
-     uses; today `current` seeks never claim, which is the other half
-     of the pile-up pathology).
-
-  **Script update once landed.** `swarm.crit:52` and `swarm-slower.crit`:
-  ```
-  # Nothing needed — park on a free leaf
-  seek nearest free current timeout 50
-  pause 10
-  done
-  ```
-  `timeout 50` caps the search if the grid is genuinely saturated
-  (no free leaves) rather than burning A* cycles indefinitely.
-
-  **Verification.** Publish the updated swarm to ricky, let it run on
-  a fully-painted grid for 10 minutes, read `failed_seeks` and
-  `astar=(avg<max)` from the heartbeat. Expected: counter growth
-  rate drops by an order of magnitude, A* avg drops from ~44ms back
-  into the "mostly idle" regime (single-digit ms) when the grid is
-  settled. `seeks_fail` will still grow — the productive branches
-  (missing/extra) legitimately contest crowded tiles — just much
-  more slowly.
-
-  **Room to grow.** The prepositive-adjective slot is a natural
-  place for future candidate-pickers (`random`, `cheapest`,
-  `coolest` for dim-first on penalty-lit targets). Worth getting
-  the grammar shape right now; easy to extend later.
-
-- **Night-mode disable sentinel (`night_enter_brightness=0`).** Today
-  the Schmitt trigger at `critterchron_particle.cpp:793-805` does a
-  plain `bri <= ne` compare; writing `0` clamps to `ne=0, nx=1` and
-  produces a rapid floor oscillator rather than disabling night mode.
-  Desired: `0` means "disable the night palette entirely, force day."
-  Change is an early-out in the Schmitt block:
-  ```cpp
-  if (ne <= 0) {
-      if (g_engine.nightMode()) {
-          g_engine.setNightMode(false);
-          Log.info("night: OFF (disabled, night_enter_brightness=0)");
-      }
-  } else {
-      // existing clamp + Schmitt
-  }
-  ```
-  Why `0` and not `-1`: `get_int` round-trips through `uint8_t` in
-  adjacent brightness code, and `-1` aliases `255` there — a
-  legitimate max-brightness value. `0` is safe because sink brightness
-  `0` is unreachable in practice (`min_brightness` range is `[1, 255]`
-  per catalog as of 2026-04-22). Also update the `night_enter_brightness`
-  help in `critterchron.s2s.yaml` to document the sentinel.
-  Pair with the `min_brightness` HAL floor entry below when the next
-  HAL pass lands — both are small Schmitt/clamp tweaks in the same
-  ~30-line block.
-
-- **(low priority) Belt-and-suspenders `min_brightness` floor in HAL.**
-  Catalog range tightened to `[1, 255]` on 2026-04-22 so `tools/s2s.py
-  set` can't write 0, but the HAL still clamps `min_b < 0 → 0` at
-  `critterchron_particle.cpp:765`. A direct KV write bypassing the
-  catalog tool could still land a zero and, combined with the
-  `night_enter_brightness=0` sentinel, produce a stuck-in-night state
-  at the floor. Cheap to harden: change to `min_b < 1 → 1`. Two
-  separate trust boundaries (tool vs. HAL) policing the same invariant
-  is fine; HAL is the one that actually runs on-device.
 
 - **Hotspot-mode fallback when WiFi is unreachable (ESP32).** On
   Particle, WiFi creds live in DCT and DeviceOS handles the "can't
@@ -607,32 +561,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   if the currently-running fw is fine) so an operator can investigate
   before re-attempting the bad flash.
 
-- **Drunken A*.** Pathfinding is too good — agents trace perfect,
-  straight Manhattan routes across the grid. Real critters wobble,
-  double back, pause, take the scenic route. Want a tunable way to
-  degrade pathing so the swarm reads as a bunch of tipsy animals
-  rather than a flock of guided missiles. Two sketches worth
-  prototyping:
-    1. *Cost jitter.* Add a small random perturbation to the g/h/f
-       cost in A*'s open-set ordering — say, `cost += rng.range(0,
-       drunkenness_eps)`. Non-optimal expansions get picked
-       occasionally, so paths meander but still reach the goal.
-       Cheap (one RNG call per expansion), deterministic per seed,
-       and `drunkenness_eps` is a natural Stra2us knob.
-    2. *Post-plan noise.* Plan the optimal path, then perturb the
-       *walk* — skip a tile with probability p, step orthogonally
-       for one tick with probability q, freeze for a tick with
-       probability r. Decouples the planner from the jitter so
-       A* stays fast and optimal; the drunkenness lives at step
-       time. Per-agent-type knob (a tanuki at the bar drunker than
-       a cheetah on duty) is the fun knob.
-    Leaning toward (2) because it composes with the existing
-    behavior IR without touching the planner core, but (1) is a
-    one-liner worth trying first to see how it reads visually. Both
-    want a `drunkenness` (or similar) Config key so the effect is
-    live-tunable — catalog it alongside `wobble_*` since it's the
-    same genre of "make it look organic" knob.
-
 ## Phase 2+ (per HAL_SPEC)
 
 - ~~**Phase 2 — Environmental polish:**~~ light sensor + brightness
@@ -677,6 +605,114 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-25 — Device-side error channel on the heartbeat.** Landed
+  across Particle (photon, photon2, argon) and ESP32-C3 in two phases.
+  `hal/ErrLog.{h,cpp}` is a 4-entry ring (~256 B RAM) protected by a
+  platform-conditional mutex (`Particle::Mutex` / `std::mutex`).
+  Producers call `g_errlog.record(ErrCat::OtaFetch|OtaApply|Boot|...,
+  fmt, ...)`; serial echo is preserved (`Log.error` on Particle,
+  `Serial.println` on ESP32) so dev workflow is unchanged. Telemetry
+  heartbeat drains one entry per cycle as ` err=<cat>:<msg>`,
+  `mark_sent()` only on HTTP 200 so a transient publish failure
+  requeues. Heartbeat report buffer bumped 320→384 to fit. Wire format
+  is grep-friendly k=v, single-token snake_case categories so server
+  splits cleanly without schema changes.
+
+  Wired sites: 5 OTA paths in both Stra2usClient.cpp variants
+  (oversized fetch / fetch failed / malformed blob / sidecar-blob sha
+  mismatch / ir_apply parse failed) plus 4 boot/reinit paths in each
+  platform's main shim (rescue-hold-on-crash / engine.begin failed /
+  cloud wait timeout / engine.reinit failed after IR swap; ESP32 also
+  ArduinoOTA error). Verified on real hardware: ricky's first
+  heartbeat after a deliberately oversized publish carried
+  `err=ota_fetch:megathyme size=4655>buf=4095`. ESP32 path verified on
+  timmy.
+
+  Mid-implementation bugfix worth remembering: first pass keyed
+  `mark_sent` on `millis`. Multiple records hitting the same
+  millisecond made peek (oldest-first) and mark_sent (linear) disagree
+  — leaked entries plus emitted dupes. Fixed by adding a per-instance
+  monotonic `seq` field as the identity. Smoke-tested with a 5-write
+  overflow; correct oldest-first drain, no dupes, oldest dropped.
+
+- **2026-04-24 — `seek nearest free` Python sim parity.** The C++ engine
+  has had `want_free` for a while (parser, candidate filter, current-tile
+  claim — all live in `CritterEngine.cpp:1761-1880`), and `swarm.crit:66`
+  / `swarm-slower.crit:65` use `seek nearest free current timeout 50` in
+  production. The Python sim was silently broken: parser at
+  `engine.py:1008` skipped straight from `nearest` to target_kind, so
+  `free` got read as the target type and the seek dispatched into
+  garbage. No functional test caught it because swarm isn't in the
+  fixture set. Closed by mirroring the C++ logic in three places —
+  parser (added `want_free` after `nearest`), candidate builder (drop
+  occupied cells, skip when target_kind=="agent"), claim site (extend
+  to `current` when `want_free` set). Painters excluded from the
+  occupancy check to match Python's existing `_occupied_positions`
+  convention; this is a pre-existing C++/Python divergence
+  (C++ counts painters as obstacles in path costs, Python doesn't) and
+  not worth fixing in this pass. All 39+6+17 tests still green.
+  Original-design discussion preserved in C++ engine comments at the
+  parser site for future reference.
+
+- **2026-04-24 — Color cycles closure.** The "blink/conditional color
+  pattern" Near-term entry was effectively done as of 2026-04-19
+  (`cycle` colors + `set color =`, hello-world in
+  `agents/rainbow.crit`). Residual sub-bullet about "canned animated
+  palettes (fire, rainbow-standard) if any script wants them" is
+  hypothetical wishlist with no demand behind it — removed from the
+  open list. If a future script genuinely wants a shared "fire"
+  palette, define it inline in that script's `--- colors ---` block;
+  if the same palette gets cribbed into a third script, that's the
+  signal to add a stdlib of canned cycles, not now.
+
+- **2026-04-24 — Drunken A* (C++ device engine).** Ported the Python
+  sim's post-plan noise to `hal/CritterEngine.cpp::stepTowardTarget`.
+  `PFConfig` gained `float drunkenness` + `has_drunkenness`; decoder
+  (`IrRuntime.cpp`) parses `drunkenness=` alongside `diagonal_cost=`.
+  `pfDrunkenness(type_idx)` mirrors `pfDiagonalCost`'s resolution chain
+  (per-agent → `all` → 0.0 default); no top-level branch since the
+  compiler restricts top-level pathfinding keys to `diagonal` /
+  `diagonal_cost`. The perturb lambda inside `stepTowardTarget` fires
+  on both the cached-plan step and the fresh-replan first step —
+  invalidates `a.plan_len = 0` on any ortho stagger (we've walked off
+  the cached path) and on freeze (cursor can't advance past an
+  unexecuted step). Host harness A/B at drunkenness=0.1 over 200 ticks
+  shows 193/200 ticks diverge from the sober run with freezes and
+  ortho staggers both firing. RNG (`std::mt19937 rng_`) is shared with
+  the existing `random N%` behavior evaluator; short-circuit at
+  `drunk<=0.0` keeps the sober hot path RNG-free just like the Python
+  side.
+
+- **2026-04-24 — Drunken A* (Python sim).** Added `drunkenness` to the
+  per-script pathfinding IR: float in `[0.0, 1.0]`, compile-time range
+  check, encode/decode through `ir_text`. Injected post-plan noise at
+  the seek-step site (`engine.py::_drunken_perturb` helper): at value
+  `d`, probability `d/2` freezes the agent for a tick, `d/2` staggers
+  perpendicular to the planned move, `1-d` takes the planned step
+  unchanged. A* itself stays pure — goal convergence preserved, only
+  the walk is noisy. Sober path (`drunkenness=0.0`, the default) is a
+  single comparison and consumes no RNG state, so existing scripts are
+  bit-identical to pre-change runs. Empirical distribution at
+  `drunkenness=0.2` across 10k rolls: 79.8% planned, 10.0% freeze,
+  10.2% ortho — matches theory. `agents/coati.crit` now sets 0.2 as a
+  live demo. Past-me's third operator ("skip a tile", jump 2 along
+  plan) is intentionally omitted — reads as a glitch more than a
+  stagger; re-add if visual eval disagrees. Past-me's "catalog
+  alongside `wobble_*` as a Stra2us knob" suggestion was dropped in
+  favor of per-script IR: agent-type granularity ("tanuki drunker than
+  cheetah") was the originally-stated fun knob, and it composes
+  cleanly with the existing `pathfinding.per_agent[type]` resolution
+  chain. C++ device engine parity landed same day — see entry above.
+
+- **2026-04-24 — Night-mode disable sentinel landed.** `night_enter_brightness<=0`
+  now force-exits night mode with an explicit early-out in
+  `critterchron_particle.cpp:850-854`, rather than relying on the
+  implicit "`bri` never reaches 0 because `min_brightness` floors at 1"
+  behaviour. Also handles the "KV flipped live while already in night
+  mode" case — exits on the next light tick instead of waiting for
+  `bri >= nx`. `min_brightness` floor in HAL (line 814) is also in
+  place as belt-and-suspenders, so the next entry below is stale too.
 
 - **2026-04-24 — P1 RAM recovery + heartbeat script-identity FR.**
   Ronaldo was deathblinking (SOS+1, hard fault) seconds after the tel

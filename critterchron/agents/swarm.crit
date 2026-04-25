@@ -29,6 +29,7 @@ locust:
   diagonal_cost: 1.414
   penalty lit cell: 0.5      # prefer dark lanes (slightly)
   penalty occupied cell: 10  # avoid other locusts
+  drunkenness: 0.2
 
 --- behavior ---
 locust:

@@ -132,7 +132,7 @@ int manhattan(Point a, Point b) {
 // Construction + lookup helpers
 // =======================================================================
 
-CritterEngine::CritterEngine(LedSink& sink, TimeSource& clock)
+CritterEngine::CritterEngine(LedSink& sink, CritTimeSource& clock)
     : sink_(sink), clock_(clock) {
     // Value-init the whole grid so every field (including count[]) is zero.
     // Bit-fields + an array member rule out the Tile{...} aggregate init we
@@ -361,6 +361,21 @@ float CritterEngine::pfDiagonalCost(uint16_t type_idx) const {
     if (all >= 0 && critter_ir::PF_CONFIGS[all].has_diagonal_cost)
         return critter_ir::PF_CONFIGS[all].diagonal_cost;
     return critter_ir::PF_TOP_HAS_DIAGONAL_COST ? critter_ir::PF_TOP_DIAGONAL_COST : 1.0f;
+}
+
+float CritterEngine::pfDrunkenness(uint16_t type_idx) const {
+    // Mirrors pfDiagonalCost's resolution chain: per-agent → 'all' →
+    // default. No top-level `drunkenness:` entry is allowed (compiler
+    // rejects) since the knob is explicitly per-script personality; so
+    // there's no top-level branch here, unlike diagonal_cost.
+    const char* name = critter_ir::AGENT_TYPES[type_idx].name;
+    int i = pfConfigIndex(name);
+    if (i >= 0 && critter_ir::PF_CONFIGS[i].has_drunkenness)
+        return critter_ir::PF_CONFIGS[i].drunkenness;
+    int all = pfConfigIndex("all");
+    if (all >= 0 && critter_ir::PF_CONFIGS[all].has_drunkenness)
+        return critter_ir::PF_CONFIGS[all].drunkenness;
+    return 0.0f;  // sober default — old IR blobs without the key land here.
 }
 
 // =======================================================================
@@ -1193,6 +1208,58 @@ bool CritterEngine::stepTowardTarget(Agent& a, Point target) {
         a.remaining_ticks = (int16_t)step_rate;
     };
 
+    // Post-plan drunkenness — mirror of engine.py::_drunken_perturb.
+    // Returns the (dx, dy) to actually commit. Sets `freeze=true` to
+    // signal the caller to idle for a tick (no move). Called with the
+    // planner-optimal (pdx, pdy); we decide sober/freeze/orthogonal
+    // stagger based on a uniform roll vs pfDrunkenness.
+    //
+    // Short-circuits at drunk<=0 so the sober hot path (almost every
+    // script, today) does a single float comparison and consumes no
+    // RNG state — matches the Python sim's zero-overhead sober path.
+    //
+    // On orthogonal failure (both 90°-rotations out-of-bounds or
+    // occupied), degrades to freeze rather than forcing the planned
+    // step: a stagger into a wall is better-read as "drunk" than
+    // "teleported through an obstacle."
+    auto drunken_perturb = [&](int8_t pdx, int8_t pdy,
+                               int8_t& odx, int8_t& ody,
+                               bool& freeze) -> void {
+        freeze = false;
+        float drunk = pfDrunkenness(a.type_idx);
+        if (drunk <= 0.0f) { odx = pdx; ody = pdy; return; }
+        if (drunk > 1.0f)  drunk = 1.0f;
+        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+        float r = ud(rng_);
+        if (r >= drunk) { odx = pdx; ody = pdy; return; }
+        if (r < drunk * 0.5f) { freeze = true; return; }
+        // Orthogonal stagger. 90° rotations of (pdx, pdy). For 4-conn
+        // planned moves one component is 0 so orthos are the two
+        // perpendicular cells; for diagonal planned moves orthos are
+        // the other two diagonals — still reads as a swerve.
+        const int8_t o1_dx = (int8_t)(-pdy), o1_dy = (int8_t)(pdx);
+        const int8_t o2_dx = (int8_t)(pdy),  o2_dy = (int8_t)(-pdx);
+        // Coin-flip order so stagger direction is unbiased.
+        std::uniform_int_distribution<int> coin(0, 1);
+        int8_t ax, ay, bx, by;
+        if (coin(rng_)) { ax=o1_dx; ay=o1_dy; bx=o2_dx; by=o2_dy; }
+        else            { ax=o2_dx; ay=o2_dy; bx=o1_dx; by=o1_dy; }
+        auto try_ortho = [&](int8_t dx, int8_t dy) -> bool {
+            int nx = a.pos.x + dx, ny = a.pos.y + dy;
+            if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT)
+                return false;
+            for (uint16_t k = 0; k < agent_count_; ++k) {
+                if (!agents_[k].alive || agents_[k].id == a.id) continue;
+                if (agents_[k].pos.x == nx && agents_[k].pos.y == ny)
+                    return false;
+            }
+            return true;
+        };
+        if (try_ortho(ax, ay)) { odx = ax; ody = ay; return; }
+        if (try_ortho(bx, by)) { odx = bx; ody = by; return; }
+        freeze = true;  // both orthos blocked — stagger into a wall = freeze
+    };
+
     // ---- try cached plan ----
     if (a.plan_len > 0 && a.plan_cursor < a.plan_len) {
         // Target drift: compare against stored plan_target.
@@ -1213,6 +1280,27 @@ bool CritterEngine::stepTowardTarget(Agent& a, Point target) {
                     // Surprise. Replan.
                     a.plan_len = 0;
                 } else {
+                    // Drunkenness fires AFTER the surprise-cost check: we
+                    // already know the planned step is still valid, we're
+                    // just deciding whether to execute it or stagger.
+                    int8_t odx, ody; bool freeze;
+                    drunken_perturb(ps.dx, ps.dy, odx, ody, freeze);
+                    if (freeze) {
+                        // Don't advance the plan cursor — we'll retry the
+                        // same step next tick. Cheap; no replan cost.
+                        a.step_duration   = 1;
+                        a.remaining_ticks = 1;
+                        return true;
+                    }
+                    if (odx != ps.dx || ody != ps.dy) {
+                        // Orthogonal stagger — we've walked off the plan.
+                        // Invalidate so next tick replans from the new
+                        // position (the cached plan's remaining steps
+                        // assumed we were on the straight-line path).
+                        a.plan_len = 0;
+                        commit_step(odx, ody);
+                        return true;
+                    }
                     a.plan_slack += ps.cost - actual;  // stays >= 0 by construction
                     ++a.plan_cursor;
                     commit_step(ps.dx, ps.dy);
@@ -1236,12 +1324,27 @@ bool CritterEngine::stepTowardTarget(Agent& a, Point target) {
         a.remaining_ticks = 1;
         return false;
     }
+    const PlannedStep& first = a.plan[0];
+    int8_t odx, ody; bool freeze;
+    drunken_perturb(first.dx, first.dy, odx, ody, freeze);
+    if (freeze) {
+        // Discard the fresh plan: we didn't execute its first step, so
+        // the cached cursor=1 position would be wrong. Replan next tick.
+        a.plan_len = 0;
+        a.step_duration   = 1;
+        a.remaining_ticks = 1;
+        return true;
+    }
+    if (odx != first.dx || ody != first.dy) {
+        // Orthogonal stagger on a fresh plan — same invalidation as above.
+        a.plan_len = 0;
+        commit_step(odx, ody);
+        return true;
+    }
     a.plan_len     = static_cast<uint8_t>(plan_len);
     a.plan_cursor  = 1;                 // cursor advances over the step we execute below
     a.plan_target  = target;
     a.plan_slack   = 0.0f;
-
-    const PlannedStep& first = a.plan[0];
     commit_step(first.dx, first.dy);
     return true;
 }

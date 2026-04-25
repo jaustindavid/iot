@@ -23,6 +23,7 @@
 #include "Particle.h"
 #include "creds.h"
 #include "CritterEngine.h"
+#include "ErrLog.h"
 #include "interface/Config.h"
 #include "LightSensor.h"
 #include "NeoPixelSink.h"
@@ -252,10 +253,10 @@ static unsigned long g_cloud_wait_start_ms = 0;
 
 static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-// Local wall-clock minute from a TimeSource. The shim uses this to detect
+// Local wall-clock minute from a CritTimeSource. The shim uses this to detect
 // minute rollovers — must read the same (wobbled) clock the engine writes
 // from, or the display lags behind the virtual time by up to a minute.
-static int local_minute(const TimeSource& c) {
+static int local_minute(const CritTimeSource& c) {
     time_t local = c.wall_now() + (time_t)(c.zone_offset_hours() * 3600.0f);
     struct tm tm;
     gmtime_r(&local, &tm);
@@ -287,11 +288,14 @@ static bool is_crash_reset(int reason) {
 static int telemetry_cycle() {
     if (!Time.isValid()) return 0;
 
-    // 256 bytes was snug before the light-sensor diagnostic fragment below
-    // widened the payload. Bump to 320 to leave headroom; truncation is still
-    // handled by the final NUL-terminate at the bottom, but we'd lose the new
-    // `light=(...)` fragment on every heartbeat without the extra bytes.
-    char report[320];
+    // 256 bytes was snug before the light-sensor diagnostic fragment widened
+    // the payload (320 in 2026-04-22), and 320 stayed snug after the OTA
+    // error-channel fragment landed (`err=<cat>:<msg>`, up to ~70 bytes per
+    // heartbeat — see ErrLog.h). 384 leaves headroom on either fragment;
+    // truncation is still handled by the final NUL-terminate at the bottom,
+    // but headroom matters because both `light=(...)` and `err=...` are
+    // observability features — silent truncation would defeat the point.
+    char report[384];
     int  rssi = -127;
     if (WiFi.ready()) {
         WiFiSignal sig = WiFi.RSSI();
@@ -362,9 +366,34 @@ static int telemetry_cycle() {
     }
 #endif
 
+    // Error-channel drain. One entry per heartbeat (ring is 4 deep, so
+    // a burst clears in 4 cycles = ~40s at 10s heartbeats — fast enough
+    // to track an OTA failure cluster, slow enough not to flood). Mark
+    // sent ONLY on successful publish; a network blip leaves the entry
+    // queued for retry on the next cycle.
+    critterchron::ErrEntry pending_err;
+    bool have_err = critterchron::g_errlog.peek_oldest_unsent(pending_err);
+    if (have_err && rlen > 0 && rlen < (int)sizeof(report) - 8) {
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " err=%s:%s",
+                             critterchron::err_cat_tag(pending_err.cat),
+                             pending_err.msg);
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+        } else {
+            // Truncated — don't claim this error was published, leave
+            // it queued for a later heartbeat that has more headroom.
+            report[sizeof(report) - 1] = '\0';
+            have_err = false;
+        }
+    }
+
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_APP, report);
     Log.info("telemetry: publish=%d %s", pub_status, report);
+    if (have_err && pub_status == 200) {
+        critterchron::g_errlog.mark_sent(pending_err.seq);
+    }
     g_cfg.poll_all();
     g_cfg.close();
 
@@ -692,7 +721,8 @@ void setup() {
     if (is_crash_reset(reason)) {
         g_rescue_mode     = true;
         g_rescue_start_ms = millis();
-        Log.warn("Rescue hold: reset_reason=%d, waiting %lums for OTA flash",
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                 "rescue hold rst=%d wait=%lums",
                  reason, (unsigned long)RESCUE_HOLD_MS);
     }
 
@@ -706,7 +736,8 @@ void setup() {
     Particle.connect();
 
     if (!g_engine.begin()) {
-        Log.error("CritterEngine::begin() failed");
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                 "engine.begin() failed");
     }
     // RNG seed: bake in something device-ish so two units diverge.
     g_engine.seedRng((uint32_t)HAL_RNG_GetRandomNumber());
@@ -930,8 +961,8 @@ void loop() {
 #endif
         } else if (now - g_cloud_wait_start_ms >= CLOUD_WAIT_FALLBACK_MS) {
             g_cloud_seen = true;
-            Log.warn("cloud wait timeout (%lums); falling back to RTC. "
-                     "final state: wifi.ready=%d time.valid=%d",
+            critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                     "cloud wait timeout %lums wifi=%d time=%d",
                      (unsigned long)CLOUD_WAIT_FALLBACK_MS,
                      (int)WiFi.ready(), (int)Time.isValid());
         } else {
@@ -1018,7 +1049,8 @@ void loop() {
         if (now - g_ota_loading_start_ms >= OTA_LOADING_MS) {
             if (g_cfg.ir_apply_if_ready()) {
                 if (!g_engine.reinit()) {
-                    Log.error("engine.reinit() failed after OTA IR swap");
+                    critterchron::g_errlog.record(critterchron::ErrCat::OtaApply,
+                             "engine.reinit() failed after IR swap");
                 } else {
                     // Fresh RNG entropy for the new script so two
                     // simultaneously-swapped devices diverge rather

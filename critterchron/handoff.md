@@ -26,7 +26,7 @@ critterchron/
 ├── agents/*.crit                                  # shared behavior scripts
 ├── hal/
 │   ├── CritterEngine.{h,cpp}                      # cross-platform engine
-│   ├── interface/{LedSink,TimeSource}.h           # platform seam
+│   ├── interface/{LedSink,CritTimeSource}.h       # platform seam (CritTimeSource not TimeSource — collides with DeviceOS 6.x's enum)
 │   ├── ir/ir_encoder.py                           # .crit → critter_ir.h
 │   ├── Makefile                                   # PLATFORM dispatcher
 │   ├── devices/<name>.h                           # per-device config

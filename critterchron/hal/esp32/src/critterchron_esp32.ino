@@ -37,6 +37,7 @@
 #include <Arduino.h>
 #include "creds.h"
 #include "src/CritterEngine.h"
+#include "src/ErrLog.h"
 #include "src/interface/Config.h"
 #include "src/FastLEDSink.h"
 
@@ -388,7 +389,7 @@ static volatile uint32_t g_astar_avg_us  = 0;
 static volatile uint32_t g_astar_max_us  = 0;
 #endif
 
-static int local_minute(const TimeSource& c) {
+static int local_minute(const CritTimeSource& c) {
     time_t local = c.wall_now() + (time_t)(c.zone_offset_hours() * 3600.0f);
     struct tm tm;
     gmtime_r(&local, &tm);
@@ -539,9 +540,31 @@ static int telemetry_cycle() {
 #endif
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
 
+    // Error-channel drain. One entry per heartbeat (ring is 4 deep).
+    // Mirror of telemetry_cycle() in hal/particle/src/critterchron_particle.cpp;
+    // mark_sent only on successful publish so a transient network failure
+    // requeues the entry for next cycle. See hal/ErrLog.h.
+    critterchron::ErrEntry pending_err;
+    bool have_err = critterchron::g_errlog.peek_oldest_unsent(pending_err);
+    if (have_err && rlen > 0 && rlen < (int)sizeof(report) - 8) {
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " err=%s:%s",
+                             critterchron::err_cat_tag(pending_err.cat),
+                             pending_err.msg);
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+        } else {
+            report[sizeof(report) - 1] = '\0';
+            have_err = false;
+        }
+    }
+
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_APP, report);
     Serial.printf("[tel] publish=%d %s\n", pub_status, report);
+    if (have_err && pub_status == 200) {
+        critterchron::g_errlog.mark_sent(pending_err.seq);
+    }
     g_cfg.poll_all();
     g_cfg.close();
 
@@ -759,7 +782,8 @@ void setup() {
 #endif
 
     if (!g_engine.begin()) {
-        Serial.println("[crit] CritterEngine::begin() failed");
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                 "engine.begin() failed");
     }
     g_engine.seedRng(esp_random());
 
@@ -808,7 +832,8 @@ void setup() {
         // resuming the engine for the ~100ms window until it does.
     });
     ArduinoOTA.onError([](ota_error_t err) {
-        Serial.printf("[ota] error=%u\n", (unsigned)err);
+        critterchron::g_errlog.record(critterchron::ErrCat::OtaApply,
+                 "ArduinoOTA error=%u", (unsigned)err);
         g_ota_active = false;
         g_ota_last_bar_cols = 0;
         // Sink may be mid-progress-bar; blank it so the engine's first
@@ -1055,7 +1080,8 @@ void loop() {
         if (now - g_ota_loading_start_ms >= OTA_LOADING_MS) {
             if (g_cfg.ir_apply_if_ready()) {
                 if (!g_engine.reinit()) {
-                    Serial.println("[crit] engine.reinit() failed after OTA IR swap");
+                    critterchron::g_errlog.record(critterchron::ErrCat::OtaApply,
+                             "engine.reinit() failed after IR swap");
                 } else {
                     // Fresh RNG entropy so two simultaneously-swapped
                     // devices diverge rather than march in lockstep.

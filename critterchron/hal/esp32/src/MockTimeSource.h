@@ -1,6 +1,6 @@
 #pragma once
 
-// MockTimeSource — TimeSource that reports valid()==true with a fixed
+// MockTimeSource — CritTimeSource that reports valid()==true with a fixed
 // epoch, so the engine ticks and behaviors run on a device that has no
 // wall clock (no WiFi, no SNTP, no RTC). Advances with millis() so the
 // virtual time moves forward even though it starts at an arbitrary
@@ -10,7 +10,7 @@
 // doesn't have WiFi or Stra2us yet but we still want to see agents
 // moving on the panel. Once EspTimeSource (SNTP-backed) lands, swap
 // this out for WobblyTimeSource(EspTimeSource(...)) — no engine changes
-// needed, the TimeSource interface is the seam.
+// needed, the CritTimeSource interface is the seam.
 //
 // Anchor epoch: Sat 2026-04-23 16:00:00 UTC — picked arbitrarily in the
 // current project week so `time`-based behaviors (if any) don't land
@@ -19,9 +19,9 @@
 // clock.
 
 #include <Arduino.h>
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 
-class MockTimeSource : public TimeSource {
+class MockTimeSource : public CritTimeSource {
 public:
     // Default anchor = 2026-04-23T16:00:00Z (Unix 1776844800).
     explicit MockTimeSource(time_t anchor_epoch = 1776844800,

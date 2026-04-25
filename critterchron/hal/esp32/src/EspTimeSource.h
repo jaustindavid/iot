@@ -1,6 +1,6 @@
 #pragma once
 
-// EspTimeSource — TimeSource backed by the ESP32's SNTP-synced system
+// EspTimeSource — CritTimeSource backed by the ESP32's SNTP-synced system
 // clock. Pure wrapper over POSIX `time()` + a validity heuristic: if
 // the current epoch parses to a year before 2024, we assume SNTP
 // hasn't completed yet (the chip boots with `time()` returning 0 ≈
@@ -21,9 +21,9 @@
 
 #include <Arduino.h>
 #include <time.h>
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 
-class EspTimeSource : public TimeSource {
+class EspTimeSource : public CritTimeSource {
 public:
     explicit EspTimeSource(float zone_offset_hours = 0.0f)
         : zone_off_(zone_offset_hours) {}

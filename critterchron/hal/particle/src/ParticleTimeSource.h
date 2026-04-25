@@ -1,13 +1,13 @@
 #pragma once
 
-// ParticleTimeSource — TimeSource backed by Particle's cloud-synced RTC.
+// ParticleTimeSource — CritTimeSource backed by Particle's cloud-synced RTC.
 
 #if defined(PLATFORM_ID)
 
 #include "Particle.h"
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 
-class ParticleTimeSource : public TimeSource {
+class ParticleTimeSource : public CritTimeSource {
 public:
     explicit ParticleTimeSource(float zone_offset_hours = 0.0f)
         : zone_off_(zone_offset_hours) {}

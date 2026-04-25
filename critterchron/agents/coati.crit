@@ -42,6 +42,11 @@ coati:
   step rate: 1
   diagonal: allowed
   diagonal cost: 1.414
+  # Mild stagger — roughly 1 in 10 ticks freezes, 1 in 10 sidesteps.
+  # Reads as a coati who's been at the water bowl but still knows where
+  # the trash is. Range is [0.0, 1.0] — 0.0 is sober (planner-optimal),
+  # 1.0 is every tick perturbed.
+  drunkenness: 0.1
 
 --- behavior ---
 coati:

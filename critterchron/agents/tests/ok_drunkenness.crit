@@ -1,0 +1,30 @@
+# ok_drunkenness.crit: positive fixture for the `drunkenness` pathfinding
+# knob. Valid values at the range endpoints (0.0 and 1.0) and a typical
+# mid-range (0.25) must all compile cleanly. Paired with
+# `drunkenness_out_of_range.crit` and `drunkenness_negative.crit` which
+# prove the [0.0, 1.0] clamp is enforced.
+--- colors ---
+tortoise: (64, 48, 0)
+green:    (0, 255, 0)
+
+--- agents ---
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+tortoise:
+  max nodes: 256
+  step rate: 1
+  drunkenness: 0.25
+
+all:
+  # Integer literal — compiler coerces to float (0.0). Tests that "0" in
+  # the source doesn't fall into an int-only code path.
+  drunkenness: 0
+
+--- behavior ---
+tortoise:
+  pause 3
+  done

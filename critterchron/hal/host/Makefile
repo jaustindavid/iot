@@ -35,7 +35,7 @@ GRID_HEIGHT = $(shell grep GRID_HEIGHT $(DEVICE_HEADER) | awk '{print $$3}')
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
             -I $(HAL_ROOT) -I $(BUILD_DIR) -I src
 
-ENGINE_SRCS := $(HAL_ROOT)/CritterEngine.cpp $(HAL_ROOT)/ir/IrRuntime.cpp src/main.cpp
+ENGINE_SRCS := $(HAL_ROOT)/CritterEngine.cpp $(HAL_ROOT)/ErrLog.cpp $(HAL_ROOT)/ir/IrRuntime.cpp src/main.cpp
 
 .PHONY: list clean $(SCRIPTS) $(addsuffix -run, $(SCRIPTS))
 

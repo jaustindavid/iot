@@ -556,6 +556,13 @@ class CritCompiler:
         "diagonal":               "diagonal",
         "diagonal cost":          "diagonal_cost",
         "diagonal_cost":          "diagonal_cost",
+        # Post-plan drunkenness. Float in [0.0, 1.0]: probability that a given
+        # step is perturbed. Perturbation is split evenly between freeze (stay
+        # a tick) and orthogonal step (stagger perpendicular to the planned
+        # move). A* itself stays pure; noise lives at step time so plans still
+        # converge on goals. 0.0 = sober planner-optimal motion (default);
+        # ~0.2 reads as "looks biological"; 1.0 every tick is perturbed.
+        "drunkenness":            "drunkenness",
     }
 
     def _parse_pathfinding_section(self, lines):
@@ -635,6 +642,17 @@ class CritCompiler:
             if not isinstance(parsed, int) or parsed < 1:
                 raise ValueError(
                     f"Pathfinding 'plan_horizon' must be a positive integer, got {val_str!r}"
+                )
+        # drunkenness is a probability — enforce the [0.0, 1.0] range at
+        # compile time so an out-of-range value shows up here (where the
+        # message includes the source line), not silently clamped at runtime.
+        # Coerced to float even if the source wrote "0" or "1" so downstream
+        # readers don't have to branch on type.
+        if canonical == "drunkenness":
+            parsed = float(parsed)
+            if not (0.0 <= parsed <= 1.0):
+                raise ValueError(
+                    f"Pathfinding 'drunkenness' must be in [0.0, 1.0], got {val_str!r}"
                 )
         return parsed
 

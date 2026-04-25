@@ -1,6 +1,6 @@
 #pragma once
 
-// WobblyTimeSource — TimeSource decorator that drifts a virtual wall clock
+// WobblyTimeSource — CritTimeSource decorator that drifts a virtual wall clock
 // around the real one by a randomized offset in [min_seconds, max_seconds].
 // Ticks faster than real time when behind its current target offset, slower
 // when ahead, then picks a new target when it gets there. Creates the
@@ -29,13 +29,13 @@
 
 #include <Arduino.h>
 #include "interface/Config.h"
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 #include <cmath>
 #include <cstdlib>
 
-class WobblyTimeSource : public TimeSource {
+class WobblyTimeSource : public CritTimeSource {
 public:
-    WobblyTimeSource(TimeSource& inner, const Config& cfg)
+    WobblyTimeSource(CritTimeSource& inner, const Config& cfg)
         : inner_(inner), cfg_(cfg) {}
 
     bool   valid()             const override { return inner_.valid(); }
@@ -88,7 +88,7 @@ private:
         target_offset_s_ = (double)min_s + (span > 0 ? (rand() % (span + 1)) : 0);
     }
 
-    TimeSource&   inner_;
+    CritTimeSource&   inner_;
     const Config& cfg_;
 
     mutable double        virt_epoch_s_    = 0.0;

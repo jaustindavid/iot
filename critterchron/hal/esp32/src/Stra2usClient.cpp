@@ -23,6 +23,7 @@
 // file line-diff-able with the Particle version is worth more than any
 // cosmetic reshuffle; resist the urge.
 #include "Stra2usClient.h"
+#include "ErrLog.h"
 #include "ir/IrRuntime.h"
 #include "sha256.h"
 #include <Arduino.h>
@@ -30,6 +31,13 @@
 #include <strings.h>   // strcasestr (newlib GNU extension; available on
                        // Arduino-ESP32 under the default -D_GNU_SOURCE)
 #include <time.h>
+
+// Error-channel shorthand. Mirror of hal/particle/src/Stra2usClient.cpp;
+// LOG_WARN/LOG_ERR macros remain in place but the OTA failure paths now
+// fan out to g_errlog.record() so the heartbeat carries the message
+// remotely. See hal/ErrLog.h for the contract.
+using critterchron::g_errlog;
+using critterchron::ErrCat;
 
 // strcasestr is a GNU extension; Arduino-ESP32's newlib exposes it, but
 // guard anyway with a tiny fallback in case a future core version drops it.
@@ -729,7 +737,8 @@ void Stra2usClient::ir_poll() {
     // hit the oversize-crash path. -1 leaves room for the NUL the
     // msgpack unwrap appends after the payload.
     if (have_size && sidecar_size > sizeof(ir_ota_buf_) - 1) {
-        LOG_WARN("ir_poll: %s size=%u exceeds buffer=%u; skipping fetch",
+        g_errlog.record(ErrCat::OtaFetch,
+                 "%s size=%u>buf=%u",
                  new_ptr,
                  (unsigned)sidecar_size,
                  (unsigned)(sizeof(ir_ota_buf_) - 1));
@@ -772,7 +781,7 @@ void Stra2usClient::ir_poll() {
     LOG_INFO("ir_poll: fetching blob %s", script_key);
     size_t blob_len = 0;
     if (!kv_fetch_str_(script_key, ir_ota_buf_, sizeof(ir_ota_buf_), blob_len)) {
-        LOG_WARN("ir_poll: fetch failed for %s", script_key);
+        g_errlog.record(ErrCat::OtaFetch, "fetch failed: %s", script_key);
         return;
     }
     // Blob is in ir_ota_buf_ and accounted for. Log length here so a
@@ -784,7 +793,8 @@ void Stra2usClient::ir_poll() {
 
     char new_sha[65];
     if (!compute_content_sha_(ir_ota_buf_, blob_len, new_sha)) {
-        LOG_ERR("ir_poll: malformed blob for %s (no encoded_at/END); ignoring", new_ptr);
+        g_errlog.record(ErrCat::OtaFetch,
+                 "malformed blob: %s (no encoded_at/END)", new_ptr);
         return;
     }
     // ASCII "..." not UTF-8 "…" — the serial monitor doesn't decode UTF-8
@@ -796,7 +806,8 @@ void Stra2usClient::ir_poll() {
     // sidecar (older publisher or transient fetch error), we trust the
     // blob's own content_sha as the identity.
     if (have_sidecar && strcmp(new_sha, sidecar_sha) != 0) {
-        LOG_ERR("ir_poll: sidecar/blob content_sha mismatch for %s (sidecar=%.8s blob=%.8s); skipping",
+        g_errlog.record(ErrCat::OtaFetch,
+                 "sha mismatch %s sc=%.8s blob=%.8s",
                   new_ptr, sidecar_sha, new_sha);
         return;
     }
@@ -854,7 +865,7 @@ bool Stra2usClient::ir_apply_if_ready() {
                             ? critter_ir::BEHAVIORS[0].insn_count : 0),
                  (unsigned long)critter_ir::RUNTIME_TICK_MS);
     } else {
-        LOG_ERR("ir_apply: parse failed for %s: %s",
+        g_errlog.record(ErrCat::OtaApply, "parse failed %s: %s",
                   ir_pending_ptr_, critter_ir::lastLoadError());
     }
     // Free the slot regardless: a bad blob shouldn't keep us retrying the

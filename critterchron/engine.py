@@ -316,6 +316,11 @@ class CritterEngine:
         "diagonal": False,
         "diagonal_cost": None,
         "step_rate": 2,
+        # Drunkenness: probability of post-plan perturbation per step,
+        # split evenly between freeze and orthogonal stagger. 0.0 = sober
+        # (historical behavior). Compiler clamps to [0.0, 1.0]; this
+        # default is the safe sober fallback if a script omits the knob.
+        "drunkenness": 0.0,
     }
 
     def _pf(self, agent_name, key):
@@ -332,6 +337,63 @@ class CritterEngine:
         if key in ("diagonal", "diagonal_cost") and key in pf:
             return pf[key]
         return self._PF_DEFAULTS.get(key)
+
+    def _drunken_perturb(self, agent, planned_next):
+        """Post-plan noise. Returns the tile the agent should actually step
+        to, or ``None`` to freeze in place for this tick.
+
+        Chooses between three outcomes based on per-agent-type `drunkenness`
+        (float in [0.0, 1.0], clamped defensively here even though the
+        compiler already range-checks it):
+
+          * planned_next               — probability  1 - drunkenness  ("sober")
+          * None (freeze)              — probability  drunkenness / 2
+          * perpendicular tile         — probability  drunkenness / 2
+
+        The perpendicular candidates are the two 90°-rotations of the
+        planned step vector. Each is validated for grid-bounds and
+        unoccupancy; if both fail we downgrade to freeze (a stagger that
+        hit a wall is more 'drunk' than forcing the planned step, and it
+        avoids trampling occupancy invariants).
+
+        Rationale for post-plan noise (vs. perturbing A*'s cost function):
+        A* stays deterministic and its goal-reaching guarantees survive;
+        only the *walk* is noisy. Tortoises still reach the pool, ants
+        still swarm the pheromone — they just wobble en route.
+
+        Past-me's 'skip a tile' operator (jump 2 along the plan) is
+        intentionally omitted — a 2-cell teleport reads as a glitch more
+        than a stagger. Re-add if visual eval disagrees.
+        """
+        drunk = self._pf(agent.name, "drunkenness") or 0.0
+        # Defensive clamp. Compiler already enforces [0.0, 1.0], but a
+        # hand-edited IR blob or missing default path could still deliver
+        # something out of range; we don't want an RNG comparison to spray
+        # noise for drunk>1 or read as sober-with-nonzero-p for drunk<0.
+        if drunk <= 0.0:
+            return planned_next
+        if drunk > 1.0:
+            drunk = 1.0
+        r = random.random()
+        if r >= drunk:
+            return planned_next
+        if r < drunk / 2:
+            return None  # freeze this tick
+        # Orthogonal stagger. Planned step vector:
+        pdx = planned_next[0] - agent.pos[0]
+        pdy = planned_next[1] - agent.pos[1]
+        # 90° rotations (both senses). For 4-connected planned moves one
+        # component is 0 — orthos are the two cells "next to" the agent
+        # perpendicular to travel. For diagonal planned moves these are
+        # the other two diagonals (45° off), which still reads as a swerve.
+        orthos = [(-pdy, pdx), (pdy, -pdx)]
+        random.shuffle(orthos)
+        for dx, dy in orthos:
+            nx, ny = agent.pos[0] + dx, agent.pos[1] + dy
+            if (0 <= nx < self.width and 0 <= ny < self.height
+                    and (nx, ny) not in self._occupied_positions):
+                return (nx, ny)
+        return None  # both orthos blocked → freeze
 
     def _get_a_star_path(self, start, target, agent_name):
         """Bounded A* with best-so-far fallback.
@@ -842,20 +904,41 @@ class CritterEngine:
                     # pheromone following has no exclusive-access
                     # semantics, and brief overshoot on the cap is
                     # handled by the script (see MARKERS_SPEC §2.4).
-                    if parsed["kind"] == "classic" and parsed["target_type"] in (
-                        "missing", "extra",
+                    # `seek free current` extends claims to `current`
+                    # tiles too, mirroring the C++ engine — without it
+                    # two agents racing to the same already-painted
+                    # leaf in the same tick would both claim victory.
+                    if parsed["kind"] == "classic" and (
+                        parsed["target_type"] in ("missing", "extra")
+                        or (parsed.get("want_free")
+                            and parsed["target_type"] == "current")
                     ):
                         self.grid[target[0]][target[1]].claimant_id = agent.id
                     path = self._get_a_star_path(agent.pos, target, agent.name)
                     if path:
-                        agent.prev_pos = list(agent.pos)
-                        agent.pos = list(path[0])
-                        if agent.name not in self.painters:
-                            self._occupied_positions.discard(tuple(agent.prev_pos))
-                            self._occupied_positions.add(tuple(agent.pos))
-                        step_rate = self._pf(agent.name, "step_rate")
-                        agent.step_duration = step_rate
-                        agent.remaining_ticks = step_rate
+                        # Post-plan drunkenness injection. Returns the
+                        # planned step (sober), a perpendicular stagger,
+                        # or None (freeze). Short-circuit at drunkenness=0
+                        # so the sober hot path is a single comparison +
+                        # an RNG skip inside the helper.
+                        next_tile = self._drunken_perturb(agent, path[0])
+                        if next_tile is None:
+                            # Freeze: hold pc on this seek, idle one tick.
+                            # Next tick re-enters the seek and A* replans
+                            # from the un-moved position. Equivalent to the
+                            # empty-path branch below, just triggered by
+                            # the perturbation instead of planner failure.
+                            agent.step_duration = 1
+                            agent.remaining_ticks = 1
+                        else:
+                            agent.prev_pos = list(agent.pos)
+                            agent.pos = list(next_tile)
+                            if agent.name not in self.painters:
+                                self._occupied_positions.discard(tuple(agent.prev_pos))
+                                self._occupied_positions.add(tuple(agent.pos))
+                            step_rate = self._pf(agent.name, "step_rate")
+                            agent.step_duration = step_rate
+                            agent.remaining_ticks = step_rate
                     else:
                         agent.step_duration = 1
                         agent.remaining_ticks = 1
@@ -918,7 +1001,8 @@ class CritterEngine:
                 "timeout": int(m.group("t")) if m.group("t") is not None else None,
                 # unused in gradient shape but present for uniform dispatch
                 "target_kind": None, "target_type": None,
-                "state_filter": None, "filter_mode": None, "filter_kind": None,
+                "state_filter": None, "want_free": False,
+                "filter_mode": None, "filter_kind": None,
                 "filter_marker_name": None, "filter_marker_op": None,
                 "filter_marker_n": None,
             }
@@ -929,6 +1013,14 @@ class CritterEngine:
         parts = inst.split()
         i = 1
         if i < len(parts) and parts[i] == "nearest":
+            i += 1
+        # `free` adjective — drop candidates occupied by another live agent
+        # and (below, in the dispatcher) extend the claim to `current`
+        # cells when set. Mirrors C++ engine `want_free`. Fixed grammar
+        # order (`nearest` then `free`) keeps the parser one-pass.
+        want_free = False
+        if i < len(parts) and parts[i] == "free":
+            want_free = True
             i += 1
         target_kind = None
         if i < len(parts) and parts[i] in ("agent", "landmark"):
@@ -984,6 +1076,7 @@ class CritterEngine:
             "target_kind": target_kind,
             "target_type": target_type,
             "state_filter": state_filter,
+            "want_free": want_free,
             "filter_mode": filter_mode,
             "filter_kind": filter_kind,
             "filter_marker_name": filter_marker_name,
@@ -1073,6 +1166,22 @@ class CritterEngine:
                         candidates.append((x, y))
                     elif target_type == "current" and tile.intended and tile.state:
                         candidates.append((x, y))
+
+        # `free` occupancy filter — drop cells currently occupied by another
+        # agent. Mirror of CritterEngine.cpp's want_free branch. Skip when
+        # target IS another agent (the agent's pos IS the target, filtering
+        # it out makes the seek unsatisfiable). Painters don't block — they
+        # aren't physical occupants for collision purposes (matches the
+        # rest of the Python sim's occupancy logic; C++ counts painters,
+        # see "C++/Python painter divergence" note in TODO.md Completed).
+        # No `alive` filter: Python sim removes despawned agents from
+        # self.agents outright (unlike C++'s tombstone-via-`alive=false`).
+        if parsed.get("want_free") and target_kind != "agent":
+            occupied = {
+                tuple(a.pos) for a in self.agents
+                if a.id != agent.id and a.name not in self.painters
+            }
+            candidates = [c for c in candidates if c not in occupied]
 
         filter_mode = parsed["filter_mode"]
         filter_kind = parsed["filter_kind"]

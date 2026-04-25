@@ -56,7 +56,46 @@ def agent_pos(engine, agent_name, which=0):
 # --- Case assertions --------------------------------------------------------
 # Each takes (engine, start_positions) and returns (ok: bool, message: str).
 
-def _check_doozer_markers(eng, starts):
+# --- Observers (per-case state recorders) -----------------------------------
+# Called once per tick during the run; mutate the `obs` dict so the final
+# check can ask "did X ever happen" rather than "is X currently true." This
+# matters because we tick 1000 by default to really exercise long-running
+# pathways (swarms reaching steady state, decay pulses fully expiring,
+# wanderers visiting many cells), but several scripts have transient peak
+# behavior that's gone by tick 1000 — first-arrival, peak deposit count,
+# and so on. Observers capture those moments inline.
+
+def _obs_visit_log(eng, obs):
+    """Record every (agent_name, position) seen this tick."""
+    obs.setdefault("visits", set()).update(
+        (a.name, tuple(a.pos)) for a in eng.agents
+    )
+
+def _obs_marker_max_at(name, x, y):
+    """Closure: record max count seen at marker `name` at cell (x, y)."""
+    def fn(eng, obs):
+        try:
+            slot = eng._markers[name]["index"]
+        except KeyError:
+            return
+        key = f"max_{name}_{x}_{y}"
+        obs[key] = max(obs.get(key, 0), eng.grid[x][y].count[slot])
+    return fn
+
+def _obs_marker_max_column(name, x, ys):
+    """Closure: record max count seen at marker `name` at each cell (x, y) for y in ys."""
+    def fn(eng, obs):
+        try:
+            slot = eng._markers[name]["index"]
+        except KeyError:
+            return
+        col = obs.setdefault(f"col_{name}_{x}", {})
+        for y in ys:
+            col[y] = max(col.get(y, 0), eng.grid[x][y].count[slot])
+    return fn
+
+
+def _check_doozer_markers(eng, starts, obs):
     """Doozers should move AND draw at least some of the clock face."""
     if not any_agent_moved(eng, starts):
         return False, "no doozer moved from its start (bootstrap deadlock regression?)"
@@ -65,84 +104,147 @@ def _check_doozer_markers(eng, starts):
         return False, f"only {lit} cells lit after run — expected >=5 clock cells"
     return True, f"doozers moved; {lit} clock cells drawn"
 
-def _check_markers_basic(eng, starts):
-    """Ant sits at (4,4) and deposits on its own cell."""
+def _check_markers_basic(eng, starts, obs):
+    """Ant sits at (4,4) and deposits on its own cell. Observer tracks max
+    trail seen because decay drives the steady-state value; we just want to
+    confirm a deposit happened at all."""
     if tuple(eng.agents[0].pos) != (4, 4):
         return False, f"ant wandered to {tuple(eng.agents[0].pos)} — expected (4, 4)"
-    c = marker_at(eng, "trail", 4, 4)
-    if c < 1:
-        return False, f"trail@(4,4) = {c}, expected >= 1 deposit"
-    return True, f"ant parked at (4,4); trail={c}"
+    peak = obs.get("max_trail_4_4", 0)
+    if peak < 1:
+        return False, f"trail@(4,4) peak = {peak}, expected >= 1 deposit"
+    return True, f"ant parked at (4,4); peak trail={peak}"
 
-def _check_hw_incr_trail(eng, starts):
-    """Ant climbs column 0 depositing 1..6 units per cell. Exact match."""
-    expected = {(0, y): y + 1 for y in range(6)}
-    got = {(0, y): marker_at(eng, "trail", 0, y) for y in range(6)}
-    if got != expected:
-        return False, f"trail column mismatch: got {got}, want {expected}"
+def _check_hw_incr_trail(eng, starts, obs):
+    """Ant climbs column 0 depositing 1..6 units per cell. Observer records
+    peak count per cell — decay wipes the actual counts long before tick
+    1000, but the deposits did happen and that's what we assert."""
+    expected = {y: y + 1 for y in range(6)}
+    got = obs.get("col_trail_0", {})
+    got_filtered = {y: got.get(y, 0) for y in range(6)}
+    if got_filtered != expected:
+        return False, f"trail column mismatch: peak={got_filtered}, want {expected}"
     pos = agent_pos(eng, "ant")
     if pos != (0, 5):
         return False, f"ant parked at {pos}, expected (0, 5)"
-    return True, f"trail column = {[got[(0, y)] for y in range(6)]}"
+    return True, f"trail column peak = {[got_filtered[y] for y in range(6)]}"
 
-def _check_hw_decay_pulse(eng, starts):
-    """Trail at (4,4) should have decayed significantly from the initial 10."""
-    c = marker_at(eng, "trail", 4, 4)
-    # Decay 1/8 over 40 ticks = 5 units lost. Count should be ~5.
-    # Tolerate ±1 for scheduling jitter.
-    if c == 0:
-        return False, "trail fully gone — decay too fast, or ticks overshot"
-    if c >= 10:
-        return False, f"trail = {c}, not decayed at all"
-    return True, f"trail decayed from 10 to {c} (expected ~5)"
+def _check_hw_decay_pulse(eng, starts, obs):
+    """Trail at (4,4) should reach 10 (initial draw) and then decay. With
+    1000 ticks we expect full decay to 0; the assertion is the *trajectory*:
+    peak >= 10 (the deposit fired), final < peak (decay happened)."""
+    peak = obs.get("max_trail_4_4", 0)
+    final = marker_at(eng, "trail", 4, 4)
+    if peak < 10:
+        return False, f"peak trail = {peak}, expected >= 10 (deposit didn't fire)"
+    if final >= peak:
+        return False, f"trail final ({final}) >= peak ({peak}) — decay not running?"
+    return True, f"trail rose to {peak}, decayed to {final}"
 
-def _check_hw_gradient_follow(eng, starts):
-    """Follower should park on the beacon's peak at (7, 0)."""
+def _check_hw_gradient_follow(eng, starts, obs):
+    """Follower should park on the beacon's peak at (7, 0). Beacon trail
+    decays once the source script tapers, so we use the observed peak."""
     pos = agent_pos(eng, "follower")
     if pos != (7, 0):
         return False, f"follower at {pos}, expected (7, 0)"
-    peak = marker_at(eng, "trail", 7, 0)
+    peak = obs.get("max_trail_7_0", 0)
     if peak < 5:
-        return False, f"trail peak at (7,0) = {peak}, expected 5"
-    return True, f"follower parked on (7, 0); peak = {peak}"
+        return False, f"trail peak at (7,0) = {peak}, expected >= 5"
+    return True, f"follower parked on (7, 0); peak trail = {peak}"
 
-def _check_markers_highest_cap(eng, starts):
-    """Ant should land on (8,8): the highest sub-cap pile cell."""
-    pos = agent_pos(eng, "ant")
-    if pos != (8, 8):
+def _check_markers_highest_cap(eng, starts, obs):
+    """Ant should land on (8,8) — the highest sub-cap pile cell — at some
+    point during the run. With 1000 ticks the ant moves on after its
+    `pause 30` ends; we assert the *first landing* via the visit log."""
+    visits = obs.get("visits", set())
+    if ("ant", (8, 8)) not in visits:
         return False, (
-            f"ant at {pos}, expected (8, 8). "
+            f"ant never visited (8, 8). "
             f"(4,8)=forgot sort-by-count; (12,8)=forgot cap filter; else=landmark scope broken"
         )
-    return True, "ant landed on (8, 8) as predicted"
+    return True, "ant visited (8, 8) as predicted"
+
+def _check_swarm(eng, starts, obs):
+    """Swarm uses `seek nearest free current` — the regression target for
+    Python sim parity with the C++ engine. Locusts spawn dynamically from
+    the nest (zero initial agents in `--- agents ---`), so the
+    `any_agent_moved` check doesn't apply: instead we assert the spawn
+    rule fired (live agents > 0) and the grid actually converged.
+
+    Assertion list:
+      * spawn rule fired (live agents > 0)
+      * grid converged (lit / intended >= 50%)
+      * no pile-up (failed_seeks below a generous budget)
+      * no crash (implicit — running 1000 ticks without raising)
+    """
+    if len(eng.agents) == 0:
+        return False, "no locusts alive — spawn rule misfired?"
+    lit = lit_count(eng)
+    intended = sum(1 for x in range(eng.width) for y in range(eng.height)
+                   if eng.grid[x][y].intended)
+    if intended == 0:
+        return False, "no intended cells (sync_time misfire?)"
+    coverage = lit / intended
+    if coverage < 0.5:
+        return False, f"convergence {coverage:.0%} below 50%; lit={lit}/{intended}"
+    fails = eng.health_metrics.get("failed_seeks", 0)
+    # 1000 ticks × 16 agents = 16k agent-ticks; pre-`free` regression saw
+    # ~57 fails/sec on hardware (~1k+ fails per minute). Headroom of 200
+    # for sim drift; trip if it spikes (regression of `seek free`).
+    if fails > 200:
+        return False, f"failed_seeks={fails} > 200 budget (free-seek regression?)"
+    return True, (
+        f"swarm: {len(eng.agents)} locusts, converged {coverage:.0%}, "
+        f"failed_seeks={fails}"
+    )
 
 
 # --- Registry ---------------------------------------------------------------
-# (relative_path, ticks_to_run, sync_time_needed, assertion_fn)
+# (relative_path, ticks_to_run, sync_time_needed, observe_fn, assertion_fn)
 # sync_time_needed=True draws the clock face into `intended` before ticking —
 # required for any script whose behavior hinges on `missing` / `extra`.
+# observe_fn is None for "no per-tick recording needed" (final-state-only
+# assertions). Default tick budget is 1000 — long enough that the swarm
+# reaches steady state, decay pulses fully expire, and any first-tick-only
+# bug (the bug that motivated this default — `seek free` AttributeError
+# only fires when an agent actually contests an occupied cell) shows up
+# as a crash rather than an unobserved silent regression.
+
+DEFAULT_TICKS = 1000
 
 CASES = [
-    ("agents/doozer_markers.crit",            80, True,  _check_doozer_markers),
-    ("agents/tests/markers_basic.crit",       20, False, _check_markers_basic),
-    # 25 ticks lands inside the ant's post-arrival `pause 30`. A longer window
-    # would see the ant re-seek after pause ends — at that point (8,8) is at
-    # cap and the only sub-cap cell left is (4,8), so it correctly walks
-    # there. We want to assert the FIRST landing, not the follow-up.
-    ("agents/tests/markers_highest_cap.crit", 25, False, _check_markers_highest_cap),
+    ("agents/doozer_markers.crit",            DEFAULT_TICKS, True,
+        None, _check_doozer_markers),
+    ("agents/tests/markers_basic.crit",       DEFAULT_TICKS, False,
+        _obs_marker_max_at("trail", 4, 4), _check_markers_basic),
+    # Visit log captures the ant's first landing on (8,8); without it the
+    # 1000-tick run would see the ant move on after `pause 30` ends and
+    # the assertion would fail.
+    ("agents/tests/markers_highest_cap.crit", DEFAULT_TICKS, False,
+        _obs_visit_log, _check_markers_highest_cap),
     # HW visual-smoke fixtures. These double as the reference render for the
     # hardware port: the sim must produce the pattern described in each
     # fixture's header comment, so flashing becomes a pure parity check.
     # All three fit an 8×8 grid rooted at (0, 0) so they run on any device.
-    # 25 ticks: 6 states × ~3 ticks/state (set-state transitions defer by
-    # a tick, step+pause account for the rest) + a few settle ticks.
-    ("agents/hw_incr_trail.crit",             25, False, _check_hw_incr_trail),
-    ("agents/hw_decay_pulse.crit",            40, False, _check_hw_decay_pulse),
-    ("agents/hw_gradient_follow.crit",        12, False, _check_hw_gradient_follow),
+    # 1000-tick observation captures the deposits/peak before decay erases
+    # them — the steady state at tick 1000 is "trail fully decayed to 0".
+    ("agents/hw_incr_trail.crit",             DEFAULT_TICKS, False,
+        _obs_marker_max_column("trail", 0, range(6)), _check_hw_incr_trail),
+    ("agents/hw_decay_pulse.crit",            DEFAULT_TICKS, False,
+        _obs_marker_max_at("trail", 4, 4), _check_hw_decay_pulse),
+    ("agents/hw_gradient_follow.crit",        DEFAULT_TICKS, False,
+        _obs_marker_max_at("trail", 7, 0), _check_hw_gradient_follow),
+    # swarm.crit exercises `seek nearest free current` (occupancy-aware
+    # candidate filtering). Added 2026-04-24 after a sim crash that
+    # earlier fixtures missed because none ticked long enough to actually
+    # contest occupancy. needs_sync because the script targets `current`
+    # tiles, which requires an `intended` clock face to seek toward.
+    ("agents/swarm.crit",                     DEFAULT_TICKS, True,
+        None, _check_swarm),
 ]
 
 
-def run_case(rel_path, ticks, needs_sync, check):
+def run_case(rel_path, ticks, needs_sync, observe, check):
     path = ROOT / rel_path
     try:
         ir = CritCompiler().compile(str(path))
@@ -152,10 +254,13 @@ def run_case(rel_path, ticks, needs_sync, check):
     if needs_sync:
         eng.sync_time(MEGAFONT_5X6)
     starts = [tuple(a.pos) for a in eng.agents]
+    obs = {}
     for _ in range(ticks):
         eng.tick()
+        if observe is not None:
+            observe(eng, obs)
     try:
-        return check(eng, starts)
+        return check(eng, starts, obs)
     except Exception as e:
         return False, f"assertion crashed: {type(e).__name__}: {e}"
 
@@ -163,8 +268,8 @@ def run_case(rel_path, ticks, needs_sync, check):
 def main(argv):
     verbose = "-v" in argv or "--verbose" in argv
     passed = failed = 0
-    for rel, ticks, needs_sync, check in CASES:
-        ok, msg = run_case(rel, ticks, needs_sync, check)
+    for rel, ticks, needs_sync, observe, check in CASES:
+        ok, msg = run_case(rel, ticks, needs_sync, observe, check)
         mark = "PASS" if ok else "FAIL"
         if verbose or not ok:
             print(f"  [{mark}] {rel}  ({ticks} ticks): {msg}")

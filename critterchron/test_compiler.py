@@ -34,6 +34,7 @@ REJECTION_CATEGORIES = {
     "despawn_landmark":    "is a landmark, not an agent",
     "standing_on_name":    "'standing on' only accepts tile predicates",
     "diagonal":            "diagonal",
+    "drunkenness":         "drunkenness",
     "missing_color":       "has no color defined",
     # Markers (v5) positive fixtures are named `markers_<case>.crit` — they
     # must compile cleanly. Two negatives have dedicated categories so the

@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 #include "interface/LedSink.h"
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 #include "ir/IrRuntime.h"
 // Generated per-build: supplies GRID_WIDTH / GRID_HEIGHT defines and the
 // DEFAULT_IR_BLOB the loader parses at begin(). The fallback 16x16 defines
@@ -144,7 +144,7 @@ struct HealthMetrics {
 
 class CritterEngine {
 public:
-    CritterEngine(LedSink& sink, TimeSource& clock);
+    CritterEngine(LedSink& sink, CritTimeSource& clock);
 
     bool begin();
     // Re-seat engine state against the *currently loaded* critter_ir tables
@@ -233,6 +233,9 @@ private:
     int32_t pfInt(uint16_t type_idx, const char* key, int32_t fallback) const;
     bool    pfDiagonal(uint16_t type_idx) const;
     float   pfDiagonalCost(uint16_t type_idx) const;
+    // Drunkenness ∈ [0.0, 1.0]; 0.0 (default) = sober planner-optimal walk.
+    // See drunkenPerturb() in CritterEngine.cpp for the effect on step.
+    float   pfDrunkenness(uint16_t type_idx) const;
 
     bool isPainter(uint16_t type_idx) const { return painter_mask_ & (1u << type_idx); }
 
@@ -283,7 +286,7 @@ private:
 
     // ---------- state ----------
     LedSink&       sink_;
-    TimeSource&    clock_;
+    CritTimeSource&    clock_;
     Tile           grid_[GRID_WIDTH][GRID_HEIGHT];
     Agent          agents_[MAX_AGENTS];
     uint16_t       agent_count_ = 0;

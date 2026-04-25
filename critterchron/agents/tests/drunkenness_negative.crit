@@ -1,0 +1,24 @@
+# drunkenness_negative.crit: negative `drunkenness` is also out of range.
+# The compiler enforces [0.0, 1.0] symmetrically — no "negative is treated
+# as 0" quirk that would hide typos. Matching rejection category:
+# `drunkenness`.
+--- colors ---
+tortoise: (64, 48, 0)
+green:    (0, 255, 0)
+
+--- agents ---
+tortoise starts at (0,0)
+
+--- simulation ---
+tick rate: 500ms
+
+--- pathfinding ---
+tortoise:
+  max nodes: 256
+  step rate: 1
+  drunkenness: -0.1
+
+--- behavior ---
+tortoise:
+  pause 3
+  done

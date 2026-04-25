@@ -1,11 +1,11 @@
 #pragma once
 #include <ctime>
-#include "interface/TimeSource.h"
+#include "interface/CritTimeSource.h"
 
-// Fixed-time TimeSource for parity runs. `valid()` is always true so the
+// Fixed-time CritTimeSource for parity runs. `valid()` is always true so the
 // engine's sync-time path runs from tick 0.
 
-class FakeTimeSource : public TimeSource {
+class FakeTimeSource : public CritTimeSource {
 public:
     FakeTimeSource(time_t utc_now, float zone_offset_hours)
         : now_(utc_now), zone_(zone_offset_hours) {}
