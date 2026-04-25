@@ -90,9 +90,10 @@ async def activity_log_middleware(request: Request, call_next):
                 "action":    log_entry["action"],
                 "status":    log_entry["status"],
             }, maxlen=150000, approximate=True)
-            # Trim entries older than 24 hours
-            min_id = str((int(time.time()) - 86400) * 1000)
-            await redis.xtrim("system:activity_log", minid=min_id)
+            # `MAXLEN ~ 150000` already bounds the stream — the previous
+            # per-request age-based xtrim added a redundant round-trip on
+            # every device call. If a strict 24h window matters later, do
+            # it from a periodic job rather than the request hot path.
 
     return response
 
