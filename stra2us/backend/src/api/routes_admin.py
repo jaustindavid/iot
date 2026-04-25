@@ -295,17 +295,24 @@ async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_con
 
 
 @router.get("/peek/kv/{key:path}")
-async def peek_kv(key: str, _: dict = Depends(require_admin_kv("read"))):
+async def peek_kv(request: Request, key: str, _: dict = Depends(require_admin_kv("read"))):
     redis = get_redis_client()
-    msg = await redis.get(f"kv:{key}")
+    phases = PerfPhases(request)
+    with phases.phase("redis_get"):
+        msg = await redis.get(f"kv:{key}")
     if not msg:
         return {"status": "empty", "message": None}
 
     try:
-        decoded = msgpack.unpackb(msg)
-        return {"status": "ok", "message": decoded, "hex": msg.hex()}
+        with phases.phase("msgpack_unpack"):
+            decoded = msgpack.unpackb(msg)
+        with phases.phase("hex_encode"):
+            hexed = msg.hex()
+        return {"status": "ok", "message": decoded, "hex": hexed}
     except Exception:
-        return {"status": "ok", "message": "unparseable_msgpack", "hex": msg.hex()}
+        with phases.phase("hex_encode"):
+            hexed = msg.hex()
+        return {"status": "ok", "message": "unparseable_msgpack", "hex": hexed}
 
 @router.post("/kv/{key:path}")
 async def set_kv(key: str, payload: KVPayload, _: dict = Depends(require_admin_kv("write"))):
