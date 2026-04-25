@@ -299,9 +299,100 @@ Peek at the oldest message in a queue without consuming it.
 
 ---
 
+### `GET /api/admin/stream/q/{topic}`
+
+Read-only tail of a topic's stream — does **not** advance any
+subscriber cursor, so safe to call on a live queue. Uses `XREVRANGE`
+under the hood; expired messages (past their `exp` field) are filtered
+server-side.
+
+**Query Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `limit` | 50 | Max number of recent messages to return |
+| `client_id` | *(none)* | Repeatable; filter to messages whose stored publisher matches one of the listed client IDs |
+
+**Response `200 OK`:**
+```json
+[
+  {"id": "1712345678901-0", "received_at": 1712345678, "client_id": "ricky", "data": {"hb": 60}}
+]
+```
+
+Requires queue read access on `<topic>`.
+
+---
+
 ### `GET /api/admin/peek/kv/{key}`
 
 Peek at the value of a KV key, decoded from MessagePack.
+
+---
+
+### `GET /api/admin/kv_scan`
+
+List KV keys matching a literal prefix, filtered to those the caller
+can read. Intended for UI discovery — e.g. `prefix=_catalog/` to list
+published catalogs.
+
+**Query Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `prefix` | *(required)* | Literal prefix to match (no globbing — `*` is appended server-side) |
+| `limit` | 500 | Cap on returned items after ACL filtering |
+
+**Response `200 OK`:**
+```json
+{"prefix": "_catalog/", "count": 2, "truncated": false, "items": [{"key": "_catalog/critterchron", "bytes": 5400}]}
+```
+
+`truncated` reflects whether the caller's *visible* result set was
+capped, not the raw redis scan size.
+
+---
+
+### `GET /api/admin/catalog/{app}/devices`
+
+List HMAC clients that can read or write under `<app>` — i.e. the
+"devices" the catalog UI's Devices tab shows. A client qualifies if
+its ACL has a permission whose prefix is `*`, exactly `<app>`, or
+starts with `<app>/`. Wildcard clients show up under every app's list,
+which is intentional. Device IDs are returned in client-ID form;
+they're also the convention for the second path segment in
+`<app>/<device>/<key>` overrides, which is what the per-device
+effective-value view depends on.
+
+**Response `200 OK`:**
+```json
+{"app": "critterchron", "devices": ["nova", "ricky"]}
+```
+
+Requires read access on `kv/<app>`.
+
+---
+
+### `POST /api/admin/kv/{key}`
+
+Create or modify a KV value from the admin UI / CLI. The body is a
+JSON envelope with a `value` string; the server tries `json.loads()`
+on `value` first (so `"60"` round-trips as the integer 60, `"true"`
+as boolean true, etc.) and falls back to the raw string on parse
+error. Whatever it ends up as is then re-encoded as MessagePack and
+written to `kv:<key>`, matching the wire shape device clients see.
+
+**Request body:**
+```json
+{"value": "60"}
+```
+
+**Response `200 OK`:**
+```json
+{"status": "ok"}
+```
+
+Requires write access on `kv/<key>`.
 
 ---
 
@@ -345,6 +436,48 @@ clients.
   }
 ]
 ```
+
+For wildcard-ACL admins (the common ops case) the server skips the
+internal over-fetch multiplier — request/response cost scales with
+`limit`, not `limit*10`.
+
+---
+
+### `GET /api/admin/perf_log`
+
+Tail the `system:perf_log` stream — one entry per request whose total
+wall time exceeded `STRA2US_PERF_LOG_THRESHOLD_MS` (default 100ms).
+Outlier-only by design; healthy traffic produces no entries. Capped
+at 5,000 entries with a 24-hour age trim.
+
+**Query Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `limit` | 200 | Max number of entries to return |
+| `path_prefix` | *(none)* | Filter to paths starting with this string (e.g. `/api/admin/kv_scan`) |
+| `min_ms` | 0 | Filter to entries with `total_ms` at or above this floor |
+
+**Response `200 OK`:**
+```json
+[
+  {
+    "timestamp": 1712345678,
+    "method": "GET",
+    "path": "/api/admin/logs",
+    "total_ms": 26.64,
+    "status": 200,
+    "client_id": "austin",
+    "phases": {"xrevrange": 17.86, "filter_loop": 1.58}
+  }
+]
+```
+
+`phases` is present only when the route is annotated with
+`PerfPhases`; check [core/perf_log.py](../backend/src/core/perf_log.py)
+for the helper. Requires superuser ACL — perf data isn't a
+per-resource concern, but it surfaces internal paths an ops view
+should see and app-scoped admins shouldn't need.
 
 ---
 

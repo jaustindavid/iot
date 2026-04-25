@@ -31,6 +31,22 @@ _(none)_
   from ~177ms → ~24ms. Phase breakdown (`xrevrange` vs `filter_loop`)
   added to the perf log so this kind of regression is visible next time.
 
+## Final post-investigation latency snapshot (2026-04-25)
+
+After the three fixes above, traced with `STRA2US_PERF_LOG_THRESHOLD_MS=1`
+on real traffic:
+
+| Endpoint | Before | After | Notes |
+|---|---|---|---|
+| Device `/kv/*` reads | 200-300ms | 2-3ms | singleton fix, ~100x |
+| `/api/admin/logs` | 180ms | 22-29ms | wildcard fix; XREVRANGE on a 150K-entry stream is ~18ms of that, intrinsic |
+| `/api/admin/peek/kv/...` | unknown | 2-3ms | redis_get=0.25ms, rest is framework |
+| `openDeviceDetail` 28-peek fan-out | 200ms each, sequential | all ≤19ms, mostly 5-10ms | singleton + warm pool |
+| `/api/admin/kv_scan` | original "5s cold" complaint | 2-4ms | singleton fix |
+
+Threshold restored to default 100ms after capture; `system:perf_log` now
+back to outlier-only mode and serves as ongoing performance telemetry.
+
 ## See also
 
 - [catalog_todo.md](catalog_todo.md) parking lot — Catalog → Devices

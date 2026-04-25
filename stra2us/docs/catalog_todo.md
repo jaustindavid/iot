@@ -23,6 +23,7 @@ file is where we capture the in-flight thinking that shapes it.
 | 2026-04-23 | Static catalog-drift lint stays in critterchron for now; no upstream to `stra2us_cli`. | CritterChron is the only consumer today; its `test_s2s_catalog.py` (~210 lines) is the proven shape. Wait for a 2nd app before generalizing. |
 | 2026-04-24 | Added `default_per_platform: true` as third mutually-exclusive sibling of `default` / `default_per_device`. | Critterchron's `light_exponent` needed it (Particle/CDS defaults to 2.5, ESP32/BH1750 to 0.5 because the upstream `n` normalization is inverted). `default_per_device` was lying about the source of truth. |
 | 2026-04-25 | GET on missing KV stays at HTTP 200 with `{"status": "not_found"}`; not switching to 404. | Status envelope is already the contract on the device path; CLI and UI handle it; flipping to 404 would force every consumer to special-case error vs. unset and buys nothing. |
+| 2026-04-25 | Per-key `enforce: true` confirmed working end-to-end. | Removed from parking lot after user-verified test. Server-side advisory-reject is live; closes FR open-question #2. |
 
 ## Active — M2 worklist
 
@@ -53,17 +54,16 @@ M2 is **shipped** as of 2026-04-22. All residual follow-ups closed:
   "enforce" concept), the server would need pyyaml + pydantic — adds
   deps, worth a discussion. Low priority; CLI validation is already
   tight.
-- **CritterChron migration.** When M2 is stable, hand back a migrated
-  `critterchron.s2s.yaml` (the 4 keys using `default: per-device`
-  need to flip to `default_per_device: true`). Ship with a short
-  "here's how to publish it" note.
-
 ## Parking lot (not for M2, not forgotten)
 
-- Web UI (M3) — four views per FR §"Ask 2". Separate doc when we get
-  there.
-- Per-key `enforce: true` opt-in for server-side advisory-reject
-  (FR open-question #2). Depends on server-side validation existing.
+- Web UI (M3) is **shipped** — the FR's four views (App index,
+  Variables table, Key detail / device view, Device index) all live
+  in the admin UI today, plus the FR's "raw key inspector"
+  debugging tab. Remaining polish items below (read_cadence, last
+  updated timestamp, diff viewer) and the FR's "nice to have" list
+  (write audit log surfaced as a per-key history view, batch edits,
+  live-preview push channel) aren't blocking — they earn their keep
+  on demand.
 - `read_cadence` UI rendering — schema field exists in M1; actual UI
   hint consumption lands in M3.
 - Catalog diff viewer / history stream — predicated on versioning
