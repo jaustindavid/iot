@@ -1,0 +1,22 @@
+# tests/fade_basic.crit — runtime fixture for tile-paint fade.
+#
+# Painter sits at (0, 0), paints a single tile with fade=5, then idles
+# long enough that the agent stays put while the engine ticks. Functional
+# test asserts: tile lit on tick 1, age_max captured at 5, tile auto-
+# expires (state flips back to False) within ≤6 ticks.
+
+--- colors ---
+painter: (200, 200, 200)
+red:     (255, 0, 0)
+
+--- agents ---
+painter starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+painter:
+  draw red fade 5
+  pause 100
+  done

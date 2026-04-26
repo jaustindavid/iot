@@ -1,0 +1,26 @@
+# tests/ok_draw_fade.crit — compile-positive smoke for `draw ... fade N`.
+#
+# Exercises every fade form so the opcode regex and the marker-rejection
+# regex don't drift apart from the spec (TODO §316-326). Runtime behavior
+# is covered by test_functional.py.
+
+--- colors ---
+painter: (200, 200, 200)
+red:     (255, 0, 0)
+green:   (0, 255, 0)
+
+--- agents ---
+painter starts at (0, 0)
+
+--- simulation ---
+tick rate: 200ms
+
+--- behavior ---
+painter:
+  draw red                  # no-fade form, unchanged from pre-v6
+  draw green fade 50        # paint + lerp-down + auto-expire in 50 ticks
+  draw fade 100             # bare draw with fade (color unchanged)
+  draw red hold 30          # paint + full bright for 30 ticks then cliff
+  draw hold 60              # bare draw with hold (color unchanged)
+  pause 1
+  done

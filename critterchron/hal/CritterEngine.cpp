@@ -417,8 +417,21 @@ bool CritterEngine::reinit() {
     // a stray "re-resolve COLORS[0]" to overwrite the RGB on a night
     // transition. Pin to the 0xFF "no name" sentinel up front.
     for (int x = 0; x < GRID_WIDTH; ++x)
-        for (int y = 0; y < GRID_HEIGHT; ++y)
+        for (int y = 0; y < GRID_HEIGHT; ++y) {
             grid_[x][y].color_ref = 0xFF;
+            // Pin fade fields to the no-fade sentinel post-memset. The
+            // memset zero would mean "expire on next tick" if state ever
+            // flipped to 1 without going through the draw handler — same
+            // defensive reasoning as color_ref above. Tiles painted by
+            // `draw <color>` (no fade) re-write these to 0xFFFF anyway.
+            grid_[x][y].age = 0xFFFF;
+            grid_[x][y].age_max = 0xFFFF;
+            // hold_mode is a 1-bit field already zeroed by the memset
+            // above; explicit write here is belt-and-suspenders, matches
+            // the posture for color_ref/age, and keeps the init story
+            // self-documenting if the bitfield is ever rearranged.
+            grid_[x][y].hold_mode = 0;
+        }
     clearClaims();
 
     // Painter mask: agent types whose behavior contains draw/erase are
@@ -644,6 +657,23 @@ void CritterEngine::tick() {
     }
 #endif
 
+    // Tile-paint fade decay (IR v6). For every lit tile painted with
+    // `draw <color> fade N`, decrement age once per tick; when age
+    // hits zero, flip state back to 0 (the tile auto-expires). The
+    // 0xFFFF sentinel skips both the decrement and the expiry — pre-v6
+    // paints and plain `draw <color>` keep their persistent behavior.
+    // Runs after agent action and after marker decay so a tick's fresh
+    // `draw ... fade N` doesn't pre-decrement (parity with engine.py).
+    for (int x = 0; x < GRID_WIDTH; ++x) {
+        for (int y = 0; y < GRID_HEIGHT; ++y) {
+            Tile& t = grid_[x][y];
+            if (!t.state) continue;
+            if (t.age_max == 0xFFFF) continue;
+            if (t.age == 0) continue;
+            if (--t.age == 0) t.state = 0;
+        }
+    }
+
     computeConvergence();
 }
 
@@ -697,6 +727,17 @@ bool CritterEngine::checkBoardCondition(const char* kind) const {
 
 bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
     // Accepts the text AFTER "if ", with any trailing ':' already stripped.
+
+    // Generic `not <rest>` peel: invert and recurse. A single peel
+    // covers every supported form symmetrically (board-scope tile
+    // predicates, standing-on-color, agent/landmark existence, on-
+    // agent colocation, etc.). Compiler-side marker canonicalization
+    // (`if not on <m>` → `if on no marker <m>`) has already fired by
+    // the time we get here, so this peel doesn't re-handle markers.
+    while (*body == ' ') ++body;
+    if (body[0] == 'n' && body[1] == 'o' && body[2] == 't' && body[3] == ' ')
+        return !evaluateIf(a, body + 4);
+
     char buf[256];
     std::strncpy(buf, body, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
@@ -1469,13 +1510,27 @@ void CritterEngine::processAgent(Agent& a) {
         }
 #endif
 
-        // ---- draw [color] ----
+        // ---- draw [color] [(fade|hold) N] ----
         if (startsWith(inst, "draw")) {
             grid_[a.pos.x][a.pos.y].state = 1;
             char buf[128];
             std::strncpy(buf, inst, sizeof(buf) - 1);
             buf[sizeof(buf) - 1] = 0;
             const char* tok[8]; int t = tokenize(buf, tok, 8);
+            // Tile-paint fade (IR v6). Optional `(fade|hold) N` tail.
+            // Compiler-validated and mutually exclusive, so trust the
+            // structure: if the second-to-last token is "fade" or
+            // "hold", the last token parses as a positive int. Strip
+            // it from the visible token count so the color-name path
+            // below sees the same shape as the pre-v6 form.
+            uint16_t fade_n = 0xFFFF;
+            uint8_t  hold_mode = 0;
+            if (t >= 2 && (strEq(tok[t - 2], "fade") || strEq(tok[t - 2], "hold"))) {
+                int n = parseIntOr(tok[t - 1], 0);
+                if (n > 0 && n < 0xFFFF) fade_n = (uint16_t)n;
+                if (strEq(tok[t - 2], "hold")) hold_mode = 1;
+                t -= 2;
+            }
             if (t > 1) {
                 // Snapshot the agent's phase-adjusted color so painted tiles
                 // match what the agent looked like at paint time. Tile stays
@@ -1502,6 +1557,13 @@ void CritterEngine::processAgent(Agent& a) {
                 grid_[a.pos.x][a.pos.y].g = g;
                 grid_[a.pos.x][a.pos.y].b = b;
             }
+            // Always reset age/age_max/hold_mode from the opcode — no
+            // carry, no max-of (TODO §328-334). Plain `draw <color>`
+            // clears any prior fade/hold by writing the no-fade
+            // sentinel and a zero hold flag.
+            grid_[a.pos.x][a.pos.y].age = fade_n;
+            grid_[a.pos.x][a.pos.y].age_max = fade_n;
+            grid_[a.pos.x][a.pos.y].hold_mode = hold_mode;
             ++pc;
             continue;
         }
@@ -1655,7 +1717,17 @@ void CritterEngine::processAgent(Agent& a) {
                     gi += 2;
                 }
                 const char* glandmark = nullptr;
-                if (gi + 2 < t && strEq(tok[gi], "on") && strEq(tok[gi + 1], "landmark")) {
+                bool gland_negate = false;
+                // `not on landmark X` inverts the candidate scope to the
+                // board cells OUTSIDE the landmark. Detect the optional
+                // `not` token first; the rest of the parse is identical.
+                if (gi + 3 < t && strEq(tok[gi], "not") && strEq(tok[gi + 1], "on")
+                        && strEq(tok[gi + 2], "landmark")) {
+                    glandmark = tok[gi + 3];
+                    gland_negate = true;
+                    gi += 4;
+                } else if (gi + 2 < t && strEq(tok[gi], "on")
+                        && strEq(tok[gi + 1], "landmark")) {
                     glandmark = tok[gi + 2];
                     gi += 3;
                 }
@@ -1727,9 +1799,28 @@ void CritterEngine::processAgent(Agent& a) {
                     }
                 };
 
-                if (lpts) {
+                if (lpts && !gland_negate) {
                     for (uint16_t k = 0; k < lnpts; ++k)
                         consider(lpts[k].x, lpts[k].y);
+                } else if (lpts && gland_negate) {
+                    // Complement scan: visit every grid cell, skip those
+                    // inside the landmark. O(W·H) outer × O(L) inner per
+                    // skip check; landmarks are typically small so the
+                    // inner loop is cheap. If a future landmark grows
+                    // large enough that this matters, swap in a packed
+                    // bitmap — the candidate-build is still warm cache
+                    // either way.
+                    for (int x = 0; x < GRID_WIDTH; ++x) {
+                        for (int y = 0; y < GRID_HEIGHT; ++y) {
+                            bool in_lm = false;
+                            for (uint16_t k = 0; k < lnpts; ++k) {
+                                if (lpts[k].x == x && lpts[k].y == y) {
+                                    in_lm = true; break;
+                                }
+                            }
+                            if (!in_lm) consider(x, y);
+                        }
+                    }
                 } else {
                     for (int x = 0; x < GRID_WIDTH; ++x)
                         for (int y = 0; y < GRID_HEIGHT; ++y)
@@ -1948,10 +2039,29 @@ void CritterEngine::render(float blend) {
     }
 
     // --- Lit tiles ---
+    // Tile-paint fade (IR v6): when age_max is non-sentinel, scale RGB
+    // by age/age_max in Q8 fixed-point. Marker composite below stacks
+    // additively on the dimmed tile — markers on a fading tile still
+    // burn through at full intensity, matching the spec (TODO §354-358).
+    // 256 lerps/frame on a 16×16 grid is noise vs. existing render cost.
+    //
+    // The cliff-fade variant (`draw ... hold N`) shares the countdown
+    // but skips the lerp: the tile renders at full intensity until the
+    // tick where state flips back to 0. Used for heartbeat / "still
+    // here" indicators that should disappear sharply rather than dim.
     for (int x = 0; x < GRID_WIDTH; ++x) {
         for (int y = 0; y < GRID_HEIGHT; ++y) {
             const Tile& t = grid_[x][y];
-            if (t.state) put(x, y, t.r, t.g, t.b);
+            if (!t.state) continue;
+            if (t.age_max == 0xFFFF || t.age_max == 0 || t.hold_mode) {
+                put(x, y, t.r, t.g, t.b);
+            } else {
+                uint16_t q8 = (uint16_t)(((uint32_t)t.age << 8) / t.age_max);
+                put(x, y,
+                    (uint8_t)(((uint16_t)t.r * q8) >> 8),
+                    (uint8_t)(((uint16_t)t.g * q8) >> 8),
+                    (uint8_t)(((uint16_t)t.b * q8) >> 8));
+            }
         }
     }
 

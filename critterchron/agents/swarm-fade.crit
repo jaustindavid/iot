@@ -1,0 +1,70 @@
+# swarm.crit: /the locusts/
+
+--- colors ---
+leaf:    (0, 255, 0)
+locust:  (10, 196, 10)
+black:   (0, 0, 0)      # nest landmark color (invisible background)
+
+night:
+  leaf:    (0, 1, 0)
+  locust:  (0, 2, 0)
+
+--- landmarks ---
+nest: black
+  (0, max_y)
+
+--- agents ---
+up to 16 locust
+
+--- spawning ---
+spawn locust at nest every 2 ticks when missing
+
+--- simulation ---
+tick rate: 50ms    # 20/s
+
+--- pathfinding ---
+locust:
+  max nodes: 256
+  diagonal: allowed
+  diagonal_cost: 1.414
+  penalty lit cell: 0.5      # prefer dark lanes (slightly)
+  penalty occupied cell: 10  # avoid other locusts
+  drunkenness: 0.2
+
+--- behavior ---
+locust:
+  # If there's a wrong cell, eat it.
+  if extra:
+    seek nearest extra
+    if standing on extra:
+      pause 5
+      erase
+      done
+
+  # Otherwise paint an intended cell.
+  if missing:
+    if random 5%:
+      pause 10
+    if random 25%:
+      pause 3
+    if random 50%:
+      pause
+    seek nearest missing
+    if standing on missing:
+      draw leaf hold 6000 # 300s
+      pause 6
+      done
+
+  # Nothing needed — park on an unoccupied leaf. `free` drops
+  # candidates another locust already stands on AND claims the
+  # winning cell, so 16 locusts don't all converge on the same
+  # Manhattan-nearest leaf and saturate A*. Timeout bails to
+  # `wander` if nothing reachable.
+  # We re-draw the current leaf if we leave, to hold it longer
+  if on current:
+    draw leaf hold 4800 # 240s
+    pause 5-20
+    done
+  seek nearest free current timeout 50
+  pause
+  done

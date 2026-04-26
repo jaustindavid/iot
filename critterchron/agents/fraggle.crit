@@ -71,7 +71,7 @@ doozer starts at (0, 0),     state = starting
 doozer starts at (max_x, 0), state = starting
 
 --- simulation ---
-tick rate: 400ms
+tick rate: 400ms # 2.5/sec
 
 --- pathfinding ---
 doozer:
@@ -82,7 +82,6 @@ doozer:
   diagonal_cost: 1.414
   penalty lit cell:      30     # don't walk through the clock face
   penalty occupied cell: 5
-  drunkenness: 0.15
 
 --- behavior ---
 doozer:
@@ -133,7 +132,7 @@ doozer:
     if missing:
       seek missing timeout 30
       if on missing:
-        draw brick
+        draw brick fade 2500 # 1000s
         pause 2
         set state = idle
         done

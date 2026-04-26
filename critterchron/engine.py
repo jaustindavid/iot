@@ -40,6 +40,20 @@ class Tile:
     # index never IndexErrors on a Tile initialized before the IR
     # was loaded.
     count: list = field(default_factory=lambda: [0] * MAX_MARKERS)
+    # Tile-paint fade (IR v6). `draw <color> fade N` sets age=age_max=N
+    # and the per-tick scheduler decrements age; at age=0 state flips
+    # back to False. Sentinel 0xFFFF means "no fade" — a plain
+    # `draw <color>` paints a tile that persists until cleaned, identical
+    # to pre-v6 behavior. Mirrored on the HAL side as Tile::age/age_max.
+    age: int = 0xFFFF
+    age_max: int = 0xFFFF
+    # Cliff-fade variant (`draw <color> hold N`). Same age/age_max
+    # countdown — only the renderer differs: when hold_mode is set, the
+    # tile renders at full brightness for the entire countdown, then
+    # vanishes in one frame at age=0. Always reset by the draw opcode
+    # alongside age/age_max (no carry across paints). Mirrored on the
+    # HAL as Tile::hold_mode (1-bit field in the bitfield slack).
+    hold_mode: bool = False
 
 @dataclass
 class Agent:
@@ -563,6 +577,22 @@ class CritterEngine:
                     if cnt:
                         col[y].count[idx] = max(0, cnt - k)
 
+        # 3.6. Tile-paint fade decay (IR v6). For every lit tile painted
+        # with `draw <color> fade N`, decrement age once per tick; when
+        # age hits zero, flip state back to False (the tile expires).
+        # `age_max == 0xFFFF` is the no-fade sentinel — pre-v6 paints and
+        # plain `draw <color>` skip the decrement. Runs after agent action
+        # AND after marker decay so a tick's fresh `draw ... fade N`
+        # doesn't pre-decrement (parity with marker-decay placement).
+        for x in range(self.width):
+            col = self.grid[x]
+            for y in range(self.height):
+                t = col[y]
+                if t.state and t.age_max != 0xFFFF and t.age > 0:
+                    t.age -= 1
+                    if t.age == 0:
+                        t.state = False
+
         # 4. Convergence Check
         matches = 0
         total = self.width * self.height
@@ -741,6 +771,19 @@ class CritterEngine:
                 tile = self.grid[agent.pos[0]][agent.pos[1]]
                 tile.state = True
                 parts = inst.split()
+                # Optional `(fade|hold) N` tail — strip it off `parts`
+                # so the color-name handling below sees the same shape as
+                # the pre-v6 form. Compiler-validated, so we can trust
+                # the structure. `hold_n` and `fade_n` are mutually
+                # exclusive: the opcode regex doesn't accept both.
+                fade_n = None
+                hold_n = None
+                if len(parts) >= 3 and parts[-2] == "fade":
+                    fade_n = int(parts[-1])
+                    parts = parts[:-2]
+                elif len(parts) >= 3 and parts[-2] == "hold":
+                    hold_n = int(parts[-1])
+                    parts = parts[:-2]
                 if len(parts) > 1:
                     cname = parts[1]
                     # Tiles snapshot the current cycle value at paint-time —
@@ -755,6 +798,24 @@ class CritterEngine:
                     # whatever the previous paint stashed, so re-drawing a
                     # tile that was first painted with a name still swaps.
                     tile.color_ref = cname
+                # Always reset age/age_max/hold_mode from the opcode —
+                # no carry, no max-of, no addition (TODO §328-334
+                # "redraw semantics"). `draw red` after a `draw red fade
+                # 100` clears the fade; `draw red hold 50` after a fade
+                # switches to hold and resets the timer; `draw red fade
+                # 100` on a half-faded tile resets to age=100.
+                if fade_n is not None:
+                    tile.age = fade_n
+                    tile.age_max = fade_n
+                    tile.hold_mode = False
+                elif hold_n is not None:
+                    tile.age = hold_n
+                    tile.age_max = hold_n
+                    tile.hold_mode = True
+                else:
+                    tile.age = 0xFFFF
+                    tile.age_max = 0xFFFF
+                    tile.hold_mode = False
                 pc += 1
                 continue
 
@@ -964,11 +1025,14 @@ class CritterEngine:
     # ---- Seek parsing / candidate building (markers + classic) ----
 
     # Match a canonical gradient seek:
-    #   seek highest|lowest marker <m> [op N] [on landmark <l>] [timeout N]
+    #   seek highest|lowest marker <m> [op N] [[not] on landmark <l>] [timeout N]
+    # `not on landmark X` inverts the scope: candidates are the board MINUS
+    # the landmark's cells. Useful for "follow the marker, but stay out of
+    # the heap zone" patterns (the original motivating ask).
     _SEEK_GRADIENT_RE = re.compile(
         r'^seek\s+(?P<dir>highest|lowest)\s+marker\s+(?P<m>\w+)'
         r'(?:\s+(?P<op>[<>])\s*(?P<n>\d+))?'
-        r'(?:\s+on\s+landmark\s+(?P<l>\w+))?'
+        r'(?:\s+(?P<neg>not\s+)?on\s+landmark\s+(?P<l>\w+))?'
         r'(?:\s+timeout\s+(?P<t>\d+))?$'
     )
 
@@ -998,6 +1062,9 @@ class CritterEngine:
                 "marker_op": m.group("op"),
                 "marker_n": int(m.group("n")) if m.group("n") is not None else None,
                 "landmark": m.group("l"),
+                # True when the user wrote `not on landmark X` — invert
+                # the candidate set to "board cells outside the landmark".
+                "landmark_negate": m.group("neg") is not None,
                 "timeout": int(m.group("t")) if m.group("t") is not None else None,
                 # unused in gradient shape but present for uniform dispatch
                 "target_kind": None, "target_type": None,
@@ -1109,12 +1176,21 @@ class CritterEngine:
             if marker is None:
                 return []
             idx = marker["index"]
-            # Scope cells to the landmark if given, else whole board.
+            # Scope cells to the landmark (or its complement, for the
+            # `not on landmark` form), else whole board. Negated form
+            # uses set membership against the landmark's points so the
+            # complement scan stays O(W·H + L) rather than O(W·H·L).
             if parsed["landmark"] is not None:
                 pts = self.ir.get("landmarks", {}).get(
                     parsed["landmark"], {}
                 ).get("points", [])
-                cells = [(p[0], p[1]) for p in pts]
+                if parsed.get("landmark_negate"):
+                    excluded = {(p[0], p[1]) for p in pts}
+                    cells = [(x, y) for x in range(self.width)
+                             for y in range(self.height)
+                             if (x, y) not in excluded]
+                else:
+                    cells = [(p[0], p[1]) for p in pts]
             else:
                 cells = [(x, y) for x in range(self.width)
                          for y in range(self.height)]
@@ -1255,8 +1331,22 @@ class CritterEngine:
     def _evaluate_if(self, agent, inst):
         """Evaluate a resolved `if ...:` instruction. Returns True/False.
         Unrecognized forms evaluate to False so the script author gets a
-        silent no-op they can spot in simulation rather than a crash."""
+        silent no-op they can spot in simulation rather than a crash.
+
+        `if not <rest>` is handled generically by peeling the `not` and
+        recursing — every per-form branch sees its de-negated shape, so
+        a single peel covers `if not current`, `if not standing on color
+        red`, `if not agent ant`, `if not landmark piles`, `if not on
+        agent ant`, etc. Compiler-side canonicalization for marker forms
+        (`if not on <m>` → `if on no marker <m>`) runs first, so the
+        peel doesn't double-fire on those.
+        """
         body = inst[:-1].rstrip() if inst.endswith(':') else inst
+
+        m = re.match(r'^if not (.+)$', body)
+        if m:
+            return not self._evaluate_if(agent, "if " + m.group(1) + ":")
+
         ax, ay = agent.pos[0], agent.pos[1]
 
         m = re.match(r'^if state (==|!=) (\w+)$', body)

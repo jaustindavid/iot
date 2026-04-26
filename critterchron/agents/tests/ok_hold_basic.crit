@@ -1,0 +1,22 @@
+# tests/ok_hold_basic.crit — runtime fixture for the cliff-fade
+# variant. Mirrors ok_fade_basic.crit but uses `hold 5` instead of
+# `fade 5`. The functional check asserts (a) age_max captured at 5,
+# (b) hold_mode is true, (c) tile auto-expires within ≤6 ticks just
+# like fade, AND (d) the tile color stays at the painted value
+# throughout the countdown — no brightness ramp.
+
+--- colors ---
+painter: (200, 200, 200)
+red:     (255, 0, 0)
+
+--- agents ---
+painter starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+painter:
+  draw red hold 5
+  pause 100
+  done

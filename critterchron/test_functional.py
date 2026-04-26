@@ -164,6 +164,107 @@ def _check_markers_highest_cap(eng, starts, obs):
         )
     return True, "ant visited (8, 8) as predicted"
 
+def _obs_fade_at(x, y):
+    """Closure: track lit-then-cleared trajectory of the fade tile at (x, y).
+
+    `peak_age_max` records the largest non-sentinel age_max seen — that's
+    the value the `fade N` tail in the script set. `cleared_tick` snaps
+    on the first tick the tile drops back to state=False after having
+    been lit; left unset if the tile never expires.
+    """
+    def fn(eng, obs):
+        t = eng.grid[x][y]
+        if t.state:
+            obs["ever_lit"] = True
+            if t.age_max != 0xFFFF:
+                obs["peak_age_max"] = max(obs.get("peak_age_max", 0), t.age_max)
+        elif obs.get("ever_lit") and "cleared_tick" not in obs:
+            obs["cleared_tick"] = eng.tick_count
+    return fn
+
+
+def _check_fade_basic(eng, starts, obs):
+    """Painter `draw red fade 5` once; tile must light, capture age_max=5,
+    and auto-expire within 5 ticks of the paint. Painter pauses 100 so a
+    re-draw can't muddy the trajectory inside the 20-tick window."""
+    if not obs.get("ever_lit"):
+        return False, "tile (0,0) never lit — draw didn't fire"
+    peak = obs.get("peak_age_max", 0)
+    if peak != 5:
+        return False, f"peak age_max={peak}, expected 5 (fade tail not captured?)"
+    cleared = obs.get("cleared_tick")
+    if cleared is None:
+        return False, "tile (0,0) never expired — fade decay not running?"
+    # Paint fires on tick 1 with age=5; decay runs end-of-tick, so age
+    # hits 0 on tick 5 (1+5-1 by inclusive count). Allow tick 6 for the
+    # off-by-one in either direction.
+    if cleared > 6:
+        return False, f"tile cleared at tick {cleared}, expected ≤ 6"
+    return True, f"tile lit, age_max={peak}, cleared at tick {cleared}"
+
+
+def _obs_hold_at(x, y):
+    """Closure: track a hold-flavor tile's full-brightness trajectory.
+
+    Records every non-zero RGB seen at (x, y) so the assertion can
+    confirm the tile never dimmed mid-countdown — a regression in the
+    render-skip would manifest as quantized intermediate values
+    appearing here. Also captures hold_mode and the cleared tick
+    (mirrors _obs_fade_at)."""
+    def fn(eng, obs):
+        t = eng.grid[x][y]
+        if t.state:
+            obs["ever_lit"] = True
+            obs["hold_mode_seen"] = obs.get("hold_mode_seen") or t.hold_mode
+            if t.age_max != 0xFFFF:
+                obs["peak_age_max"] = max(obs.get("peak_age_max", 0), t.age_max)
+            obs.setdefault("colors_seen", set()).add(tuple(t.color))
+        elif obs.get("ever_lit") and "cleared_tick" not in obs:
+            obs["cleared_tick"] = eng.tick_count
+    return fn
+
+
+def _check_hold_basic(eng, starts, obs):
+    """Painter `draw red hold 5` once. Assertions:
+    (a) tile lit; (b) hold_mode flag observed; (c) age_max captured at
+    5; (d) tile auto-expired within ≤6 ticks; (e) RGB stayed at the
+    painted (255, 0, 0) the entire time it was lit — no dimmer
+    intermediate values, which is the whole point of `hold` over `fade`.
+    Note: tile.color is the *post-paint* RGB, not the rendered RGB —
+    the render-skip lives in renderer.py / HAL render(), not in the
+    engine. So this asserts the engine never *mutated* the tile's
+    stored color, which is the necessary precondition for the
+    renderer's full-brightness output."""
+    if not obs.get("ever_lit"):
+        return False, "tile (0,0) never lit — draw didn't fire"
+    if not obs.get("hold_mode_seen"):
+        return False, "hold_mode flag never observed True (regression?)"
+    peak = obs.get("peak_age_max", 0)
+    if peak != 5:
+        return False, f"peak age_max={peak}, expected 5"
+    cleared = obs.get("cleared_tick")
+    if cleared is None:
+        return False, "tile (0,0) never expired — countdown not running?"
+    if cleared > 6:
+        return False, f"tile cleared at tick {cleared}, expected ≤ 6"
+    colors = obs.get("colors_seen", set())
+    if colors != {(255, 0, 0)}:
+        return False, f"tile colors seen = {colors}, expected just (255, 0, 0)"
+    return True, f"tile held red, age_max={peak}, cleared at tick {cleared}"
+
+
+def _check_negation_runtime(eng, starts, obs):
+    """Painter at (0, 0) gated by `if not standing on color red`. Tile
+    starts unlit, so the negation must evaluate to True for the paint
+    to fire. A regression in the `not` peel would leave (0, 0) dark."""
+    tile = eng.grid[0][0]
+    if not tile.state:
+        return False, "tile (0, 0) unlit — `if not` did not invert (peel broken?)"
+    if tuple(tile.color) != (0, 0, 255):
+        return False, f"tile (0, 0) lit but color={tuple(tile.color)}, expected blue (0, 0, 255)"
+    return True, "tile (0, 0) lit blue — `if not` peel inverted correctly"
+
+
 def _check_swarm(eng, starts, obs):
     """Swarm uses `seek nearest free current` — the regression target for
     Python sim parity with the C++ engine. Locusts spawn dynamically from
@@ -241,6 +342,21 @@ CASES = [
     # tiles, which requires an `intended` clock face to seek toward.
     ("agents/swarm.crit",                     DEFAULT_TICKS, True,
         None, _check_swarm),
+    # Tile-paint fade (IR v6). 20 ticks is plenty — paint fires on tick 1,
+    # tile expires by tick 6, observer captures the trajectory either way.
+    ("agents/tests/ok_fade_basic.crit",       20, False,
+        _obs_fade_at(0, 0), _check_fade_basic),
+    # Cliff-fade variant: same lifecycle as fade, but the engine must
+    # never mutate the stored color (the renderer reads it as full-bright
+    # for the whole countdown). Asserting the color invariant catches a
+    # regression where the engine accidentally pre-multiplies.
+    ("agents/tests/ok_hold_basic.crit",       20, False,
+        _obs_hold_at(0, 0), _check_hold_basic),
+    # Negation-symmetry pass: 5 ticks is enough — paint should fire on
+    # tick 1 (the `if not` branch), and we sample at tick 5. Regression
+    # of the `not`-peel in `_evaluate_if` would leave (0, 0) dark.
+    ("agents/tests/ok_negation_runtime.crit",  5, False,
+        None, _check_negation_runtime),
 ]
 
 

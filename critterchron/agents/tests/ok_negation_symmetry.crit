@@ -1,0 +1,79 @@
+# tests/ok_negation_symmetry.crit — compile-positive smoke for the
+# `not`-symmetry pass (cases #1-#6 from the negation audit).
+#
+# Every form below has a positive sibling that has worked since v5;
+# this fixture exercises the negative form so the parser, name
+# resolver, and evaluator-peel stay aligned across edits. Runtime
+# behavior is informally exercised — the assertions are at compile
+# time (this file must parse cleanly).
+
+--- colors ---
+follower: (255, 200, 100)
+target:   (100, 100, 255)
+red:      (255, 0, 0)
+heap:     ramp (1, 1, 1) decay 1/8
+
+--- landmarks ---
+piles: [(0, 0), (1, 0), (2, 0)]
+
+--- agents ---
+follower starts at (4, 4)
+target starts at (0, 7)
+
+--- simulation ---
+tick rate: 200ms
+
+--- behavior ---
+follower:
+  # #1 — gradient seek with `not on landmark`. The follower chases the
+  # heap marker but stays out of the piles landmark.
+  seek highest marker heap not on landmark piles timeout 4
+
+  # #2 — board-scope tile predicates, negated.
+  if not current:
+    pause 1
+    done
+  if not extra:
+    pause 1
+    done
+  if not missing:
+    pause 1
+    done
+
+  # #3 — standing on color, negated.
+  if not standing on color red:
+    pause 1
+    done
+
+  # #4 — agent existence, negated.
+  if not agent target:
+    pause 1
+    done
+
+  # #5 — landmark existence, negated.
+  if not landmark piles:
+    pause 1
+    done
+
+  # #6 — on-agent colocation (with and without the state filter).
+  if not on agent target:
+    pause 1
+    done
+  if not on agent target with state == idle:
+    pause 1
+    done
+
+  # Free side effect: `if not <marker>` canonicalizes to `if no marker <m>`
+  # so the marker name doesn't trip the name-classifier. Validates the
+  # marker-pre-pass companion rule lands.
+  if not heap:
+    pause 1
+    done
+
+  pause 1
+  done
+
+target:
+  set state = idle
+  pause 5
+  done

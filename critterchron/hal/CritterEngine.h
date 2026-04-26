@@ -52,6 +52,13 @@ struct PlannedStep {
 struct Tile {
     uint8_t state    : 1;
     uint8_t intended : 1;
+    // Cliff-fade flag (IR v6): when set alongside a non-sentinel
+    // age_max, the render path skips the brightness lerp — the tile
+    // sits at full intensity for the whole countdown then vanishes in
+    // one frame. Sibling to the `fade` flavor (lerp) and the no-fade
+    // sentinel (persist forever). Fits in existing bitfield slack;
+    // zero footprint. Mirrored on the Python side as Tile.hold_mode.
+    uint8_t hold_mode : 1;
     int16_t claimant;            // -1 unclaimed
     uint8_t r, g, b;             // last draw color (only meaningful when state)
     // Index into critter_ir::COLORS of the color name that produced r/g/b.
@@ -72,6 +79,16 @@ struct Tile {
     // Size is 0 (opt-out) on builds that -DIR_MAX_MARKERS=0.
     uint8_t count[IR_MAX_MARKERS];
 #endif
+    // Tile-paint fade (IR v6). `draw <color> fade N` sets age=age_max=N
+    // and the per-tick scheduler decrements age; at age=0 state flips
+    // back to 0 (the tile auto-expires). Sentinel 0xFFFF means "no fade"
+    // — a plain `draw <color>` paints a tile that persists until cleaned,
+    // identical to pre-v6 behavior. Render-time lerp: rgb *= age/age_max
+    // (Q8 fixed-point) before marker composite. 4 bytes/tile; on a 16×16
+    // that's 1 KiB, manageable on every platform including OG Photon
+    // (TODO.md §369-374). Mirrored on the Python side as Tile.age/age_max.
+    uint16_t age;
+    uint16_t age_max;
 };
 
 // Engine-wide cap across all agent types. Must be >= the sum of per-type

@@ -1,0 +1,25 @@
+# tests/ok_negation_runtime.crit — runtime fixture proving the `not`
+# peel actually inverts (not just parses). Painter sits at (0, 0).
+# The tile starts unlit, so `if standing on color red` is False; the
+# negation must flip that to True, and `draw blue` should fire on
+# tick 1. Functional test asserts the tile lit and is blue.
+
+--- colors ---
+painter: (200, 200, 200)
+red:     (255, 0, 0)
+blue:    (0, 0, 255)
+
+--- agents ---
+painter starts at (0, 0)
+
+--- simulation ---
+tick rate: 100ms
+
+--- behavior ---
+painter:
+  if not standing on color red:
+    draw blue
+    pause 100
+    done
+  pause 100
+  done

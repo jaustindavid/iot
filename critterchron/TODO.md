@@ -294,7 +294,32 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   pick a learning-rule fix based on what the raw traces actually
   show across the device fleet.
 
-- **Tile-paint fade on `draw`.** Motivating use case: a busier
+- ~~**Tile-paint fade on `draw`.**~~ Landed 2026-04-26. `draw <color>
+  fade <N>` lerps brightness from full to off over N ticks then flips
+  state→False; sibling `draw <color> hold <N>` (added same day, not in
+  the original spec) keeps full brightness for N ticks then vanishes
+  in one frame — both share the `age`/`age_max` countdown and the
+  per-tick decay sweep. `Tile.hold_mode` (1 bit, fits HAL bitfield
+  slack) selects flavor. No wire-format change — IR_VERSION stays at
+  6, the fade/hold clause rides as free-form text on the existing
+  `draw` instruction. Plain `draw <color>` (no fade/hold) behaves
+  identically to pre-v6. Marker-rejection regex extended so `draw
+  <ramp> fade N` / `draw <ramp> hold N` reject with the same
+  message. RAM cost regression on OG Photon documented below
+  ("Tile-fade RAM clawback") — the §369-374 "manageable on every
+  platform" claim was empirically wrong; rico is currently
+  dirtnapped pending one of the two clawback knobs. Tests:
+  `agents/tests/ok_draw_fade.crit` (compile fixture covers both
+  keywords + bare-color form), `agents/tests/ok_fade_basic.crit`
+  and `ok_hold_basic.crit` (functional fixtures asserting lit→
+  cleared trajectory and color-invariant for hold).
+
+  The original spec follows for reference; everything below the
+  rule is the as-designed shape (intent preserved on landing).
+
+  ---
+
+  Motivating use case: a busier
   tortoise whose clock tiles slowly dim and need periodic refresh,
   so stability manifests as brightness. Hour tiles get redrawn
   every hour; minute tiles get redrawn every minute; with (say) a
@@ -369,9 +394,11 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   **RAM cost.** Two new fields per tile: `uint16_t age`, `uint16_t
   age_max`. 4 bytes × GRID_WIDTH × GRID_HEIGHT. On elk_cheetah's
   16×16 that's 1 KiB; on rachel's 32×8 also 1 KiB; on rico's 8×8
-  256 bytes. Manageable on every platform, including OG Photon. If
-  tightness ever bites, pack age into uint8_t (max fade ≈ 51 seconds
-  at 5Hz) behind a `IR_TILE_AGE_BITS` knob.
+  256 bytes. ~~Manageable on every platform, including OG Photon.~~
+  **Empirically wrong** (2026-04-26): the +256 B on rico's 8×8 was
+  enough to dirtnap it on first boot. See "Tile-fade RAM clawback
+  for OG Photon" below for the two remediation knobs
+  (`IR_TILE_FADE_ENABLED` compile-out, `IR_TILE_AGE_BITS=8` packing).
 
   **Wire format.** `draw` opcode gains an optional fade parameter.
   Pre-v6 blobs encode as fade=0 (no fade). IR_VERSION bump to 6.
@@ -386,6 +413,93 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
   **Dependencies.** None. Natural to bundle with night-markers in a
   v6 bump, but can land independently.
+
+- **Tile-fade RAM clawback for OG Photon.** The fade landing
+  (2026-04-26) added 4 bytes/tile (`age` + `age_max`) plus the
+  hold variant's 1-bit `hold_mode` (free in HAL bitfield slack).
+  Spec §369-374 budgeted "manageable on every platform including
+  OG Photon" — empirically wrong: flashing the new firmware to
+  rico (OG Photon, 8×8 = 256 B added) dirtnapped it on the first
+  boot. Pre-emptively cut the 4K IR_OTA buffer on ronaldo (P1) to
+  keep it alive; rico is currently bricked-in-place pending one
+  of the two remediations below. **Posture:** disabled-OTA route
+  first (no code change), evaluate the knobs after rico is back.
+
+  **Option 1 — `IR_TILE_FADE_ENABLED` compile-out switch.** Defaults
+  to 1; a device header sets it to 0 to skip `age` / `age_max` /
+  `hold_mode` from `Tile`, the per-tick decay loop in `tick()`, and
+  the render-time lerp / hold-skip branch in `render()`. Scripts
+  that contain `fade` or `hold` against a fade-disabled target
+  silently behave like plain `draw` (tile persists until cleaned).
+  Worth a compile-time warning on the device-side parser when an
+  instruction with the `fade` / `hold` tail is seen on a build
+  with the switch off — silent no-op is the worst kind of script
+  divergence between sim and hardware. Saves the full 4 B/tile +
+  the 1 bit. Right call for OG Photon (rico's 8×8 doesn't run
+  anything fade-y) and any future Gen 1 device.
+
+  **Option 2 — `IR_TILE_AGE_BITS=8` packing knob (TODO §373).**
+  Halves `age` / `age_max` to `uint8_t` each, capping max fade
+  at 255 ticks (~51s at 5Hz / 12.75s at 50Hz). Saves 2 B/tile
+  (512 B on 16×16, 128 B on 8×8). Less invasive — fade still
+  works everywhere, just with a tighter ceiling — but the cap
+  is a footgun for authors who don't read the device header.
+  Reasonable middle ground for P1 (ronaldo) if the IR_OTA cut
+  doesn't give enough headroom long-term.
+
+  **Both knobs are orthogonal.** A device can be `IR_TILE_FADE_ENABLED=0`
+  (full opt-out) or `=1` with `IR_TILE_AGE_BITS=8` (packed). Photon 2
+  and elk_cheetah stay on the defaults (fade enabled, 16-bit ages).
+
+  **Triggering on the rico failure path.** `provision.py` (when it
+  lands) should bake `IR_TILE_FADE_ENABLED=0` into the OG-Photon
+  template by default — same hardware-class-drives-the-knobs
+  pattern that the IR_OTA buffer template solves. Until then,
+  manual flag in the rico device header.
+
+- ~~**Cliff-fade variant (`draw <color> hold <N>`).**~~ Landed
+  2026-04-26 alongside fade (already summarized inline in the fade
+  entry above; recorded here as its own bullet so a future grep for
+  `hold` finds something). Same `age` / `age_max` countdown plumbing
+  as fade, plus a 1-bit `Tile.hold_mode` (free in the HAL bitfield
+  slack) that gates the renderer: when set, the tile renders at full
+  intensity for the entire countdown and vanishes in one frame at
+  age=0; when clear, the original fade lerp runs. `fade` and `hold`
+  are mutually exclusive on a single `draw` (regex-enforced). Bare
+  `draw hold N` keeps the existing tile color and just resets the
+  countdown — same shape as bare `draw fade N`. Use case: heartbeat
+  / "still here" indicators where a smooth dim would misread as
+  "this thing is dying." Fixture: `agents/tests/ok_hold_basic.crit`
+  asserts the engine never mutates the stored color (the renderer's
+  full-bright output depends on it).
+
+- ~~**Negation symmetry across `if` and gradient seek.**~~ Landed
+  2026-04-26. Audit found nine grammar sites where `X` was accepted
+  but `not X` was rejected; closed cases #1-#6 (the meaningful ones).
+  Concretely: gradient seek's landmark filter now accepts `not on
+  landmark X` (the original motivating ask: "follow the marker but
+  stay out of the heap zone"); board-scope tile predicates take
+  `if not current` / `not extra` / `not missing`; positional sites
+  take `if not standing on color X`, `if not agent X`, `if not
+  landmark X`, `if not on agent X [with state == ...]`. Implemented
+  via a generic recursive `not` peel in `_evaluate_if` (engine.py)
+  and the matching HAL `evaluateIf` — strip the `not`, recurse on
+  the de-negated body, invert. Compiler-side: name-resolution
+  pre-pass (`_resolve_names_in_behaviors`) updated to allow a
+  `(?:not )?` prefix so `if not <bare-name>` resolves to `if not
+  <kind> <bare-name>` before the runtime peels it. Bonus: `if not
+  state == X` and `if not random N%` work for free off the same
+  recursion (case #7 / #8 from the audit, which the audit marked
+  skip-worthy because of `!=` and `100-N` workarounds). Free side
+  effect: `if not <marker>` canonicalizes to `if no marker <m>` via
+  a new `_MARKER_IF_PATTERNS` rule, keeping marker references
+  symmetric and avoiding a misleading "unknown name" error from
+  the name-classifier. Cases #7/#8 from the audit are technically
+  closed; case #9 (`wander not avoiding`) stays rejected — it's
+  semantic gibberish. Fixtures: `agents/tests/ok_negation_symmetry.crit`
+  (compile coverage of all six forms), `ok_negation_runtime.crit`
+  + `_check_negation_runtime` (asserts the peel actually inverts —
+  a regression would leave the painter's tile dark instead of blue).
 
 - ~~**Night-mode marker ramps.**~~ Landed 2026-04-21. `ramp (r, g, b)`
   inside a `night:` block overrides the per-unit coefficient of the

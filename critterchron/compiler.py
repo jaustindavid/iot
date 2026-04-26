@@ -14,6 +14,20 @@ import json
 # shared with the day marker (that's a scheduler property, not a visual
 # one); names must match an existing day marker. Wire format adds a
 # NIGHT_MARKERS section (4 tokens per entry: name r g b).
+#
+# IR_VERSION 6 also adds tile-paint fade: `draw <color> fade <N>` (or
+# bare `draw fade <N>`) makes the painted tile auto-expire after N ticks
+# with a render-time brightness lerp. State stays binary; age and age_max
+# are per-tile visual fields decremented by the per-tick scheduler. No
+# wire-format change — the fade clause rides as free-form text on the
+# existing draw instruction. Pre-fade `draw <color>` form is unchanged.
+#
+# IR_VERSION 6 also adds the cliff-fade variant: `draw <color> hold <N>`
+# uses the same age/age_max countdown but the renderer skips the lerp —
+# the tile sits at full brightness for N ticks then vanishes in one
+# frame. `fade` and `hold` are mutually exclusive on a single draw.
+# Storage cost is one extra bit per tile (`hold_mode`), which fits in
+# existing HAL bitfield slack.
 IR_VERSION = 6
 
 # Tile-predicate tokens that can appear after `if on` / `seek [nearest]`.
@@ -739,6 +753,14 @@ class CritCompiler:
          'if no marker {m} on landmark {l}'),
         (re.compile(r'^if (?P<m>\w+)\s*==\s*0$'),
          'if no marker {m}'),
+        # `if not <m>` is the natural negation of bare `if <m>` (which
+        # canonicalizes to `if marker <m> > 0`). Negation = "all cells
+        # zero" = `if no marker <m>`. Catching it here keeps marker
+        # references symmetric with the rest of the negation-peeling
+        # work and avoids the name-classifier falsely reporting `m` as
+        # unknown when it's actually a declared marker.
+        (re.compile(r'^if not (?P<m>\w+)$'),
+         'if no marker {m}'),
         (re.compile(r'^if (?P<m>\w+)\s*(?P<op>[<>])\s*(?P<n>\d+) on landmark (?P<l>\w+)$'),
          'if marker {m} {op} {n} on landmark {l}'),
         (re.compile(r'^if (?P<m>\w+)\s*(?P<op>[<>])\s*(?P<n>\d+)$'),
@@ -862,11 +884,11 @@ class CritCompiler:
             return f"if marker {m.group(1)} > 0"
 
         # --- seek forms ---
-        # seek highest|lowest <m> [op N] [on landmark X] [timeout N]
+        # seek highest|lowest <m> [op N] [[not] on landmark X] [timeout N]
         m = re.match(
             r'^seek\s+(?P<dir>highest|lowest)\s+(?P<m>\w+)'
             r'(?:\s+(?P<op>[<>])\s*(?P<n>\d+))?'
-            r'(?:\s+on\s+landmark\s+(?P<l>\w+))?'
+            r'(?:\s+(?P<neg>not\s+)?on\s+landmark\s+(?P<l>\w+))?'
             r'(?:\s+timeout\s+(?P<t>\d+))?$',
             body,
         )
@@ -883,7 +905,8 @@ class CritCompiler:
             if m.group('op'):
                 out += f" {m.group('op')} {m.group('n')}"
             if m.group('l'):
-                out += f" on landmark {m.group('l')}"
+                neg = "not " if m.group('neg') else ""
+                out += f" {neg}on landmark {m.group('l')}"
             if m.group('t'):
                 out += f" timeout {m.group('t')}"
             return out
@@ -940,9 +963,13 @@ class CritCompiler:
                 f"{context!r} — not a landmark, agent, or tile predicate"
             )
 
-        if_on_re = re.compile(r'^(if on )(\w+)(\s.*)?$')
-        if_standing_re = re.compile(r'^(if standing on )(\w+)(\s.*)?$')
-        if_exist_re = re.compile(r'^(if )(\w+)$')
+        # Optional `not ` prefix is captured into the prefix group so the
+        # rewrite emits `if not <kind> <name>` symmetrically. Runtime
+        # peels the `not` off and inverts the result of the de-negated
+        # form. See evaluateIf / _evaluate_if for the matching half.
+        if_on_re = re.compile(r'^(if (?:not )?on )(\w+)(\s.*)?$')
+        if_standing_re = re.compile(r'^(if (?:not )?standing on )(\w+)(\s.*)?$')
+        if_exist_re = re.compile(r'^(if (?:not )?)(\w+)$')
         seek_re = re.compile(r'^(seek\s+)(nearest\s+)?(free\s+)?(\w+)(\s.*)?$')
         despawn_re = re.compile(r'^despawn\s+(\w+)(\s.*)?$')
 
@@ -1053,7 +1080,14 @@ class CritCompiler:
         re.compile(r'set\s+state\s*=\s*\w+'),
         re.compile(r'set\s+color\s*=\s*\w+'),
         re.compile(r'erase'),
-        re.compile(r'draw(\s+\w+)?'),
+        # `draw [<color>] [(fade|hold) <N>]`. The optional color slot
+        # uses a negative lookahead so `draw fade 100` / `draw hold 100`
+        # don't bind the keyword as the color name (which would then
+        # fail to match the trailing duration group). N is a positive
+        # tick count; no time-unit suffixes — author computes ticks
+        # from tick_rate and moves on. `fade` lerps brightness over N;
+        # `hold` keeps it at full and vanishes in one frame at N.
+        re.compile(r'draw(\s+(?!fade\b|hold\b)\w+)?(\s+(fade|hold)\s+\d+)?'),
         re.compile(r'pause(\s+\d+(-\d+)?)?'),
         re.compile(r'despawn(\s+agent\s+\w+)?'),
         re.compile(r'wander(\s+avoiding\s+(current|any))?'),
@@ -1073,13 +1107,14 @@ class CritCompiler:
             r'(\s+(not\s+)?on\s+(marker\s+\w+(\s*[<>]\s*\d+)?|\w+))?'
             r'(\s+timeout\s+\d+)?'
         ),
-        # Gradient seek primitives. `on landmark X` is the ONLY filter
-        # allowed on these — the comparison op is fused into the target
-        # description, not expressed as a separate `on marker ...`.
+        # Gradient seek primitives. `on landmark X` (or `not on landmark
+        # X` for the inverse — board minus landmark cells) is the ONLY
+        # filter allowed on these — the comparison op is fused into the
+        # target description, not expressed as a separate `on marker ...`.
         re.compile(
             r'seek\s+(highest|lowest)\s+marker\s+\w+'
             r'(\s*[<>]\s*\d+)?'
-            r'(\s+on\s+landmark\s+\w+)?'
+            r'(\s+(not\s+)?on\s+landmark\s+\w+)?'
             r'(\s+timeout\s+\d+)?'
         ),
     ]
@@ -1257,7 +1292,7 @@ class CritCompiler:
         # reject at compile time than hunt a no-op on hardware.
         for agent, insts in self.ir.get("behaviors", {}).items():
             for indent, inst in insts:
-                m = re.match(r'^draw\s+(\w+)$', inst)
+                m = re.match(r'^draw\s+(\w+)(\s+(fade|hold)\s+\d+)?$', inst)
                 if m and m.group(1) in markers:
                     raise ValueError(
                         f"Compilation Failed: 'draw {m.group(1)}' in "

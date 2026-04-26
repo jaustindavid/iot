@@ -67,10 +67,27 @@ class CritterRenderer:
                 elif self.tile_alphas[x][y] > target_alpha:
                     self.tile_alphas[x][y] = max(target_alpha, self.tile_alphas[x][y] - alpha_step)
                 
-                # Start with grid color (lit-tile RGB, faded by alpha)
-                tile_r = tile.color[0] * self.tile_alphas[x][y]
-                tile_g = tile.color[1] * self.tile_alphas[x][y]
-                tile_b = tile.color[2] * self.tile_alphas[x][y]
+                # Start with grid color (lit-tile RGB, faded by alpha).
+                # Tile-paint fade (IR v6): scale by age/age_max when this
+                # tile was painted with `draw ... fade N`. Sentinel 0xFFFF
+                # = no fade, pre-v6 behavior. Runs before marker composite
+                # so markers stack on top of the dimmed tile, not the
+                # original brightness (TODO §354-358). The cliff-fade
+                # variant (`draw ... hold N`) also has age_max != 0xFFFF
+                # but skips the lerp — full brightness for the entire
+                # countdown, then state flips to False at age=0.
+                base_r = tile.color[0]
+                base_g = tile.color[1]
+                base_b = tile.color[2]
+                if (tile.age_max != 0xFFFF and tile.age_max > 0
+                        and not tile.hold_mode):
+                    fade = tile.age / tile.age_max
+                    base_r *= fade
+                    base_g *= fade
+                    base_b *= fade
+                tile_r = base_r * self.tile_alphas[x][y]
+                tile_g = base_g * self.tile_alphas[x][y]
+                tile_b = base_b * self.tile_alphas[x][y]
 
                 # Additively composite any marker ramp on top. Each
                 # marker contributes `count * rgb_floats` to the tile
