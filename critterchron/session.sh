@@ -26,9 +26,11 @@ if [ ! -d "venv" ]; then
     if [ -f "requirements.txt" ]; then
         pip install -r requirements.txt
     fi
+    # clone and install the stra2us client
+    pip install -e ../stra2us/tools
 else
     source venv/bin/activate
-    echo "Venv Active: $(python3 --version)"
 fi
+echo "Venv Active: $(python3 --version)"
 
 [ -f .env.local ] && source .env.local

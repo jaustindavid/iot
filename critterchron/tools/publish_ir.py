@@ -2,27 +2,36 @@
 
     python3 tools/publish_ir.py agents/thyme.crit
         [--name thyme]            # override script name (default: file stem)
-        [--server http://host:p]  # override server (else env STRA2US_HOST)
-        [--client-id <id>]        # else env STRA2US_CLIENT_ID
-        [--secret <hex>]          # else env STRA2US_SECRET_HEX
         [--dry-run]               # encode + print summary, no network
-        [--force]                 # upload even if src_sha256 matches remote
+        [--force]                 # upload even if remote sidecar matches
         [--source]                # include SOURCE trailer (roughly doubles
                                   #   blob size; for human-readable inspection
-                                  #   via `curl <blob_url>`). Default: omit —
+                                  #   via the KV store). Default: omit —
                                   #   devices never read SOURCE at runtime and
                                   #   the extra bytes regularly push blobs past
                                   #   IR_OTA_BUFFER_BYTES, which silently kills
                                   #   OTA on buffer-tight devices like rico.
 
-Key layout: `critterchron/scripts/<name>` holds the blob. Separate tool
-will set `critterchron/<device>/ir = <name>` to point a device at it.
+Auth comes from `stra2us_cli.client_from_env`, which reads either the
+`STRA2US_*` env vars or a `~/.stra2us` profile — same resolution the
+`stra2us` CLI uses interactively. No `--server` / `--client-id` /
+`--secret` flags here; configure via that path instead.
 
-Idempotency: fetches the remote blob and compares bytes against what
-we'd upload, with `encoded_at` normalized out (wall-clock drift would
-otherwise defeat the check). Catches both source edits and encoder
-changes — a src_sha-only comparison would miss the latter, e.g. when
-the encoder starts emitting symbolic coords for an unchanged .crit.
+Key layout: `critterchron/scripts/<name>` holds the blob bytes;
+`critterchron/scripts/<name>/sha` holds the sidecar string
+`<content_sha>:<size>`. A separate tool (`set_ir_pointer.py`) sets
+`critterchron/<device>/ir = <name>` to point a device at a script.
+
+Idempotency: probes the remote sidecar and skips the upload when it
+matches what we'd write. Sidecar comparison is enough — it IS the
+content_sha, and we always upload blob then sidecar (so a stale
+sidecar implies a stale blob). One small GET vs the original's full-
+blob fetch.
+
+Tear-safety: blob first, sidecar second. If the process dies between
+the two writes, the sidecar still points at the *previous* sha so
+devices skip the apply (fail-safe). Reverse tear (sidecar updated,
+blob stale) is caught device-side by the recompute-on-fetch check.
 """
 
 from __future__ import annotations
@@ -40,7 +49,7 @@ if _REPO not in sys.path:
 
 from compiler import CritCompiler                    # noqa: E402
 from hal.ir import ir_text                           # noqa: E402
-from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
+from stra2us_cli import client_from_env              # noqa: E402
 
 
 ENCODER_VERSION = "publish_ir/1"
@@ -50,9 +59,8 @@ ENCODER_VERSION = "publish_ir/1"
 # reject blobs whose HTTP body exceeds this cap (the rejection at
 # `kv_fetch_str_` line 472 only surfaces via serial as "ir_poll: fetch
 # failed"). Blobs over this threshold get a loud stderr warning here so
-# the operator at least sees it publisher-side — see TODO.md "Publish
-# warns when blob exceeds OTA buffer size". Device headers can override
-# IR_OTA_BUFFER_BYTES smaller or larger; without device-reported
+# the operator at least sees it publisher-side. Device headers can
+# override IR_OTA_BUFFER_BYTES smaller or larger; without device-reported
 # telemetry we can't know per-device, so we warn against the default and
 # let the operator judge. Keep in lockstep with the device header.
 DEFAULT_OTA_BUFFER_BYTES = 8192
@@ -79,7 +87,10 @@ def _content_sha(blob_text: str) -> str:
     Fletcher END line normalized out. Stable across republishes of the
     same source with the same encoder, shifts on source edits OR on
     encoder behavior changes — so devices pull a new blob in both cases
-    without pulling one when nothing actually changed."""
+    without pulling one when nothing actually changed.
+
+    Re-exported because `set_ir_pointer.py` imports it for the same
+    normalization on the pointer side; keep the symbol stable."""
     norm = _normalize_for_hash(blob_text)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
@@ -115,36 +126,38 @@ def _build_blob(script_path: str, name: str,
     return blob, src_sha, ir.get("ir_version", 1)
 
 
+def _read_sidecar(client, sha_key: str) -> str | None:
+    """Fetch the sidecar value, normalizing bytes→str. Returns None on
+    any failure (missing key, network blip, decode error) so the caller
+    can degrade to "proceed with upload" without a special-case branch."""
+    try:
+        v = client.get(sha_key)
+    except Exception:
+        return None
+    if v is None:
+        return None
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return v
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("script", help="Path to a .crit file")
     ap.add_argument("--name", help="Script name (default: file stem)")
-    ap.add_argument("--server")
-    ap.add_argument("--client-id", dest="client_id")
-    ap.add_argument("--secret", dest="secret_hex")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
-                    help="Upload even if the remote blob already matches")
+                    help="Upload even if the remote sidecar already matches")
     ap.add_argument("--source", dest="include_source",
                     action="store_true", default=False,
                     help="Include the SOURCE trailer in the published blob "
-                         "(human-readable inspection via curl; roughly "
-                         "doubles blob size). Default: omit — devices "
-                         "never read SOURCE at runtime.")
-    # Deprecated alias for the old default-on behavior. Kept one release
-    # so muscle memory / existing shell scripts don't break loudly; emits
-    # a stderr note when used. Do NOT document in --help (argparse.SUPPRESS).
-    # Semantically a no-op now: the new default is already source-off, so
-    # `--no-source` just reinforces it. Retire once no one's typing it.
-    ap.add_argument("--no-source", dest="_deprecated_no_source",
-                    action="store_true", default=False,
-                    help=argparse.SUPPRESS)
+                         "(human-readable inspection via the KV store; "
+                         "roughly doubles blob size). Default: omit — "
+                         "devices never read SOURCE at runtime.")
     args = ap.parse_args()
-
-    if args._deprecated_no_source:
-        print("note: --no-source is deprecated — dropping SOURCE is now the "
-              "default. Pass --source if you want the trailer included.",
-              file=sys.stderr)
 
     name    = args.name or os.path.splitext(os.path.basename(args.script))[0]
     key     = f"critterchron/scripts/{name}"
@@ -157,9 +170,12 @@ def main() -> int:
         print(f"error: compile/encode failed: {e}", file=sys.stderr)
         return 1
 
-    size        = len(blob.encode("utf-8"))
+    blob_bytes  = blob.encode("utf-8")
+    size        = len(blob_bytes)
     content_sha = _content_sha(blob)
+    sidecar     = f"{content_sha}:{size}"
     source_tag  = "with source" if args.include_source else "no source"
+
     print(f"script:     {args.script}")
     print(f"name:       {name}")
     print(f"key:        {key}")
@@ -170,10 +186,9 @@ def main() -> int:
 
     if size > DEFAULT_OTA_BUFFER_BYTES:
         overshoot = size - DEFAULT_OTA_BUFFER_BYTES
-        # Warning text branches on whether source is *already* off. If it
-        # is (the new default), `--no-source` can't help — only option is
-        # raising IR_OTA_BUFFER_BYTES. If source is on, suggest dropping
-        # it first, then the header bump as fallback.
+        # Branch on whether SOURCE is on: if it is, suggest dropping it
+        # first (free ~halving). If it's already off, only fix is bumping
+        # IR_OTA_BUFFER_BYTES on the device.
         if args.include_source:
             remedy = (
                 "         Drop the SOURCE trailer (remove --source) —\n"
@@ -203,68 +218,46 @@ def main() -> int:
         return 0
 
     try:
-        client = client_from_env(
-            base_url=args.server,
-            client_id=args.client_id,
-            secret_hex=args.secret_hex,
-        )
-    except Stra2usError as e:
-        print(f"error: {e}", file=sys.stderr)
+        client = client_from_env()
+    except Exception as e:
+        print(f"error: stra2us client init failed: {e}", file=sys.stderr)
         return 2
 
     if not args.force:
-        # Compare *content_sha*, not source sha. The encoder's output can
-        # change without a source edit (e.g. new preserve_symbolic_coords
-        # mode), and a src-sha-only check would silently skip the upload
-        # and leave devices running the old encoding. One extra GET on
-        # the happy path is cheap compared to a debug session chasing a
-        # "but I published it" ghost.
-        try:
-            remote_blob = client.get(key)
-        except Stra2usError as e:
-            print(f"warning: remote probe failed ({e}); proceeding with upload")
-            remote_blob = None
-        if isinstance(remote_blob, bytes):
-            try:
-                remote_blob = remote_blob.decode("utf-8")
-            except UnicodeDecodeError:
-                remote_blob = None
-        if isinstance(remote_blob, str):
-            if _content_sha(remote_blob) == content_sha:
-                print(f"up-to-date: remote content_sha matches (use --force to re-upload)")
-                return 0
+        remote = _read_sidecar(client, sha_key)
+        if remote == sidecar:
+            print("up-to-date: remote sidecar matches "
+                  "(use --force to re-upload)")
+            return 0
 
-    # Upload order matters: blob first, sidecar second. If the process dies
-    # between the two writes the sidecar still points at the *previous* sha,
-    # so devices see no change and skip the apply — fail-safe. The device
-    # recomputes content_sha on the fetched blob and checks it matches the
-    # sidecar, catching the reversed tear (sidecar updated but blob stale)
-    # by refusing to apply.
+    # Upload order: blob first, sidecar second. If the process dies
+    # between the two writes, the sidecar still points at the *previous*
+    # sha so devices see no change and skip the apply — fail-safe. The
+    # device recomputes content_sha on the fetched blob and checks it
+    # matches the sidecar, catching the reversed tear.
     #
     # Sidecar format: "<64-char content_sha>:<size_bytes>". The size suffix
     # lets the device skip the big blob fetch entirely when the blob would
-    # overrun IR_OTA_BUFFER_BYTES, avoiding the oversize-crash path (see
-    # TODO.md "OTA crash — oversize blob kills the device hard"). Legacy
-    # devices that expect bare sha get a 64-hex prefix and will ignore the
-    # suffix (the `sha_len == 64` gate in older Stra2usClient.cpp fails
-    # closed on any length != 64, which degrades to "miss this poll, retry
-    # next cycle" — fail-safe for rollout).
-    sidecar_value = f"{content_sha}:{size}"
+    # overrun IR_OTA_BUFFER_BYTES, avoiding the oversize-crash path.
+    # Legacy devices that expect bare sha get a 64-hex prefix and ignore
+    # the suffix (the `sha_len == 64` gate fails closed on length != 64,
+    # which degrades to "miss this poll, retry next cycle" — fail-safe).
     try:
-        client.put(key, blob)
-    except Stra2usError as e:
-        print(f"error: {e}", file=sys.stderr)
+        client.put(key, blob_bytes)
+    except Exception as e:
+        print(f"error: blob upload failed: {e}", file=sys.stderr)
         return 3
     try:
-        client.put(sha_key, sidecar_value)
-    except Stra2usError as e:
-        print(f"error: blob uploaded but sidecar sha upload failed: {e}",
+        client.put(sha_key, sidecar)
+    except Exception as e:
+        print(f"error: blob uploaded but sidecar upload failed: {e}",
               file=sys.stderr)
-        print(f"       retry with --force to restore sidecar", file=sys.stderr)
+        print( "       retry with --force to restore the sidecar",
+              file=sys.stderr)
         return 3
 
-    print(f"published: {client.base_url}/kv/{key}  ({size} bytes, {source_tag})")
-    print(f"sidecar:   {client.base_url}/kv/{sha_key}")
+    print(f"published: {key}  ({size} bytes, {source_tag})")
+    print(f"sidecar:   {sha_key}  -> {sidecar}")
     return 0
 
 

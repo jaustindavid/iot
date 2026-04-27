@@ -2,3 +2,4 @@ pygame-ce
 msgpack
 requests
 pyyaml
+# Also: pip install -e ../stra2us/tools

@@ -301,13 +301,15 @@ engine init — they're no longer part of the IR.
 ## Tools
 
 Two CLIs sit over Stra2us KV: one publishes blobs, one points devices at
-them. Both share `tools/s2s_client.py` for auth/signing.
+them. Both call `stra2us_cli.client_from_env()` for auth — same
+resolution path the `stra2us` CLI uses interactively (env vars or a
+`~/.stra2us` profile). Neither tool accepts `--server` / `--client-id`
+/ `--secret` flags any more; configure those upstream of the call.
 
 ### publish_ir
 
 ```
 python3 tools/publish_ir.py agents/thyme.crit [--name thyme]
-                                              [--server https://…]
                                               [--dry-run]
                                               [--force]
                                               [--source]
@@ -317,20 +319,21 @@ By default the published blob omits the SOURCE trailer — devices never
 read it at runtime, and including it roughly doubles blob size, which
 regularly pushes scripts past `IR_OTA_BUFFER_BYTES` on buffer-tight
 targets (rico in particular). Pass `--source` when you want the
-human-readable trailer on the KV blob for `curl`-based inspection.
+human-readable trailer on the KV blob for inspection via `stra2us get`.
 
 Behavior:
 
-1. Read creds from env: `STRA2US_HOST`, `STRA2US_CLIENT_ID`, `STRA2US_SECRET_HEX`.
+1. Resolve auth via `stra2us_cli.client_from_env()`.
 2. Compile .crit → IR dict, serialize to wire format via `hal/ir/ir_text.py`.
-3. Compute `src_sha256` over the .crit file contents.
-4. `GET /kv/critterchron/scripts/<name>/sha` — if it matches `src_sha256`,
-   exit no-op (unless `--force`). Cheaper than pulling the blob and parsing
-   its metadata.
-5. `PUT /kv/critterchron/scripts/<name>` — the blob.
-6. `PUT /kv/critterchron/scripts/<name>/sha` — the sidecar
-   (`<content_sha>:<size_bytes>`).
-7. Print a short summary: size, sha, key, server.
+3. Compute the sidecar value `<content_sha>:<size_bytes>` we'd write.
+4. `GET critterchron/scripts/<name>/sha` — if it byte-matches the value
+   from step 3, exit no-op (unless `--force`). Sidecar comparison is
+   cheap (single small value, no full-blob fetch) and sufficient: the
+   sidecar IS the content_sha, and tear-safe ordering (step 5 then 6)
+   means a matching sidecar implies a matching blob.
+5. `PUT critterchron/scripts/<name>` — the blob (bytes).
+6. `PUT critterchron/scripts/<name>/sha` — the sidecar (string).
+7. Print a short summary: size, sha, key.
 
 Step 5 before 6 is intentional: a mid-publish crash leaves the sidecar
 pointing at the previous sha and devices see no change (see "Why the
@@ -513,8 +516,10 @@ empty value = skip), and the next reboot comes up on `DEFAULT_IR_BLOB`.
 1. **Text serializer** (Python). `hal/ir/ir_text.py` — `encode(ir_dict,
    meta) -> str` and `decode(text) -> (ir_dict, meta)`.
 2. **Round-trip test.** Encode every script in `agents/`; decode; verify.
-3. **Upload tool + shared client lib.** `tools/publish_ir.py` +
-   `tools/s2s_client.py`. Usable against today's server immediately.
+3. **Upload tool.** `tools/publish_ir.py` (originally with a local
+   `tools/s2s_client.py` for HTTP/auth; deleted 2026-04-27 when
+   `stra2us_cli` shipped a Python client surface usable directly via
+   `from stra2us_cli import client_from_env`).
 4. **Default blob generation.** `ir_encoder.py` emits `DEFAULT_IR_BLOB[]`
    (hex-escaped text) instead of the constexpr-struct namespace.
 5. **C++ loader.** `Stra2usIRLoader` — parse buffer, materialize runtime

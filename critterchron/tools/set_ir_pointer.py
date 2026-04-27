@@ -1,19 +1,25 @@
 """Set the OTA IR pointer for a device.
 
     python3 tools/set_ir_pointer.py <device> <script-name>
-        [--server http://host:p]
-        [--client-id <id>]
-        [--secret <hex>]
         [--clear]          # delete the pointer (revert to compiled-in default)
+        [--force]          # skip the publish-side existence check
 
-Key written: `critterchron/<device>/ir = <script-name>` (msgpack str). The
-device polls this on its heartbeat cycle; on change it fetches
-`critterchron/scripts/<script-name>` and hot-swaps the engine.
+Auth comes from `stra2us_cli.client_from_env`, which reads either the
+`STRA2US_*` env vars or a `~/.stra2us` profile — same resolution the
+`stra2us` CLI uses interactively. No `--server` / `--client-id` /
+`--secret` flags here; configure via that path instead.
+
+Key written: `critterchron/<device>/ir = <script-name>` (stored as a
+string). The device polls this on its heartbeat cycle; on change it
+fetches `critterchron/scripts/<script-name>` and hot-swaps the engine.
+A pointer flip is the smallest atomic operation the KV API exposes
+(one key → one put), so torn-state risk is concentrated entirely in
+the publish step (blob/sidecar pair) — covered by the `_script_exists`
+cross-check below.
 
 Script must already be published via tools/publish_ir.py. This tool
-verifies the target exists before writing the pointer (a GET on the
-sidecar sha key, with a fallback probe of the blob key for pre-sidecar
-publishes). Pass --force to skip the check.
+verifies the target's blob and sidecar agree (size + content_sha)
+before writing the pointer; passing --force skips the check.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ _REPO = os.path.abspath(os.path.join(_HERE, ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
+from stra2us_cli import client_from_env  # noqa: E402
 from tools.publish_ir import _content_sha  # noqa: E402
 
 
@@ -88,10 +94,12 @@ def _script_exists(client, name: str) -> tuple[bool, str]:
     sha_key = f"critterchron/scripts/{name}/sha"
     blob_key = f"critterchron/scripts/{name}"
 
-    # 1. Fetch sidecar.
+    # 1. Fetch sidecar. Broad except: the new client surface doesn't
+    # expose a single error type, and any failure (network, missing
+    # key, decode) means "no usable sidecar" for our purposes.
     try:
         sha = _as_text(client.get(sha_key))
-    except Stra2usError as e:
+    except Exception as e:
         sha = None
         sha_err = str(e)
     else:
@@ -114,7 +122,7 @@ def _script_exists(client, name: str) -> tuple[bool, str]:
     # publisher-side size includes it.
     try:
         blob = _as_raw_text(client.get(blob_key))
-    except Stra2usError as e:
+    except Exception as e:
         if sidecar_sha is None:
             return False, f"sidecar missing ({sha_err or 'empty'}); blob probe failed: {e}"
         return False, f"sidecar ok but blob fetch failed: {e}"
@@ -157,9 +165,6 @@ def main() -> int:
     ap.add_argument("device", help="Device name, e.g. rachel_raccoon")
     ap.add_argument("script", nargs="?",
                     help="Script name (omit with --clear to unset)")
-    ap.add_argument("--server")
-    ap.add_argument("--client-id", dest="client_id")
-    ap.add_argument("--secret", dest="secret_hex")
     ap.add_argument("--clear", action="store_true",
                     help="Unset the pointer (device reverts to its compiled-in default)")
     ap.add_argument("--force", action="store_true",
@@ -174,13 +179,9 @@ def main() -> int:
     key = f"critterchron/{args.device}/ir"
 
     try:
-        client = client_from_env(
-            base_url=args.server,
-            client_id=args.client_id,
-            secret_hex=args.secret_hex,
-        )
-    except Stra2usError as e:
-        print(f"error: {e}", file=sys.stderr)
+        client = client_from_env()
+    except Exception as e:
+        print(f"error: stra2us client init failed: {e}", file=sys.stderr)
         return 2
 
     if args.clear:
@@ -189,28 +190,28 @@ def main() -> int:
         # script sticks. A reboot then comes up on the compiled-in default.
         try:
             client.put(key, "")
-        except Stra2usError as e:
-            print(f"error: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"error: clear failed: {e}", file=sys.stderr)
             return 3
-        print(f"cleared: {client.base_url}/kv/{key}")
+        print(f"cleared: {key}")
         return 0
 
     if not args.force:
         ok, detail = _script_exists(client, args.script)
         if not ok:
-            print(f"error: {args.script!r} not found on {client.base_url}: {detail}",
+            print(f"error: {args.script!r} not usable: {detail}",
                   file=sys.stderr)
-            print(f"       publish it first (tools/publish_ir.py) or pass --force",
+            print( "       publish it first (tools/publish_ir.py) or pass --force",
                   file=sys.stderr)
             return 4
         print(f"verified: {detail}")
 
     try:
         client.put(key, args.script)
-    except Stra2usError as e:
-        print(f"error: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"error: pointer put failed: {e}", file=sys.stderr)
         return 3
-    print(f"set: {client.base_url}/kv/{key} → {args.script}")
+    print(f"set: {key} → {args.script}")
     return 0
 
 

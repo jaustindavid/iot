@@ -132,8 +132,10 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   overshoot, explaining the failure mode ("devices silently stay on
   the previous script, visible only as 'ir_poll: fetch failed' on
   serial"), and suggesting either raising `IR_OTA_BUFFER_BYTES` in the
-  device header or re-running with `--no-source` to drop the SOURCE
-  trailer. The device-side error-channel-on-heartbeat follow-up is
+  device header or dropping the SOURCE trailer (`--source` is now
+  opt-in and off by default; was `--no-source` opt-out at the time of
+  this landing — see the 2026-04-23 flip below for the rename, and the
+  2026-04-27 publish/point cleanup which removed the deprecated alias). The device-side error-channel-on-heartbeat follow-up is
   still the right-sized fix (see entry above) — this was the
   short-loop papercut close.
 - **Re-publish doesn't trigger re-OTA.** ~~Investigation open — see
@@ -919,8 +921,9 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   shrinks from 2245→850 bytes, foreman.crit from 8895→4442 — no
   longer trips the oversize warning on the default publish path.
   `--no-source` kept as a hidden deprecated alias (argparse.SUPPRESS)
-  with a one-line stderr deprecation note; retire next release once
-  no one's typing it. Oversize warning now branches on whether SOURCE
+  with a one-line stderr deprecation note; **retired 2026-04-27** in
+  the publish/point cleanup that also rebased both tools on
+  `stra2us_cli.client_from_env`. Oversize warning now branches on whether SOURCE
   was requested: if yes, recommend dropping it; if no (default path),
   recommend raising `IR_OTA_BUFFER_BYTES` since no publisher-side fix
   remains. Publish summary line names the path (`850 bytes (no

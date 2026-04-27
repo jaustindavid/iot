@@ -1,6 +1,14 @@
 # Stra2us Catalog — feature request / proposal
 
-**Status:** proposal, from the CritterChron team
+**Status:** **ADOPTED.** Stra2us shipped `stra2us_cli` with the
+`{catalog, show, put, get, del, set}` surface proposed below;
+CritterChron migrated `tools/publish_ir.py` and `tools/set_ir_pointer.py`
+off the local `s2s.py` / `s2s_client.py` modules on 2026-04-27 (both
+local modules deleted in that pass). The proposal text below is kept
+as historical context — what CritterChron prototyped, why, and the
+shape that ended up landing. The web-UI half of the proposal
+(non-CLI editing for headless / non-developer users) is **not** yet
+shipped as far as we know — that piece remains an open ask.
 **Audience:** Stra2us maintainers
 **One-line:** adopt the per-app YAML "catalog" pattern CritterChron has
 prototyped, and grow a web UI on top of it so non-CLI users can see and
