@@ -331,6 +331,48 @@ def cmd_put(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_get(args: argparse.Namespace) -> int:
+    """Raw KV read — bypasses catalog. Writes the value to stdout (bytes
+    binary-safe via stdout.buffer, strings as utf-8, anything else as
+    JSON). Exits 1 with no output when the key is unset, so a script can
+    branch on the exit code."""
+    try:
+        client = _build_client(args)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        value = client.get(args.key)
+    except Stra2usError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 4
+
+    if value is None:
+        return 1
+
+    if isinstance(value, bytes):
+        out_bytes = value
+    elif isinstance(value, str):
+        out_bytes = value.encode("utf-8")
+    else:
+        import json
+        out_bytes = json.dumps(value).encode("utf-8")
+
+    if args.output is not None:
+        try:
+            with open(args.output, "wb") as f:
+                f.write(out_bytes)
+        except OSError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+    else:
+        sys.stdout.buffer.write(out_bytes)
+        sys.stdout.flush()
+
+    return 0
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     """Raw KV delete — bypasses catalog. Idempotent."""
     try:
@@ -462,6 +504,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="inline string value; written as msgpack str",
     )
 
+    # ----- get -----
+    sp_get = sub.add_parser(
+        "get",
+        help="read a raw KV value (bytes/str/json) to stdout; exits 1 if unset",
+    )
+    sp_get.add_argument("key", help="full KV path")
+    sp_get.add_argument(
+        "--output", "-o",
+        help="write to this file instead of stdout (recommended for binary)",
+    )
+
     # ----- del -----
     sp_del = sub.add_parser(
         "del",
@@ -508,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_show(args)
         if args.verb == "put":
             return cmd_put(args)
+        if args.verb == "get":
+            return cmd_get(args)
         if args.verb == "del":
             return cmd_delete(args)
         if args.verb == "set":
