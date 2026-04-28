@@ -722,6 +722,51 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 # Completed
 
+- **2026-04-27 — OTA HardFault on first pull (rachel) — tel-thread stack
+  overflow.** Symptom: Photon 2 ran compiled-in scripts indefinitely
+  but reset cleanly the moment the OTA pointer flipped. Last serial
+  line was always `ir_poll: fetching blob critterchron/scripts/<name>`,
+  never reaching `blob in (N bytes)`. No SOS — `SYSTEM_THREAD(ENABLED)`
+  panics on a worker thread don't get a chance to render the SOS pattern
+  before reset, so the symptom *looked* like a watchdog or a Particle
+  cloud-side firmware-OTA push.
+
+  *Diagnosis.* Added an unconditional `boot reset_reason=...` log in
+  `loop()` (NOT `setup()` — early-boot Log.info gets dropped before USB
+  CDC reattaches on a post-crash boot, which is why the first attempt to
+  capture the reason saw nothing). Repro on rachel: `reset_reason=130
+  data=1` = `RESET_REASON_PANIC` + HardFault. Hard pointer fault on the
+  tel thread mid-`kv_fetch_str_`.
+
+  *Root cause.* Call chain `telemetry_worker → ir_poll → kv_fetch_str_
+  → read_response_` nests deep enough that the streaming-body branch
+  (only reached on OTA — heartbeats have tiny bodies) overruns
+  `TELEMETRY_STACK_BYTES=5120`. nRF52840 MPU stack guard fires the
+  HardFault. Sum-of-locals estimate looked fine (~3.1KB), but libc +
+  HMAC-SHA256 context allocations push it past the limit in practice.
+  Buffer overrun and use-after-free were ruled out by code reading
+  `read_response_`'s streaming branch — bounds and pointer lifetimes
+  check out.
+
+  *Fix.* `TELEMETRY_STACK_BYTES` default in
+  `hal/particle/src/critterchron_particle.cpp:60` is now coupled to
+  `NO_IR_OTA`: 8192 when OTA is enabled, 5120 when stubbed. OTA-capable
+  devices (Photon 2 family, Argon) automatically get the bigger stack;
+  RAM-tight devices (rico/OG Photon, ronaldo/P1) already define
+  `NO_IR_OTA` so they keep the smaller stack and reclaim the 8KB
+  `ir_ota_buf_` along with it. Either knob still device-overridable.
+  The unconditional `boot reset_reason=` log in `loop()` is left in
+  place as cheap permanent diagnostic for the next mystery reboot.
+
+  *Related.* `device_name.h` template comment block on
+  `TELEMETRY_STACK_BYTES` updated to reflect the auto-coupling. This
+  is a third distinct OTA-first-pull failure class — the prior two
+  (oversize blob 2026-04-22 Repro A, inline `ota_detected` POST wedging
+  the tel socket 2026-04-22 Repro B) had different repro signatures
+  (no panic, system thread down) and different fixes already in place.
+  Keeping this entry separate so future grep on `panic data=1` lands
+  here.
+
 - **2026-04-25 — Device-side error channel on the heartbeat.** Landed
   across Particle (photon, photon2, argon) and ESP32-C3 in two phases.
   `hal/ErrLog.{h,cpp}` is a 4-entry ring (~256 B RAM) protected by a

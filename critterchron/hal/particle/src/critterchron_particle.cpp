@@ -58,12 +58,23 @@ static inline uint32_t physics_tick_ms() { return critter_ir::RUNTIME_TICK_MS; }
 #endif
 
 // Telemetry worker stack. The worker does HTTPS-ish TCP + msgpack parse +
-// HMAC-SHA256 signing — deepest call chains measured run ~3KB, so 5KB is
-// 1.5x headroom. Was 10KB historically; dropped for OG Photon's ~80KB
-// user-RAM budget. Bump in a device header if a future consumer (deeper
-// IR-poll, bigger SHA contexts, etc.) pushes the stack harder.
+// HMAC-SHA256 signing. Two regimes:
+//   - With IR-OTA enabled, the blob fetch nests ir_poll → kv_fetch_str_ →
+//     read_response_ deep enough that the streaming-body branch overruns a
+//     5KB stack on Photon 2 and HardFaults the device on first OTA pull
+//     (panic data=1, see the 2026-04-27 rachel investigation). 8KB clears it
+//     with comfortable headroom.
+//   - With NO_IR_OTA, ir_poll() is stubbed to return immediately and the
+//     deep streaming branch is unreachable; 5KB is plenty and the saved
+//     3KB matters on OG Photon / P1's ~80KB user-RAM budget.
+// Auto-couple to NO_IR_OTA so memory-tight devices don't have to remember
+// two overrides. Either knob is still device-overridable in the header.
 #ifndef TELEMETRY_STACK_BYTES
-#define TELEMETRY_STACK_BYTES 5120
+#  ifdef NO_IR_OTA
+#    define TELEMETRY_STACK_BYTES 5120
+#  else
+#    define TELEMETRY_STACK_BYTES 8192
+#  endif
 #endif
 
 // Brightness is a 0..255 scale factor applied per channel at the sink.
@@ -812,6 +823,17 @@ static void draw_ota_streamer(unsigned long now) {
 
 void loop() {
     unsigned long now = millis();
+
+    // One-shot reset_reason log. Fires from loop() (not setup()) so USB CDC
+    // is reliably draining by the time it goes out — early-boot Log.info
+    // calls get dropped if the host's serial monitor hasn't reattached yet.
+    static bool s_logged_reset_reason = false;
+    if (!s_logged_reset_reason && now > 2000) {
+        s_logged_reset_reason = true;
+        Log.info("boot reset_reason=%d data=%lu",
+                 (int)System.resetReason(),
+                 (unsigned long)System.resetReasonData());
+    }
 
 #if defined(LIGHT_SENSOR_TYPE)
     // Ambient light sample @ 5Hz. The sensor gives us a target brightness;
