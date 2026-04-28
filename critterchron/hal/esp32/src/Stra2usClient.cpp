@@ -781,27 +781,27 @@ void Stra2usClient::ir_poll() {
         }
     }
 
-    if (have_sidecar && strcmp(sidecar_sha, ir_loaded_sha_) == 0) {
-        // Sidecar matches loaded — no blob fetch this cycle. Fast path.
-        // Kept silent by design: fires every poll on a stable deployment,
-        // and a log line every 20min just to say "nothing to do" is
-        // noise. Everything beyond this point is OTA activity and gets
-        // breadcrumb logs so a freeze leaves a serial trail of which
-        // phase we reached — see TODO.md "OTA crash — first pull after
-        // boot freezes device" for the failure mode the breadcrumbs
-        // exist to diagnose.
+    // Fast path: sidecar sha matches what we have loaded — no blob fetch.
+    // Compare against the accessor rather than ir_loaded_sha_ directly so
+    // a freshly-flashed device whose compiled-in SCRIPT_SHA equals the
+    // sidecar's sha also short-circuits; otherwise every cold boot would
+    // re-fetch the blob we already have burned into flash. The accessor
+    // returns SCRIPT_SHA when ir_loaded_sha_ is empty (pre-first-OTA).
+    if (have_sidecar && strcmp(sidecar_sha, ir_loaded_sha()) == 0) {
         return;
     }
 
     // OTA candidate: sidecar differs from loaded (or is missing). Announce
-    // the intent on serial so a reader can see we got this far. Loaded
-    // side may be empty (first OTA since boot) — render those as "(none)".
+    // the intent on serial so a reader can see we got this far. On a fresh
+    // boot pre-first-OTA the private ir_loaded_* buffers are empty; fall
+    // back to the compiled-in blob's identity (via the accessor) so the
+    // log shows e.g. `loaded=fraggle@d0920aba` instead of `(none)@00000000`.
     LOG_INFO("ir_poll: OTA candidate %s sidecar=%.8s%s (loaded=%s@%.8s)",
              new_ptr,
              have_sidecar ? sidecar_sha : "none",
              have_size    ? " (sized)" : "",
-             ir_loaded_ptr_[0] ? ir_loaded_ptr_ : "(none)",
-             ir_loaded_sha_[0] ? ir_loaded_sha_ : "00000000");
+             ir_loaded_script(),
+             ir_loaded_sha()[0] ? ir_loaded_sha() : "00000000");
 
     // Pre-fetch size gate. If the sidecar tells us the blob won't fit,
     // don't attempt the fetch — it would either silently fail at the
@@ -831,8 +831,12 @@ void Stra2usClient::ir_poll() {
     // worse than not firing. Legacy no-sidecar path still fetches + applies
     // — it just skips the pre-announcement, as before.
     if (have_sidecar) {
-        const char* from_name = ir_loaded_ptr_[0] ? ir_loaded_ptr_ : "default";
-        const char* from_sha  = ir_loaded_sha_[0] ? ir_loaded_sha_ : "00000000";
+        // Same fallback as the log line above: before the first successful
+        // OTA apply the device is running the compiled-in blob, so report
+        // its real identity as the from= side of ota_detected rather than
+        // a placeholder "default".
+        const char* from_name = ir_loaded_script();
+        const char* from_sha  = ir_loaded_sha()[0] ? ir_loaded_sha() : "00000000";
         strncpy(ir_detected_from_name_, from_name, sizeof(ir_detected_from_name_) - 1);
         ir_detected_from_name_[sizeof(ir_detected_from_name_) - 1] = '\0';
         strncpy(ir_detected_from_sha_,  from_sha,  sizeof(ir_detected_from_sha_)  - 1);
@@ -884,10 +888,12 @@ void Stra2usClient::ir_poll() {
         return;
     }
 
-    if (strcmp(new_sha, ir_loaded_sha_) == 0) {
+    if (strcmp(new_sha, ir_loaded_sha()) == 0) {
         // Content-identical to what's already loaded. This path only runs
         // when the sidecar was missing (otherwise the fast path above
-        // already short-circuited).
+        // already short-circuited). Accessor-based comparison (vs the raw
+        // ir_loaded_sha_ field) also covers the pre-first-OTA case where
+        // the fetched blob is what we already have compiled in.
         return;
     }
     LOG_INFO("ir_poll: staged %s (%u bytes, sha=%.8s...)",

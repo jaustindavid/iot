@@ -100,21 +100,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   Memory ref: `debug_ota_diagnosis_2026-04-28.md` has the full
   rationale and failure→cause table.
 
-- **ESP32 should report the compiled-in program name.** On Particle (bf64551)
-  `ir_loaded_script()` / `ir_loaded_sha()` were migrated to fall back to
-  `critter_ir::SCRIPT_NAME` / `SCRIPT_SHA` when the OTA-loaded fields are
-  empty (i.e. pre-first-OTA), so the heartbeat shows `script=<real-name>@<sha>`
-  instead of `default@00000000`. ESP32's `Stra2usClient.h` / `.cpp` still
-  return the raw fields directly — observed 2026-04-27 with timmy publishing
-  `ota_detected from=default@00000000 to=fraggle@...` instead of
-  `from=<compiled-in>@<sha>`. Migration is mechanical: copy the accessor
-  bodies from `hal/particle/src/Stra2usClient.h:140-150`, swap the four
-  raw-field uses inside `hal/esp32/src/Stra2usClient.cpp` (lines ~712, 732,
-  763, 815) for the accessor calls. While there, also fix the matching
-  pre-first-OTA fast-path comparison so a freshly-flashed ESP32 whose
-  compiled-in sha equals the sidecar's sha short-circuits instead of
-  re-fetching the blob it already has burned in.
-
 - **One-shot device provisioning script.** Breaking out a fresh device is
   currently a 3-step manual sequence that's easy to botch — the too-big
   OTA buffer on ricardo traces directly to copying a similar device's
@@ -770,6 +755,31 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — ESP32 reports compiled-in program name in heartbeat /
+  OTA events.** Mirror of the Particle migration that landed in bf64551.
+  `ir_loaded_script()` / `ir_loaded_sha()` accessors in
+  `hal/esp32/src/Stra2usClient.h` now fall back to
+  `critter_ir::SCRIPT_NAME` / `SCRIPT_SHA` when the OTA-loaded fields
+  are empty, so a pre-first-OTA timmy reports `script=fraggle@d0920aba`
+  in the heartbeat instead of `default@00000000`, and `ota_detected`
+  publishes `from=fraggle@d0920aba` instead of `from=default@00000000`.
+  Four call sites in `hal/esp32/src/Stra2usClient.cpp` updated to use
+  the accessors instead of raw fields:
+  - Sidecar fast-path compare (`ir_poll`): now compares against
+    `ir_loaded_sha()` so a freshly-flashed ESP32 whose compiled-in sha
+    equals the sidecar's sha short-circuits, not re-fetches.
+  - "OTA candidate" log line: shows the compiled-in identity in the
+    `(loaded=...)` field on first poll.
+  - `ota_detected` from-side snapshot: real identity, not "default".
+  - Post-fetch identity check: skips apply if blob content_sha equals
+    the (effective) loaded sha, including the compiled-in case.
+  Write sites in `ir_apply_if_ready` (lines 931-936) intentionally
+  keep raw-field access — they're populating those fields and logging
+  the just-loaded values directly. Required `#include "ir/IrRuntime.h"`
+  in `Stra2usClient.h` for the `critter_ir::SCRIPT_*` externs (already
+  present transitively via the `IR_SCRIPT_NAME_MAX` use, but explicit
+  for symmetry with Particle).
 
 - **2026-04-28 — Closed: re-publish doesn't trigger re-OTA.** Held
   open since 2026-04-21 with a three-branch diagnostic table for

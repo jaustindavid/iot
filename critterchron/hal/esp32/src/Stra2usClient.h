@@ -29,6 +29,13 @@
 #include "creds.h"
 #include "interface/Config.h"
 #include "hmac_sha256.h"
+// Pulled in for critter_ir::SCRIPT_NAME / SCRIPT_SHA — the heartbeat
+// accessors below fall back to them so a flash-only or pre-first-OTA
+// device still reports its real compiled-in script identity instead of
+// `default@00000000` (observed 2026-04-27 on timmy publishing
+// `ota_detected from=default@00000000` despite running compiled-in
+// fraggle). Mirrors hal/particle/src/Stra2usClient.h.
+#include "ir/IrRuntime.h"
 
 class Stra2usClient : public Config {
 public:
@@ -71,8 +78,18 @@ public:
     const char* ir_detected_to_sha()    const { return ir_detected_to_sha_;    }
     size_t      ir_detected_size()      const { return ir_detected_size_;      }
 
-    const char* ir_loaded_script() const { return ir_loaded_ptr_; }
-    const char* ir_loaded_sha()    const { return ir_loaded_sha_; }
+    // Identity of the currently-loaded script. Falls back to the
+    // compiled-in blob's metadata (critter_ir::SCRIPT_NAME, populated
+    // by loadDefault() at boot) when no OTA has applied yet, so a
+    // pre-first-OTA device reports its real script in the heartbeat
+    // (`script=fraggle@d0920aba`) instead of `default@00000000`.
+    // Mirrors hal/particle/src/Stra2usClient.h.
+    const char* ir_loaded_script() const {
+        return ir_loaded_ptr_[0] ? ir_loaded_ptr_ : critter_ir::SCRIPT_NAME;
+    }
+    const char* ir_loaded_sha() const {
+        return ir_loaded_sha_[0] ? ir_loaded_sha_ : critter_ir::SCRIPT_SHA;
+    }
 
 private:
     static constexpr size_t CACHE_CAP = 32;
