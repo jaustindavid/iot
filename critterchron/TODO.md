@@ -4,6 +4,53 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **At IR-poll interval, actively try to bring the network back up if
+  it's down.** Today, `telemetry_worker()`
+  (`hal/particle/src/critterchron_particle.cpp:506`) does
+  `if (!wifi_now) { delay(100); continue; }` and skips the entire
+  iteration — including the IR-poll branch — whenever `WiFi.ready()`
+  reports false. Implication: a device that loses WiFi (AP reboot,
+  RF glitch, network maintenance) waits for the radio stack to
+  recover *on its own*, and no IR pull happens until it does. For
+  short outages that's fine; for longer ones a stuck device is just
+  stuck. Want to use the IR-poll cadence as a heartbeat for "actively
+  attempt reconnection" — every `ir_poll_interval` seconds, if WiFi
+  isn't up, call `WiFi.connect()` (and/or `Particle.connect()` if the
+  cloud thread looks wedged) before deciding to skip.
+
+  *Sketch.* In the tel-worker outer loop, before the `if (!wifi_now)
+  continue` skip, check whether enough time has passed since the
+  last reconnect attempt; if so, kick `WiFi.connect()` and continue
+  looping (give the radio a few seconds to settle). The IR poll
+  interval is a sensible cadence — already user-tunable via
+  `ir_poll_interval`, already the right "wake up periodically and
+  try things" rhythm. Track `last_reconnect_attempt_ms` separate
+  from `last_ir_poll_ms` so the reconnect doesn't piggyback on a
+  successful poll's timestamp.
+
+  *Open questions.*
+  - **Particle's auto-reconnect.** SYSTEM_THREAD(ENABLED) +
+    SYSTEM_MODE(AUTOMATIC) means Particle's system thread already
+    tries to reconnect on its own. Calling `WiFi.connect()` from
+    user code might race with or duplicate that. Worth checking
+    the DeviceOS docs / source for "is it harmful to call
+    `WiFi.connect()` if the system is already reconnecting?" If
+    yes, gate the call on `WiFi.connecting() == false`.
+  - **ESP32 parity.** ESP32 has its own reconnect machinery via
+    `WiFi.onEvent` callbacks. Same idea — periodically force a
+    reconnect attempt — but the API is different. Mirror to
+    `hal/esp32/src/critterchron_esp32.ino` if we land this.
+  - **Visibility.** The reconnect attempt should land in the
+    heartbeat error channel as `err=net:reconnect_kick` or similar,
+    so an operator monitoring fleet health sees "this device tried
+    to reconnect at HH:MM" rather than guessing why a long offline
+    window finally ended.
+
+  Adjacent to the existing "Hotspot-mode fallback when WiFi is
+  unreachable (ESP32)" entry but distinct: that's about *which
+  network* to join after a sustained outage; this is about
+  recovering the *configured* network after a transient one.
+
 - **Time-of-day knobs for brightness / night mode.** Today brightness
   is purely a function of the ambient light sensor: lux (or CDS raw)
   → curve → bri target → Schmitt-triggered night mode. Two real-world
@@ -65,40 +112,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   wanting human-clock-driven authority over the result. Both could
   share a "what's actually driving bri right now?" diagnostic in the
   heartbeat.
-
-- **Mirror ESP32's Connection:close handling + granular OTA breadcrumbs to
-  Particle.** Defensive consistency, not currently bug-fixing. The
-  2026-04-28 ESP32 triage uncovered that arduino-esp32's `WiFiClient::
-  connected()` returns true for a window after the server FINs (uvicorn
-  ASGI sends `Connection: close` after every response), causing
-  `read_response_` to write into a half-closed socket and time out.
-  Fix landed in `hal/esp32/src/Stra2usClient.cpp` — parse the response's
-  Connection header, call our own `close()` after reading the body when
-  the server says `close`, so `ensure_connected_()` opens a fresh socket
-  on the next request.
-
-  Particle's TCPClient currently propagates FIN to `connected()` fast
-  enough that the bug doesn't repro there (rachel pulls cleanly), but the
-  protocol stimulus is identical and a future DeviceOS update or odd
-  network condition could expose it. Same fix applied symmetrically would
-  cost ~10 lines in `hal/particle/src/Stra2usClient.cpp` `read_response_`
-  and gives us identical OTA-fetch semantics across platforms.
-
-  While there, also mirror the granular failure-path breadcrumbs:
-  `kvs req too big`, `kvs ensure_connected failed (2x)`, `kvs send_all
-  failed (2x)`, `kvs status=N`, `kvs msgpack hdr=0xXX`, `kvs payload=N>
-  cap=M` in `kv_fetch_str_`, plus `rr hdr timeout`, `rr bad status line`,
-  `rr body EOF`, `rr 2xx unsigned`, `rr ts drift`, `rr HMAC fail` in
-  `read_response_`. Each `g_errlog.record(ErrCat::OtaFetch, ...)` paired
-  with the matching `Log.warn(...)` (Particle uses Log directly, not
-  the LOG_WARN macro from ESP32). Heartbeat surfaces the specific
-  reason as `err=ota_fetch:<reason>` so a future Photon-2 OTA mystery
-  doesn't have to start from "fetch failed: <key>" again. See
-  `hal/esp32/src/Stra2usClient.cpp` for the exact set of sites and the
-  message format conventions.
-
-  Memory ref: `debug_ota_diagnosis_2026-04-28.md` has the full
-  rationale and failure→cause table.
 
 - **One-shot device provisioning script.** Breaking out a fresh device is
   currently a 3-step manual sequence that's easy to botch — the too-big
@@ -755,6 +768,51 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — Particle Stra2usClient symmetry pass with ESP32 (Connection:close
+  + granular OTA breadcrumbs).** Mirror of the 2026-04-28 ESP32 OTA-triage
+  fixes, applied defensively to Particle even though the Connection:close
+  bug doesn't currently repro there (rachel's TCPClient propagates FIN
+  fast enough). Two parts, landed together but verifiable independently:
+
+  *Part 1 — Connection:close detection + close-after-handle.* In
+  `hal/particle/src/Stra2usClient.cpp::read_response_`, after the body
+  + HMAC verification path, parse the response's `Connection:` header
+  and if it's `close`, call our own `close()` before returning. Stra2us
+  (uvicorn) sends `Connection: close` after every response; without the
+  explicit close on our end, a future DeviceOS update or odd network
+  condition that slowed FIN propagation would put us in the same
+  half-closed-socket state the ESP32 hit on first OTA pull. Inline
+  case-insensitive compare for "close" (no `<strings.h>` dependency)
+  to keep the include surface minimal. Behavior change observable:
+  more TCP reconnects per `ir_poll` (3 closes/3 reconnects vs. 1
+  close at the end), per `poll_all` cycle (~6-7 closes/reconnects).
+  Particle TCP setup ~50-100ms so per-cycle overhead is well under
+  1% wall time. Verification ladder run on rachel: clean compile →
+  reflash → heartbeat lands at 200 → config-poll round-trip
+  (heartbeep flip) → full OTA trio (`detected → matrix → loaded`).
+  All passed; no new `err=ota_fetch:*` records appeared.
+
+  *Part 2 — granular failure-path breadcrumbs.* Twelve sites
+  instrumented. Every `return false` in `kv_fetch_str_` and every
+  `return -1` in `read_response_` now records a specific reason via
+  `g_errlog.record(ErrCat::OtaFetch, ...)` (heartbeat-visible as
+  `err=ota_fetch:<reason>`) paired with `Log.warn(...)` (serial-visible).
+  Specific messages match ESP32's exactly so a fleet-wide grep for
+  `err=ota_fetch:rr ...` or `err=ota_fetch:kvs ...` works regardless
+  of platform. Sites:
+  - `read_response_`: `rr hdr timeout total=N`, `rr bad status line`,
+    `rr body EOF cl=X filled=Y rem=Z`, `rr 2xx unsigned`,
+    `rr ts drift now=A resp=B`, `rr HMAC fail cl=X filled=Y`.
+  - `kv_fetch_str_`: `kvs req too big: N`, `kvs ensure_connected failed (2x)`,
+    `kvs send_all failed (2x)`, `kvs status=N`, `kvs msgpack hdr=0xXX`,
+    `kvs payload=N>cap=M`.
+  Risk: zero behavior change on the happy path; only failure paths
+  add records. If something *does* fire, that's diagnostic information,
+  not a regression.
+
+  Memory ref: `debug_ota_diagnosis_2026-04-28.md` has the failure→cause
+  lookup table; this completes its applicability across both platforms.
 
 - **2026-04-28 — ESP32 reports compiled-in program name in heartbeat /
   OTA events.** Mirror of the Particle migration that landed in bf64551.
