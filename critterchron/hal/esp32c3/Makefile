@@ -42,7 +42,7 @@
 ARDUINO_CLI ?= arduino-cli
 PYTHON      ?= python3
 PLATFORM    := esp32c3
-FQBN        ?= esp32:esp32:esp32c3
+FQBN        ?= esp32:esp32:esp32c3:CDCOnBoot=cdc
 DEVICE      ?= timmy_tanuki
 PORT        ?=
 

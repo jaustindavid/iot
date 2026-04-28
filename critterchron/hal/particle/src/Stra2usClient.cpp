@@ -460,16 +460,22 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
     size_t hdr_len = 0;
     size_t payload_len = 0;
 
+    // Accept both str and bin msgpack types — wire layout is identical
+    // (length prefix + raw bytes), only the type byte differs. Stra2us
+    // serializes large blob values as bin16 (0xc5) on the current server
+    // build (observed 2026-04-28 / timmy/fraggle); smaller / older values
+    // come back as str. The IR blob is ASCII text either way, so accepting
+    // both keeps the device tolerant of either serializer choice.
     if ((b[0] & 0xe0) == 0xa0) {                 // fixstr
         payload_len = b[0] & 0x1f;
         hdr_len = 1;
-    } else if (b[0] == 0xd9) {                   // str8
+    } else if (b[0] == 0xd9 || b[0] == 0xc4) {   // str8 / bin8
         payload_len = b[1];
         hdr_len = 2;
-    } else if (b[0] == 0xda) {                   // str16
+    } else if (b[0] == 0xda || b[0] == 0xc5) {   // str16 / bin16
         payload_len = ((size_t)b[1] << 8) | b[2];
         hdr_len = 3;
-    } else if (b[0] == 0xdb) {                   // str32
+    } else if (b[0] == 0xdb || b[0] == 0xc6) {   // str32 / bin32
         payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
                       ((size_t)b[3] << 8)  |  b[4];
         hdr_len = 5;

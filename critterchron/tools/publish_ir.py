@@ -243,7 +243,18 @@ def main() -> int:
     # the suffix (the `sha_len == 64` gate fails closed on length != 64,
     # which degrades to "miss this poll, retry next cycle" — fail-safe).
     try:
-        client.put(key, blob_bytes)
+        # Pass the str, not blob_bytes: stra2us_cli's `put()` calls
+        # `msgpack.packb(value, use_bin_type=True)`, which serializes
+        # Python `bytes` as msgpack `bin` and Python `str` as msgpack
+        # `str`. The IR blob is semantically text (UTF-8, LF-terminated
+        # per OTA_IR.md), and on-device `kv_fetch_str_` originally only
+        # accepted msgpack `str` types — passing bytes here got the
+        # value stored as bin and made the device reject the fetch.
+        # Devices now also accept bin defensively, but storing as str
+        # is the semantically correct shape and keeps inspection
+        # tools that print the value (admin UI, `stra2us get`) showing
+        # the text rather than a hex dump.
+        client.put(key, blob)
     except Exception as e:
         print(f"error: blob upload failed: {e}", file=sys.stderr)
         return 3

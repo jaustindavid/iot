@@ -4,6 +4,55 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Mirror ESP32's Connection:close handling + granular OTA breadcrumbs to
+  Particle.** Defensive consistency, not currently bug-fixing. The
+  2026-04-28 ESP32 triage uncovered that arduino-esp32's `WiFiClient::
+  connected()` returns true for a window after the server FINs (uvicorn
+  ASGI sends `Connection: close` after every response), causing
+  `read_response_` to write into a half-closed socket and time out.
+  Fix landed in `hal/esp32/src/Stra2usClient.cpp` — parse the response's
+  Connection header, call our own `close()` after reading the body when
+  the server says `close`, so `ensure_connected_()` opens a fresh socket
+  on the next request.
+
+  Particle's TCPClient currently propagates FIN to `connected()` fast
+  enough that the bug doesn't repro there (rachel pulls cleanly), but the
+  protocol stimulus is identical and a future DeviceOS update or odd
+  network condition could expose it. Same fix applied symmetrically would
+  cost ~10 lines in `hal/particle/src/Stra2usClient.cpp` `read_response_`
+  and gives us identical OTA-fetch semantics across platforms.
+
+  While there, also mirror the granular failure-path breadcrumbs:
+  `kvs req too big`, `kvs ensure_connected failed (2x)`, `kvs send_all
+  failed (2x)`, `kvs status=N`, `kvs msgpack hdr=0xXX`, `kvs payload=N>
+  cap=M` in `kv_fetch_str_`, plus `rr hdr timeout`, `rr bad status line`,
+  `rr body EOF`, `rr 2xx unsigned`, `rr ts drift`, `rr HMAC fail` in
+  `read_response_`. Each `g_errlog.record(ErrCat::OtaFetch, ...)` paired
+  with the matching `Log.warn(...)` (Particle uses Log directly, not
+  the LOG_WARN macro from ESP32). Heartbeat surfaces the specific
+  reason as `err=ota_fetch:<reason>` so a future Photon-2 OTA mystery
+  doesn't have to start from "fetch failed: <key>" again. See
+  `hal/esp32/src/Stra2usClient.cpp` for the exact set of sites and the
+  message format conventions.
+
+  Memory ref: `debug_ota_diagnosis_2026-04-28.md` has the full
+  rationale and failure→cause table.
+
+- **ESP32 should report the compiled-in program name.** On Particle (bf64551)
+  `ir_loaded_script()` / `ir_loaded_sha()` were migrated to fall back to
+  `critter_ir::SCRIPT_NAME` / `SCRIPT_SHA` when the OTA-loaded fields are
+  empty (i.e. pre-first-OTA), so the heartbeat shows `script=<real-name>@<sha>`
+  instead of `default@00000000`. ESP32's `Stra2usClient.h` / `.cpp` still
+  return the raw fields directly — observed 2026-04-27 with timmy publishing
+  `ota_detected from=default@00000000 to=fraggle@...` instead of
+  `from=<compiled-in>@<sha>`. Migration is mechanical: copy the accessor
+  bodies from `hal/particle/src/Stra2usClient.h:140-150`, swap the four
+  raw-field uses inside `hal/esp32/src/Stra2usClient.cpp` (lines ~712, 732,
+  763, 815) for the accessor calls. While there, also fix the matching
+  pre-first-OTA fast-path comparison so a freshly-flashed ESP32 whose
+  compiled-in sha equals the sidecar's sha short-circuits instead of
+  re-fetching the blob it already has burned in.
+
 - **One-shot device provisioning script.** Breaking out a fresh device is
   currently a 3-step manual sequence that's easy to botch — the too-big
   OTA buffer on ricardo traces directly to copying a similar device's
@@ -721,6 +770,80 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — OTA pipeline triage on timmy: three bugs under one
+  symptom.** After the 2026-04-27 stack fix unblocked rachel, ESP32
+  (timmy) showed the same surface-level "OTA pull doesn't progress"
+  but for entirely different reasons. Two distinct root causes shook
+  out of the diagnostic round-trip, plus a publisher-side bug that
+  affected every device class. Worth its own entry because the
+  symptoms looked identical to the 2026-04-27 stack overflow at first
+  pass and the troubleshooting path required several reflash cycles
+  to disambiguate. Memory `debug_ota_diagnosis_2026-04-28.md` has the
+  full red-herring list and failure→cause lookup table. The three
+  bugs:
+
+  *Bug A — ESP32 stale socket on server-sent `Connection: close`.*
+  Stra2us (uvicorn ASGI) responds with `Connection: close` and FINs
+  after every request. arduino-esp32's `WiFiClient::connected()`
+  returns true for a window after the FIN, so `ensure_connected_()`
+  reuses the half-closed socket; `tcp_.write()` succeeds (local TCP
+  buffer accepts), the server never sees the request, and
+  `read_response_` times out at total=0. Manifested as
+  `err=ota_fetch:rr hdr timeout total=0` in the heartbeat error
+  channel. Fix: `read_response_` parses the response's Connection
+  header; on `close`, calls our own `close()` after returning the
+  body. Next request reconnects fresh. Mirrored defensively to
+  Particle, where the same protocol stimulus might bite under
+  different DeviceOS or network conditions even though it currently
+  doesn't repro.
+
+  *Bug B — Publisher serialized blob as msgpack `bin`, devices
+  only accepted `str`.* `tools/publish_ir.py:246` did
+  `client.put(key, blob_bytes)`. `stra2us_cli.client.put()` calls
+  `msgpack.packb(value, use_bin_type=True)`, so Python `bytes` →
+  msgpack `bin` (0xc4/c5/c6) and Python `str` → msgpack `str`
+  (0xd9/da/db). On-device `kv_fetch_str_` only accepted str types
+  and silently rejected bin. The IR blob is semantically text
+  (UTF-8 LF-terminated per OTA_IR.md), so the publisher should
+  have been passing the str. Smaller values (the sidecar string)
+  came back as str by virtue of being Python str, which is why
+  sidecar fetch worked while blob fetch failed. Manifested as
+  `err=ota_fetch:kvs msgpack hdr=0xc5`. Fixes (defense in depth):
+  (a) `publish_ir.py` now passes `blob` (str) to `client.put`,
+  (b) both Particle and ESP32 `kv_fetch_str_` widened to accept
+  bin types alongside str — wire layout is identical, only the
+  type byte differs, so the change is one extra `||` per branch.
+  Already-published-as-bin scripts need a `--force` re-publish to
+  flip their stored encoding to str; new firmware doesn't strictly
+  need that since it now accepts both, but re-publishing keeps
+  inspection tools (admin UI, `stra2us get`) showing the value as
+  text rather than a hex dump.
+
+  *Bug C (also resolved 2026-04-27, see entry below).* Tel-thread
+  stack overflow on Photon 2 — referenced here for completeness;
+  it manifested on rachel before timmy was even tested. ESP32
+  didn't see this one because its task stack default is larger.
+
+  *Diagnostic plumbing landed alongside the fixes.* Each `return
+  false` in `kv_fetch_str_` and each `return -1` in `read_response_`
+  on ESP32 now records a specific reason via `g_errlog.record()`
+  (heartbeat-visible) and `LOG_WARN` (serial-visible). The granular
+  breadcrumbs (`kvs req too big`, `kvs ensure_connected failed`,
+  `kvs send_all failed`, `kvs status=N`, `kvs msgpack hdr=0xXX`,
+  `kvs payload=N>cap=M`, `rr hdr timeout total=N`, `rr bad status
+  line`, `rr body EOF cl=X filled=Y rem=Z`, `rr 2xx unsigned`,
+  `rr ts drift now=A resp=B`, `rr HMAC fail cl=X filled=Y`)
+  are deliberately verbose because the previous "everything maps
+  to outer `fetch failed: <key>`" was useless for diagnosis. Cost
+  ~12 lines of code; saved hours on this triage and will save
+  more on the next.
+
+  *ESP32-C3 USB-CDC fix as side-quest.* Native USB Serial was
+  silent until we flipped the FQBN in `hal/esp32c3/Makefile` from
+  `esp32:esp32:esp32c3` to `esp32:esp32:esp32c3:CDCOnBoot=cdc`.
+  Default Arduino-ESP32 menu option targets UART0 pins, not native
+  USB. Worth knowing for future ESP32-C3 / S3 device bring-up.
 
 - **2026-04-27 — OTA HardFault on first pull (rachel) — tel-thread stack
   overflow.** Symptom: Photon 2 ran compiled-in scripts indefinitely

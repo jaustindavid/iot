@@ -89,7 +89,11 @@
 // #define NO_IR_OTA
 //
 // TELEMETRY_STACK_BYTES — stack for the Stra2us telemetry thread. Default
-// 5120. Lower if you've profiled the thread's peak usage and have headroom.
+// is auto-coupled to NO_IR_OTA: 8192 when IR-OTA is enabled (the blob fetch
+// nests deep enough to overrun a smaller stack and HardFault on first pull
+// — see debug log around 2026-04-27 / rachel), 5120 when NO_IR_OTA stubs
+// out the deep streaming branch. Override here only if you've profiled
+// peak usage on this specific device and have a reason to deviate.
 // #define TELEMETRY_STACK_BYTES 5120
 
 // --- Debug ---

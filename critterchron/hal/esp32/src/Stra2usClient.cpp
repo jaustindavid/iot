@@ -211,11 +211,19 @@ int Stra2usClient::read_response_(const char* uri,
         }
         delay(10);
     }
-    if (!strstr(buf, "\r\n\r\n")) { close(); return -1; }
+    if (!strstr(buf, "\r\n\r\n")) {
+        LOG_WARN("read_response_: header timeout total=%d", total);
+        g_errlog.record(ErrCat::OtaFetch, "rr hdr timeout total=%d", total);
+        close(); return -1;
+    }
 
     int status = -1;
     const char* sp = strchr(buf, ' ');
-    if (!sp) { close(); return -1; }
+    if (!sp) {
+        LOG_WARN("read_response_: malformed status line");
+        g_errlog.record(ErrCat::OtaFetch, "rr bad status line");
+        close(); return -1;
+    }
     status = atoi(sp + 1);
 
     int content_length = 0;
@@ -243,6 +251,20 @@ int Stra2usClient::read_response_(const char* uri,
     };
     copy_header("x-response-timestamp:", resp_ts,  sizeof(resp_ts));
     copy_header("x-response-signature:", resp_sig, sizeof(resp_sig));
+
+    // Detect server-side close. Stra2us (uvicorn / ASGI) responds with
+    // `Connection: close` after every request — at that point the server
+    // FINs the socket and our cached connection is dead-on-next-write.
+    // arduino-esp32's WiFiClient::connected() doesn't notice until the FIN
+    // has fully propagated locally, so the next ensure_connected_() will
+    // happily reuse a half-closed socket: tcp_.write() succeeds into the
+    // local buffer, the server never sees the request, and read_response_
+    // times out with total=0 (observed on timmy 2026-04-28). Honor the
+    // header by closing our end after we've finished reading the body —
+    // ensure_connected_() then opens a fresh socket on the next call.
+    char resp_conn[16] = {0};
+    copy_header("connection:", resp_conn, sizeof(resp_conn));
+    bool server_will_close = (strcasecmp(resp_conn, "close") == 0);
 
     const char* hdr_end = strstr(buf, "\r\n\r\n");
     int hdr_len    = (int)(hdr_end - buf) + 4;
@@ -281,7 +303,14 @@ int Stra2usClient::read_response_(const char* uri,
                 int space = (int)body_out_len - 1 - body_filled;
                 int to_read = remaining < space ? remaining : space;
                 int n = tcp_.read((uint8_t*)(body_out + body_filled), to_read);
-                if (n <= 0) { close(); return -1; }
+                if (n <= 0) {
+                    LOG_WARN("read_response_: body read EOF status=%d cl=%d filled=%d rem=%d",
+                             status, content_length, body_filled, remaining);
+                    g_errlog.record(ErrCat::OtaFetch,
+                                    "rr body EOF cl=%d filled=%d rem=%d",
+                                    content_length, body_filled, remaining);
+                    close(); return -1;
+                }
                 if (verify) hmac_sha256_update(&hctx,
                                                (const uint8_t*)(body_out + body_filled),
                                                (size_t)n);
@@ -314,12 +343,20 @@ int Stra2usClient::read_response_(const char* uri,
     // the headers were absent we fail closed. For non-2xx we return the
     // status as-is so callers can see 4xx/5xx normally.
     if (status >= 200 && status < 300) {
-        if (!verify) { close(); return -1; }
+        if (!verify) {
+            LOG_WARN("read_response_: 2xx but unsigned ts=%d sig=%d",
+                     (int)(resp_ts[0] != '\0'), (int)(resp_sig[0] != '\0'));
+            g_errlog.record(ErrCat::OtaFetch, "rr 2xx unsigned");
+            close(); return -1;
+        }
 
         // Drift window mirrors the server's request check (±300s).
         long ts_val = atol(resp_ts);
         long now    = (long)::time(nullptr);
         if (now > 0 && (now - ts_val > 300 || ts_val - now > 300)) {
+            LOG_WARN("read_response_: ts drift now=%ld resp=%ld", now, ts_val);
+            g_errlog.record(ErrCat::OtaFetch,
+                            "rr ts drift now=%ld resp=%ld", now, ts_val);
             close(); return -1;
         }
 
@@ -333,9 +370,19 @@ int Stra2usClient::read_response_(const char* uri,
         mac_hex[64] = '\0';
 
         if (!hex_equal_(mac_hex, resp_sig)) {
+            LOG_WARN("read_response_: HMAC mismatch cl=%d filled=%d ours=%.8s theirs=%.8s",
+                     content_length, body_filled, mac_hex, resp_sig);
+            g_errlog.record(ErrCat::OtaFetch,
+                            "rr HMAC fail cl=%d filled=%d",
+                            content_length, body_filled);
             close(); return -1;
         }
     }
+
+    // Server told us it's closing — drop our end too so the next request
+    // doesn't try to reuse a half-closed socket. See Connection-close note
+    // above the copy_header() call.
+    if (server_will_close) close();
 
     return status;
 }
@@ -499,42 +546,67 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
         "Connection: keep-alive\r\n"
         "\r\n",
         uri, host_, port_, client_id_, (unsigned long)ts, sig);
-    if (req_len >= (int)sizeof(req)) return false;
+    if (req_len >= (int)sizeof(req)) {
+        g_errlog.record(ErrCat::OtaFetch, "kvs req too big: %d", req_len);
+        return false;
+    }
 
+    bool sent = false;
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!ensure_connected_()) { delay(100); continue; }
-        if (send_all_(req, req_len)) break;
-        if (attempt == 1) return false;
+        if (send_all_(req, req_len)) { sent = true; break; }
+        if (attempt == 1) {
+            g_errlog.record(ErrCat::OtaFetch, "kvs send_all failed (2x)");
+            return false;
+        }
+    }
+    if (!sent) {
+        g_errlog.record(ErrCat::OtaFetch, "kvs ensure_connected failed (2x)");
+        return false;
     }
 
     // read_response_ fills buf with raw body bytes (and null-terminates at
     // the byte after the last filled byte). For msgpack str we then strip
     // the header in place.
     int status = read_response_(uri, buf, buf_cap);
-    if (status != 200) return false;
+    if (status != 200) {
+        g_errlog.record(ErrCat::OtaFetch, "kvs status=%d", status);
+        return false;
+    }
 
     uint8_t* b = (uint8_t*)buf;
     size_t hdr_len = 0;
     size_t payload_len = 0;
 
+    // Accept both str and bin msgpack types — wire layout is identical
+    // (length prefix + raw bytes), only the type byte differs. Stra2us
+    // serializes large blob values as bin16 (0xc5) on the current server
+    // build (observed 2026-04-28 / timmy/fraggle); smaller values come
+    // back as str. The IR blob is ASCII text either way, so accepting
+    // both keeps the device tolerant of either serializer choice.
     if ((b[0] & 0xe0) == 0xa0) {                 // fixstr
         payload_len = b[0] & 0x1f;
         hdr_len = 1;
-    } else if (b[0] == 0xd9) {                   // str8
+    } else if (b[0] == 0xd9 || b[0] == 0xc4) {   // str8 / bin8
         payload_len = b[1];
         hdr_len = 2;
-    } else if (b[0] == 0xda) {                   // str16
+    } else if (b[0] == 0xda || b[0] == 0xc5) {   // str16 / bin16
         payload_len = ((size_t)b[1] << 8) | b[2];
         hdr_len = 3;
-    } else if (b[0] == 0xdb) {                   // str32
+    } else if (b[0] == 0xdb || b[0] == 0xc6) {   // str32 / bin32
         payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
                       ((size_t)b[3] << 8)  |  b[4];
         hdr_len = 5;
     } else {
+        g_errlog.record(ErrCat::OtaFetch, "kvs msgpack hdr=0x%02x", b[0]);
         return false;
     }
 
-    if (hdr_len + payload_len > buf_cap - 1) return false;
+    if (hdr_len + payload_len > buf_cap - 1) {
+        g_errlog.record(ErrCat::OtaFetch, "kvs payload=%u>cap=%u",
+                        (unsigned)(hdr_len + payload_len), (unsigned)(buf_cap - 1));
+        return false;
+    }
 
     // Shift payload to the start of the buffer, null-terminate.
     if (hdr_len > 0) memmove(buf, buf + hdr_len, payload_len);
