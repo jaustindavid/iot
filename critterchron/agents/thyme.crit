@@ -10,9 +10,9 @@
 
 --- colors ---
 red:     (255, 0, 0)    # unused — ladybug's color comes from the `ladybug` entry below
-leaf:    (0, 128, 0)    # the tint an aphid paints
+leaf:    (0, 160, 0)    # the tint an aphid paints
 brightleaf:   (8, 160, 8)  # agent body color
-aphid: cycle leaf 20, brightleaf 5
+aphid: cycle leaf 40, brightleaf 1
 ladybug: (255, 0, 0)    # agent body color
 black:   (0, 0, 0)      # nest landmark color (invisible background)
 
@@ -36,11 +36,12 @@ ladybug starts at (max_x,0), state = running
 spawn aphid at nest every 10 ticks when missing
 
 --- simulation ---
-tick rate: 125ms
+tick rate: 125ms # 8/sec
 
 --- pathfinding ---
 aphid:
-  max nodes: 64
+  max nodes: 32
+  plan horizon: 16
   step rate: 3
   diagonal: allowed
   diagonal_cost: 3
@@ -48,6 +49,7 @@ aphid:
 
 ladybug:
   max nodes: 256
+  plan horizon: 2
   step rate: 2
   diagonal: allowed
   diagonal_cost: 1.414

@@ -231,9 +231,19 @@ Physics tick period. Render ticks are decoupled (50Hz on hardware).
 
 ### `--- pathfinding ---`
 
-Top-level and per-agent A\* options. Top-level accepts only `diagonal` and
-`diagonal_cost`. Per-agent blocks (indented under `agent_name:` or `all:`)
-accept everything:
+A\* options live at two scopes:
+
+- **Top-level** (unindented): only `diagonal` and `diagonal_cost`. Apply
+  to every agent unless overridden.
+- **Per-agent block** (`agent_name:` header, indented body): any key from
+  the table below. The header `all:` is a reserved pseudo-agent — its
+  values act as a fallback for any agent that doesn't have its own block,
+  so it's the right place for fleet-wide defaults that aren't legal at
+  top level (`max nodes`, `step rate`, etc.).
+
+Lookup order, first hit wins: `per_agent[<name>]` → `per_agent["all"]`
+→ top-level (for `diagonal` / `diagonal_cost` only) → hardcoded engine
+default.
 
 ```
 all:
@@ -246,12 +256,24 @@ ladybug:
   step rate: 2
   penalty lit cell: 1.5
   penalty occupied cell: 3
+  plan horizon: 8
+  drunkenness: 0.2
 ```
 
-Lookup chain: `per_agent[name]` → `per_agent["all"]` → top-level (for
-`diagonal`/`diagonal_cost` only) → hardcoded default. `diagonal: allowed`
-requires `diagonal_cost`; setting `diagonal_cost` without `diagonal:
-allowed` is a compile error.
+`diagonal: allowed` requires `diagonal_cost`; setting `diagonal_cost`
+without `diagonal: allowed` is a compile error. The pair must appear at
+the same scope (both top-level or both inside the same per-agent block).
+
+| Key | Form | Range / values | Notes |
+|---|---|---|---|
+| `max nodes` (alias `max_nodes`) | int | positive | A\* node-expansion budget per seek. Higher = farther reach, more CPU. |
+| `step rate` (alias `step_rate`) | int | positive | Ticks between agent moves. `1` = move every physics tick; `2` = every other; etc. |
+| `diagonal` | `allowed` \| `disallowed` | — | Whether 8-connected moves are legal. Top-level OR per-agent. |
+| `diagonal cost` (alias `diagonal_cost`) | float | positive | A\* cost weight on diagonal steps. Required iff `diagonal: allowed`. Typically `1.414` (≈√2). Top-level OR per-agent. |
+| `penalty lit cell` (alias `penalty_lit`) | numeric | ≥ 0 | Extra A\* cost for stepping onto a lit (state=1) tile. Used to discourage walking through the clock face. |
+| `penalty occupied cell` (alias `penalty_occupied`) | numeric | ≥ 0 | Extra A\* cost for stepping onto a non-painter agent's cell. Encourages flowing around peers instead of through them. |
+| `plan horizon` (alias `plan_horizon`) | int | ≥ 1 | Number of cached A\* steps the agent consumes before replanning. `1` (default) replans every move; higher amortizes A\* across multiple steps. Clamped to `[1, PLAN_MAX]` on-device — values above the cap silently saturate. |
+| `drunkenness` | float | `0.0`–`1.0` | Probability of perturbing a planned step. Half the perturbations freeze the agent for one tick; the other half stagger orthogonally to the planned move. A\* itself stays deterministic, so goal convergence is preserved — only the walk is noisy. `0.0` (default) is sober planner-optimal motion; `~0.2` reads as "looks biological"; `1.0` perturbs every tick. Top-level not allowed (per-script personality knob). |
 
 ### `--- behavior ---`
 

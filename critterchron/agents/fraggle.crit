@@ -39,7 +39,7 @@ night:
   bright_y: (0, 0, 0)
   dull_y: (0, 0, 0)
   idle_y: (0, 0, 0)
-  brick: (0, 1, 0)
+  brick: (0, 64, 0)
   heap: ramp (0, 0, 0)
 
 --- landmarks ---
@@ -132,7 +132,7 @@ doozer:
     if missing:
       seek missing timeout 30
       if on missing:
-        draw brick fade 2500 # 1000s
+        draw brick hold 2500 # 1000s
         pause 2
         set state = idle
         done

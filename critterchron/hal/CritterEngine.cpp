@@ -2056,11 +2056,21 @@ void CritterEngine::render(float blend) {
             if (t.age_max == 0xFFFF || t.age_max == 0 || t.hold_mode) {
                 put(x, y, t.r, t.g, t.b);
             } else {
+                // Fade-pass channel scale. Mirrors NeoPixelSink::scale_ch's
+                // contract: a non-zero source channel stays at >=1 through
+                // the entire fade window, falling to 0 only when state
+                // flips off at age=0. Without the floor-clamp, low-channel
+                // night-palette colors (e.g. brick (0, 1, 0)) truncate to
+                // 0 for any q8 < 256 — the channel disappears one tick
+                // into the fade rather than gracefully dimming. Observed
+                // 2026-04-28 on fraggle's brick at night.
                 uint16_t q8 = (uint16_t)(((uint32_t)t.age << 8) / t.age_max);
-                put(x, y,
-                    (uint8_t)(((uint16_t)t.r * q8) >> 8),
-                    (uint8_t)(((uint16_t)t.g * q8) >> 8),
-                    (uint8_t)(((uint16_t)t.b * q8) >> 8));
+                auto fade_ch = [q8](uint8_t c) -> uint8_t {
+                    if (c == 0) return 0;
+                    uint16_t s = ((uint16_t)c * q8) >> 8;
+                    return s ? (uint8_t)s : 1;
+                };
+                put(x, y, fade_ch(t.r), fade_ch(t.g), fade_ch(t.b));
             }
         }
     }

@@ -1,0 +1,33 @@
+--- colors ---
+time:  (0, 255, 0)
+black: (0, 0, 0)
+rando: (0, 0, 0)
+
+--- landmarks ---
+nest: black
+  (0, 0)
+trap:  black
+  (max_x, max_y)
+
+--- agents ---
+up to 10 rando
+# rando starts at (0, 0)
+
+--- spawning ---
+spawn rando at nest every 1 ticks when missing
+
+--- simulation ---
+tick rate: 10ms # 100/sec
+
+--- behavior ---
+rando:
+  wander
+  if on missing:
+    draw time fade 3000 # 30 secs
+  if on current:
+    draw time fade 3000 # 30 secs
+  if on extra:
+    erase 
+  if on trap:
+    despawn
+  done

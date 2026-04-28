@@ -4,6 +4,99 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Time-of-day knobs for brightness / night mode.** Today brightness
+  is purely a function of the ambient light sensor: lux (or CDS raw)
+  → curve → bri target → Schmitt-triggered night mode. Two real-world
+  failure modes argue for a time-of-day overlay on top:
+  1. **Bedside display at night.** A nightstand panel may sit in a
+     dim-but-not-pitch-black room — sensor reads bri=4, panel renders
+     at perceptible levels, but the human asleep next to it wants a
+     *much* dimmer or off panel during sleep hours regardless of
+     ambient. Today there's no way to say "between 11pm and 7am, cap
+     max_bri at 1, regardless of sensor."
+  2. **Workspace where bright-natural-light-via-windows during the
+     day biases the curve unrealistically.** A panel facing a window
+     during morning sun saturates lux high and then never adjusts
+     back down through the working day as the sun moves. Wanting
+     "max_bri=24 1pm-6pm regardless of sensor" is a different shape
+     of need but the same plumbing.
+  Both cases are solved by letting the panel's effective `max_bri`
+  (and possibly `min_bri`, `night_enter`, `night_exit`) be
+  time-of-day-modulated — the sensor still controls the *position*
+  on the curve but the curve's endpoints can shift through the day.
+
+  *Sketch of an interface, not a commitment.* A schedule string in
+  Stra2us KV, parsed once on cache update, evaluated against
+  `clock_.wall_now()` each time the brightness loop reads
+  `max_brightness`:
+  ```
+  brightness_schedule = "23:00-07:00:1, 07:00-09:00:8, 09:00-23:00:64"
+  ```
+  Each segment is `HH:MM-HH:MM:max_bri`; gaps fall through to the
+  device-header default. Wraps midnight via the segment ordering. A
+  parallel `night_force_schedule` could pin the engine into night
+  mode for a window even if bri stays above the Schmitt threshold,
+  for the bedroom case.
+
+  *Open questions.*
+  - Granularity: per-device only, per-device-with-app-fallback, or a
+    single fleet-wide schedule? Per-device most flexible but a pain
+    to manage; the heartbeep / cloud_heartbeep precedent suggests
+    `<app>/<device>/<key>` first then `<app>/<key>`.
+  - Edge transitions: hard cut at the segment boundary, or smooth
+    interpolation between segments? EMA on top of the light sensor
+    smoothing already (50× damping); a hard schedule cut would
+    propagate as a 50-tick fade naturally. Probably fine.
+  - DST / timezone: schedule is local-wall-clock, evaluated through
+    the existing `CritTimeSource::zone_offset_hours()`. WobblyTime
+    would wobble the schedule too — undesirable for "11pm bedtime"
+    semantics. Probably want to evaluate against the *real* time
+    source (un-wobbled), which means exposing the inner clock from
+    WobblyTimeSource or routing the schedule check around it.
+  - Discoverability: today a confused operator can grep `bri=` in a
+    heartbeat and see what the panel thinks. With a schedule active,
+    a richer heartbeat field like `bri=(min<cur<max @schedid)` or
+    `bri_src=schedule|sensor|override` would name *why* the panel is
+    where it is.
+
+  Loosely related to TODO entry "Light-sensor calibration poisons
+  itself; only reflash recovers" — that's about the sensor mapping
+  collapsing in stable lux conditions; this is about the operator
+  wanting human-clock-driven authority over the result. Both could
+  share a "what's actually driving bri right now?" diagnostic in the
+  heartbeat.
+
+- **`fade` should clamp non-zero channels to 1 until age=0, not
+  truncate them mid-fade.** The render pass at
+  `hal/CritterEngine.cpp:2058-2064` does a Q8 quantization
+  `(t.r * q8) >> 8` over each channel and stores the result back
+  to the framebuffer. For low-channel-value night colors like
+  `brick: (0, 1, 0)`, channel value 1 truncates to 0 for any
+  `q8 < 256` — i.e., every fade tick except the very first.
+  `scale_ch` at the sink-side has a 1-floor for exactly this
+  reason ("if input was non-zero, keep at least 1"); the fade
+  pass should mirror that contract. Proposed shape:
+  ```cpp
+  auto fade_ch = [q8](uint8_t c) -> uint8_t {
+      if (c == 0) return 0;
+      uint16_t s = ((uint16_t)c * q8) >> 8;
+      return s ? (uint8_t)s : 1;
+  };
+  put(x, y, fade_ch(t.r), fade_ch(t.g), fade_ch(t.b));
+  ```
+  Trade: a tile painted with `draw <name> fade N` and channel
+  value 1 will sit at intensity 1 for the full N ticks then
+  vanish at age=0 — visually the same as `hold`. That's the
+  right answer for night palettes where channel-1 means "this
+  is the dim version, don't optimize me away." Bright-channel
+  fades behave unchanged.
+  Mirror to `engine.py` for sim parity. Add a fixture in
+  `agents/tests/` that paints a `(0, 1, 0)` tile with
+  `fade 100` and asserts the cell remains lit through ticks
+  1..99. (The corresponding fixture for the day case ought to
+  show the gradient — same opcode, different visual outcome
+  by design.)
+
 - **Mirror ESP32's Connection:close handling + granular OTA breadcrumbs to
   Particle.** Defensive consistency, not currently bug-fixing. The
   2026-04-28 ESP32 triage uncovered that arduino-esp32's `WiFiClient::

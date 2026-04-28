@@ -82,9 +82,17 @@ class CritterRenderer:
                 if (tile.age_max != 0xFFFF and tile.age_max > 0
                         and not tile.hold_mode):
                     fade = tile.age / tile.age_max
-                    base_r *= fade
-                    base_g *= fade
-                    base_b *= fade
+                    # Floor-clamp non-zero channels to 1 — mirror of the
+                    # C++ engine's fade_ch (CritterEngine.cpp render
+                    # branch) and NeoPixelSink::scale_ch's contract:
+                    # nonzero in → at-least-1 out, until the tile flips
+                    # off at age=0. Without it, a night-palette `(0, 1,
+                    # 0)` brick faded with `fade N` truncates green to 0
+                    # one tick into the fade and the tile goes dark for
+                    # the rest of N — observed and fixed 2026-04-28.
+                    base_r = max(base_r * fade, 1.0) if base_r > 0 else 0.0
+                    base_g = max(base_g * fade, 1.0) if base_g > 0 else 0.0
+                    base_b = max(base_b * fade, 1.0) if base_b > 0 else 0.0
                 tile_r = base_r * self.tile_alphas[x][y]
                 tile_g = base_g * self.tile_alphas[x][y]
                 tile_b = base_b * self.tile_alphas[x][y]

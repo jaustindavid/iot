@@ -43,6 +43,17 @@ public:
         // blobs look identical across ports), so keep FastLED's global
         // multiplier at full and let our scale_ch do the floor-preserve.
         FastLED.setBrightness(255);
+        // Disable temporal dithering. With BINARY_DITHER (FastLED's
+        // default) low per-channel PWM values get pulsed off most frames
+        // to time-average toward sub-PWM-1 targets. That suppresses the
+        // pixels scale_ch's floor-preserve was designed to keep visible:
+        // a value of 1 reads on Particle/NeoPixelBus (no dithering) but
+        // dithers to mostly-off on FastLED, producing platform-divergent
+        // night-palette behavior (observed 2026-04-28: rachel renders
+        // night brick (0,1,0) as a clear green dot, timmy renders it as
+        // dark — same blob, same scale_ch). Same fleet, same intent —
+        // disable dithering so what scale_ch writes is what the LED gets.
+        FastLED.setDither(DISABLE_DITHER);
         FastLED.clear(true);
     }
 
