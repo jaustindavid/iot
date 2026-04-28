@@ -66,37 +66,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   share a "what's actually driving bri right now?" diagnostic in the
   heartbeat.
 
-- **`fade` should clamp non-zero channels to 1 until age=0, not
-  truncate them mid-fade.** The render pass at
-  `hal/CritterEngine.cpp:2058-2064` does a Q8 quantization
-  `(t.r * q8) >> 8` over each channel and stores the result back
-  to the framebuffer. For low-channel-value night colors like
-  `brick: (0, 1, 0)`, channel value 1 truncates to 0 for any
-  `q8 < 256` — i.e., every fade tick except the very first.
-  `scale_ch` at the sink-side has a 1-floor for exactly this
-  reason ("if input was non-zero, keep at least 1"); the fade
-  pass should mirror that contract. Proposed shape:
-  ```cpp
-  auto fade_ch = [q8](uint8_t c) -> uint8_t {
-      if (c == 0) return 0;
-      uint16_t s = ((uint16_t)c * q8) >> 8;
-      return s ? (uint8_t)s : 1;
-  };
-  put(x, y, fade_ch(t.r), fade_ch(t.g), fade_ch(t.b));
-  ```
-  Trade: a tile painted with `draw <name> fade N` and channel
-  value 1 will sit at intensity 1 for the full N ticks then
-  vanish at age=0 — visually the same as `hold`. That's the
-  right answer for night palettes where channel-1 means "this
-  is the dim version, don't optimize me away." Bright-channel
-  fades behave unchanged.
-  Mirror to `engine.py` for sim parity. Add a fixture in
-  `agents/tests/` that paints a `(0, 1, 0)` tile with
-  `fade 100` and asserts the cell remains lit through ticks
-  1..99. (The corresponding fixture for the day case ought to
-  show the gradient — same opcode, different visual outcome
-  by design.)
-
 - **Mirror ESP32's Connection:close handling + granular OTA breadcrumbs to
   Particle.** Defensive consistency, not currently bug-fixing. The
   2026-04-28 ESP32 triage uncovered that arduino-esp32's `WiFiClient::
@@ -280,35 +249,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   2026-04-27 publish/point cleanup which removed the deprecated alias). The device-side error-channel-on-heartbeat follow-up is
   still the right-sized fix (see entry above) — this was the
   short-loop papercut close.
-- **Re-publish doesn't trigger re-OTA.** ~~Investigation open — see
-  three-branch diagnostic below.~~ **Root cause identified 2026-04-21**:
-  blob size grew past `IR_OTA_BUFFER_BYTES` (8192), device rejected
-  fetch at `Stra2usClient.cpp:472`, failure logged on serial only so
-  publisher saw no signal. Short-loop fix captured in the "publish
-  warns when blob exceeds OTA buffer size" entry above; right-sized
-  fix is the device-side error channel on the heartbeat. Keeping the
-  historical three-branch diagnostic below for future observers who
-  hit the same symptom from a different cause:
-  (a) content_sha actually identical — working as designed per the
-  comment at `Stra2usClient.cpp:588` ("content_sha shifts on source
-  edits AND on encoder behavior changes, but NOT on pure republishes
-  of the same source"). A whitespace-only or comment-only edit that
-  the compiler canonicalizes away genuinely produces identical content.
-  Not a bug; surprising.
-  (b) content_sha changed but sidecar didn't update — publisher bug,
-  the sidecar write after the blob write either failed silently or
-  raced with the blob.
-  (c) sidecar updated but device didn't pick it up — either the poll
-  interval is longer than the observer expected, the blob exceeded
-  the OTA buffer (the 2026-04-21 case), or the fast-path compare at
-  `ir_poll()` lines 603-607 is reading stale values.
-  Diagnostic: publish, then directly inspect the three KV entries
-  (`<app>/scripts/<name>`, `<app>/scripts/<name>/sha`,
-  `<app>/<device>/ir`) via admin read and compare against the device's
-  `ir_loaded_sha_` from a heartbeat. Three-way comparison names the
-  branch. `publish_ir.py --force` smoke also useful — if `--force`
-  re-OTAs but plain publish doesn't, it's a content-identity issue
-  (branch a), not transport.
 - **OTA freeze — "grid frozen, device online, colors still cycle".**
   Intermittent, affects all hardware types (shared HAL code, not
   platform glue). Signature: physics layer wedges (agents stop
@@ -332,39 +272,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   future-class hang resets the device with a clear panic code rather
   than wedging silently.
 
-- **Device registers loaded sha back to Stra2us on successful OTA.**
-  ~~Today the only fleet-visibility signal for "what sha is this
-  device actually running" is the heartbeat (`script=<name>@<sha
-  _prefix>`) which fires every heartbeep interval.~~ **Partially
-  addressed 2026-04-23** via the lighter-weight heartbeat-nudge
-  approach: on successful `ir_apply_if_ready()` → `engine.reinit()`
-  (via the existing `g_ota_pub_loaded` flag path in
-  `critterchron_particle.cpp:487-510`), the tel thread resets
-  `last_attempt_ms` + sets `next_interval_ms = 5000` so the next
-  heartbeat fires ~5s after load instead of up to `heartbeep`
-  seconds later. The operator sees the confirming
-  `script=<name>@<sha>` within seconds instead of waiting for
-  cadence. Reuses the signal operators already grep — no new KV
-  keys, no new tooling.
-
-  What this doesn't cover (still open if the need arises):
-  - **Single-KV-read fleet status.** The heartbeat-nudge still
-    requires iterating every device's heartbeat stream to see who's
-    on what sha; a dedicated `<app>/<device>/ir/loaded` key would
-    let a single GET-per-device (or even a wildcard read) produce a
-    fleet dashboard. Not urgent for small fleets.
-  - **Parse-failure visibility.** The nudge only fires on successful
-    reinit, so "fetched but rejected" is still only surfaced via
-    serial. Overlaps with the device-side-error-channel TODO above —
-    that's the right place for this signal, not a separate KV key.
-  - **Payload richness.** Heartbeat carries `sha_prefix` (8 chars);
-    a dedicated key could carry full sha + size + last error. Has
-    mattered zero times so far; skip until it does.
-
-  If a fleet dashboard becomes real, the original per-device KV
-  proposal (`<app>/<device>/ir/loaded` containing `<sha>:<uptime_ms>`)
-  is still the right shape — it just composes with the nudge rather
-  than replacing it.
 - **Light-sensor calibration poisons itself; only reflash recovers.**
   Observed 2026-04-21: rachel sat at `bri=(1<125<128)` in a room the
   operator describes as "very dark, for hours" — a state the current
@@ -863,6 +770,86 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — Closed: re-publish doesn't trigger re-OTA.** Held
+  open since 2026-04-21 with a three-branch diagnostic table for
+  future observers; closed 2026-04-28 since all three of those
+  branches are now either handled or cheaply diagnosable from the
+  heartbeat error channel. The original 2026-04-21 case (blob grew
+  past `IR_OTA_BUFFER_BYTES`, fetch silently rejected) is now loud
+  via `err=ota_fetch:<reason>` from `g_errlog.record` — same
+  diagnostic surface that named the bin-vs-str and Connection:close
+  failures during the 2026-04-28 timmy triage. Three-branch
+  archaeology preserved in this entry purely as historical
+  context for someone hitting the same symptom from a different
+  cause:
+  (a) `content_sha` actually identical — working as designed.
+  Whitespace/comment-only edits that the compiler canonicalizes
+  away genuinely produce identical content. `--force` re-uploads
+  if you want to override.
+  (b) `content_sha` changed but sidecar didn't update — publisher
+  bug; defended against by upload-order (blob first, sidecar
+  second) and by the device-side recompute-on-fetch check.
+  (c) sidecar updated but device didn't pick it up — buffer
+  oversize (now reported), poll-interval surprise (configurable),
+  or fast-path compare bug (would now surface a granular
+  breadcrumb).
+  Diagnostic recipe if it recurs: publish, inspect the three KV
+  entries (`<app>/scripts/<name>`, `<app>/scripts/<name>/sha`,
+  `<app>/<device>/ir`), compare against the device's
+  `ir_loaded_sha_` from a heartbeat. Three-way comparison names
+  the branch. `publish_ir.py --force` smoke is the cheapest
+  isolation: if `--force` re-OTAs but plain publish doesn't, it's
+  a content-identity issue (branch a), not transport.
+
+- **2026-04-28 — Closed: device registers loaded sha back to Stra2us.**
+  Held since 2026-04-23 as "partially addressed via heartbeat-nudge";
+  closed 2026-04-28 because the open sub-bullets either don't matter
+  (small fleet, no dashboard demand yet) or have been subsumed by
+  shipping work. The heartbeat nudge — on successful
+  `ir_apply_if_ready()` → `engine.reinit()`, tel thread sets
+  `next_interval_ms=5000` so the confirming `script=<name>@<sha>`
+  lands within ~5s of load instead of waiting up to `heartbeep`
+  seconds — has been in place across the fleet and works. The
+  three things that "weren't covered yet" in the original entry:
+  - *Single-KV-read fleet status.* Still costs an iteration over
+    heartbeat streams; not blocking until a dashboard exists.
+  - *Parse-failure visibility.* Now surfaced as
+    `err=ota_apply:parse failed ...` via the device-side error
+    channel that landed 2026-04-25. The original "this is the
+    right place, not a separate KV key" call was correct.
+  - *Payload richness* (full sha, size, last error). Has not
+    mattered once. Reopen if a fleet dashboard ever materializes
+    and the 8-char sha prefix actually collides — file then, not
+    speculatively.
+  Original per-device KV proposal (`<app>/<device>/ir/loaded`
+  containing `<sha>:<uptime_ms>`) is still the right shape *if*
+  fleet status becomes a real need; it would compose with the
+  nudge rather than replace it. Not filing speculatively.
+
+- **2026-04-28 — `fade` floor-clamp on non-zero channels.** The render
+  pass at `hal/CritterEngine.cpp:2058-2064` was doing a Q8 quantization
+  `(t.r * q8) >> 8` per channel and writing the result back. For
+  low-channel-value night colors like `brick: (0, 1, 0)`, channel
+  value 1 truncated to 0 for any `q8 < 256` — i.e., every fade tick
+  except the very first — and the rest of the fade rendered as
+  `(0, 0, 0)`. Symptom: fraggle's night brick was invisible at any
+  global brightness despite the LED being capable of (0, 1, 0)
+  output. Channel-by-channel test confirmed the boundary: c=4
+  survives until q8≥64, c=8 until q8≥32, c=1 only at q8=256.
+  Fix mirrors `NeoPixelSink::scale_ch`'s contract: a non-zero source
+  channel stays at ≥1 through the whole fade window, falling to 0
+  only when state flips off at age=0. Trade: `draw <name> fade N`
+  with c=1 now sits at intensity 1 for the full N ticks then
+  vanishes at age=0 — visually the same as `hold N` for that
+  channel. Higher-channel fades behave unchanged. Engine
+  (`hal/CritterEngine.cpp:2058-2073`) and Python sim
+  (`renderer.py:79-94`) updated together for parity. All 10
+  pre-existing `test_functional.py` fixtures still pass; existing
+  `ok_fade_basic.crit` paints `(255, 0, 0)` so it didn't exercise
+  the floor case. New fixture for `(0, 1, 0) fade N` is open work
+  but not blocking — the bug is no longer reachable without
+  republishing fraggle.
 
 - **2026-04-28 — OTA pipeline triage on timmy: three bugs under one
   symptom.** After the 2026-04-27 stack fix unblocked rachel, ESP32
