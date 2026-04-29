@@ -101,7 +101,7 @@ ESP32_FILES    := $(filter-out critterchron_esp32.ino, \
 ESP32_COPIES   := $(addprefix $(SRC_DIR)/,$(ESP32_FILES)) \
                   $(SKETCH_DIR)/$(SKETCH_NAME).ino
 
-.PHONY: all flash flash-ota flash-usb clean list $(DEVICES) $(SCRIPTS) compile assemble
+.PHONY: all flash flash-ota flash-usb publish clean list $(DEVICES) $(SCRIPTS) compile assemble
 
 default: list
 
@@ -112,6 +112,7 @@ list:
 	@echo "  scripts:   $(SCRIPTS)"
 	@echo "  flash:     make DEVICE=<device> flash               (OTA; alias: flash-ota)"
 	@echo "  flash-usb: make DEVICE=<device> flash-usb PORT=/dev/cu.usbmodemXXX"
+	@echo "  publish:   make DEVICE=<device> <script> publish    (stage fw to Stra2us)"
 
 # `make echo_ermine` shorthand for `make flash DEVICE=echo_ermine`.
 $(DEVICES):
@@ -212,6 +213,23 @@ endif
 # went through this name. Kept so existing scripts and muscle memory keep
 # working; new invocations should prefer plain `flash`.
 flash-ota: flash
+
+# Stage the built firmware to Stra2us KV at `critterchron/fw/$(PLATFORM)`.
+# No flashing — devices pull on their own cadence (see Phase 2 work).
+# Idempotent (publish_fw.py probes the remote sidecar and skips if
+# unchanged); pass FORCE=1 to override.
+#
+# Typical usage:
+#   make DEVICE=timmy_tanuki coati publish        (rebuild + stage)
+#   make DEVICE=timmy_tanuki publish              (stage current build)
+#
+# Auth lives in stra2us_cli's env / profile resolution — same path
+# `publish_ir.py` uses. No --server / --client-id flags here.
+publish: $(FIRMWARE_BIN)
+	@echo "== Publishing fw $(DEVICE) ($(PLATFORM)) to Stra2us =="
+	$(PYTHON) $(REPO_ROOT)/tools/publish_fw.py $(FIRMWARE_BIN) \
+		--target $(PLATFORM) \
+		$(if $(FORCE),--force,)
 
 # --- Source assembly ---
 assemble: $(ENGINE_COPIES) $(ESP32_COPIES)

@@ -605,42 +605,85 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   and Stra2us integration — landing it before Stra2us means the very
   first field-deployable ESP32 build is credential-recoverable.
 
-- **Pull-mode firmware OTA with signature verification (ESP32).** M5
-  ships `ArduinoOTA` push-mode only: `arduino-cli upload --port
-  <device>.local --protocol network` flashes over LAN. Fine for dev
-  (trusted network, hands-on operator), wrong shape for fleet-wide
-  rollouts — no authentication, no centralized "push new fw to every
-  device in the swarm" story, and it assumes the developer is on the
-  same LAN as every device. Want: a pull-OTA path where the device
-  periodically checks a staged firmware URL (Stra2us sidecar?
-  mirroring the IR-blob pattern — `<app>/fw/<target>/<sha>` pointer,
-  `<app>/fw/<target>.bin` blob), verifies HMAC-SHA256 over the binary
-  under the device's Stra2us secret, and flashes via
-  `Update.writeStream`. Makefile gets an `ota-stage` target that SCPs
-  the built .bin plus the sha sidecar to the staging server. Same
-  device-secret that already signs Stra2us traffic; no new key
-  material. Skip the trust-on-first-use shape — compiled-in secret is
-  the anchor. Nice-to-have: a publish topic (`fw_staged
-  target=esp32c3 sha=abcd1234`) so a tooling script can watch for
-  devices to pick up the update and report back.
+- **ESP32 pull-OTA — Phase 2: device-side pull + apply + auto-rollback.**
+  *Blocked on Phase 1.* Device-side pipeline that fetches a
+  staged firmware from Stra2us KV (same wire format Phase 1
+  validates), verifies it, flashes it via `Update.writeStream`,
+  reboots into the new image, and uses ESP32 A/B partition
+  rollback to recover from a bad firmware. Auto-rollback is
+  folded in deliberately — without it, pull-OTA has a meaningful
+  bricking surface (firmware that boots cleanly then crashes mid-
+  loop, or loses Stra2us auth in the new build, can't be remotely
+  recovered). They're functionally one piece of code.
 
-- **Auto-rollback on post-flash crash (ESP32).** M5's rescue-hold
-  window buys time to OTA a replacement when a previous boot crashed,
-  but doesn't roll back automatically. Arduino-ESP32's bootloader
-  supports A/B validation: the app must call
-  `esp_ota_mark_app_valid_cancel_rollback()` after a successful boot,
-  otherwise the bootloader reverts to the previous partition on next
-  reset. Want to wire this up — mark valid after N seconds of uptime
-  with WiFi associated and SNTP synced (or some similar "this fw
-  actually works" heuristic), and if we crash before that, the
-  bootloader reverts for us. Closes the "bad flash bricked the
-  device" failure mode without requiring an operator to notice and
-  push a replacement through the rescue-hold window. Interaction with
-  `esp_reset_reason()` / rescue mode needs thought: a device that
-  boots, crashes, reverts, boots successfully on the old fw should
-  probably still enter rescue mode (previous boot was a crash, even
-  if the currently-running fw is fine) so an operator can investigate
-  before re-attempting the bad flash.
+  *Wire format (Phase 1 establishes this):* device-then-app
+  fallback for the target pointer:
+  - `critterchron/<device>/fw_target` → target name (e.g. `esp32c3`)
+  - `critterchron/fw_target` → fleet-wide fallback
+  Plus the blob + sidecar at `critterchron/fw/<target>` and
+  `critterchron/fw/<target>/sha` (Phase 1 keys).
+
+  *Cadence:* new `fw_poll_interval` Stra2us KV key (separate from
+  `ir_poll_interval` — firmware updates are rare enough that
+  borrowing the IR cadence would generate hundreds of needless
+  sidecar GETs per device per day). Default 86400s (1 day);
+  catalog-validated; per-device-with-app-fallback. Plus a one-shot
+  check on boot so a staged update that landed during an offline
+  overnight window gets picked up at next power-on without waiting
+  out the full poll interval.
+
+  *Auth:* reuses Stra2us response signing (server signs response
+  body with the device's secret; existing `read_response_` HMAC
+  path verifies). Same as IR-OTA blob fetch. No new key material;
+  no per-device pre-signed binaries. Sidecar-then-blob torn-upload
+  guard mirrors the IR side: device recomputes SHA over the body
+  and matches against sidecar.
+
+  *Apply:* `Update.writeStream` chunks the body into the inactive
+  OTA partition. On `Update.end(true)`: `Update.commit()` and
+  reboot. The reconnect kick + brightness loop are unaffected
+  during the flash since `Update.writeStream` runs on the tel
+  task and the main loop continues rendering until the reboot.
+
+  *Auto-rollback (criterion B):* mark image valid via
+  `esp_ota_mark_app_valid_cancel_rollback()` after the *first
+  successful Stra2us heartbeat publish*. Rationale: the heartbeat
+  exercises both the network stack and the cloud auth, which
+  together are the layers most likely to break in a firmware
+  change. Crash before that → bootloader reverts to previous
+  partition on next reset. Catches: setup() OK / loop() crash;
+  WiFi/auth misconfigured by build; SNTP doesn't sync.
+  Doesn't catch: slow-burn issues (memory leak, crash-after-N-hours).
+  We accept the slow-burn gap as a known limitation; criterion D
+  (mark valid after N minutes stable) is a future tightening if
+  ever needed.
+
+  *Interaction with rescue-hold:* a device that boots, crashes
+  before mark-valid, reverts, then boots successfully on the
+  *old* firmware should still enter rescue mode (the *previous*
+  boot was a crash, even though the currently-running firmware
+  is fine) — so the operator notices and can investigate the
+  bad flash before re-attempting it. This is the one place the
+  rescue-hold logic gets a small tweak: don't suppress rescue
+  mode just because the current image's boot was clean.
+
+  *Discoverability:* heartbeat carries `fw=<date>` already;
+  add `fw_sha=<8 hex>` so an operator can match the running
+  device against the staged blob without parsing build dates.
+  Computed at boot from `Update.getCurrentImageSha256()` (or
+  arduino-esp32 equivalent), cached for the boot lifetime.
+
+  *Optional:* a `fw_staged target=esp32c3 sha=abcd1234` event on
+  the publish stream when `publish_fw.py` runs (mirroring the
+  `ota_detected/matrix/loaded` lifecycle for IR), so a tooling
+  script can correlate "what got pushed" with "what landed."
+  Not required for v1; file separately if useful.
+
+  Done definition: published a test firmware (e.g. with a bumped
+  `APP_VERSION`), pointed timmy at it, observed full lifecycle
+  in heartbeat (`fw_sha` flips, then heartbeat publish=200 on
+  the new image), verified rollback on a deliberately-broken
+  test firmware (e.g. one that fails to connect WiFi).
 
 ## Phase 2+ (per HAL_SPEC)
 
@@ -665,27 +708,80 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 3 — WobblyTime**~~ (landed 2026-04-19). `TimeSource` decorator
   around the Particle time source. Tuning via Stra2us KV lands with
   phase 4.
-- **Phase 5 — OTA IR persistence.** KV pull + in-RAM apply is live on
-  both HALs today (Particle pre-2026-04-22, ESP32 2026-04-23 via the
-  `.ino`-ladder M4): devices poll `critterchron/<device>/ir`, fetch
-  the blob, verify content_sha, and swap the in-RAM IR tables via
-  `critter_ir::load()`. What's still missing: every cold boot snaps
-  back to the compiled-in `critter_ir.h` default, so the first
-  `ir_poll` after boot eats a fetch+apply cycle to re-converge on
-  whatever the device was already running. Phase 5 closes that by
-  persisting the OTA'd bytes to flash (NVS on ESP32, DCT/EEPROM on
-  Particle) after a successful apply, and having
-  `CritterEngine::begin()` try the flash copy first and only fall
-  through to `loadDefault()` on empty / corrupt / parse-fail. *NB:
-  the compiled-in blob stays pristine as the "never been online"
-  fallback — we write to a separate flash region, not over `.rodata`.*
-  *Numbering note: "Phase N" is the HAL_SPEC roadmap axis; "M N" in
-  this file also refers to the ESP32-bring-up ladder (see the ESP32
-  Hotspot / OTA-pull-mode / Auto-rollback entries above). They aren't
-  1:1 — Phase 5 ≠ ESP32-ladder M5.*
+- ~~**Phase 5 — OTA IR persistence.**~~ **Rejected 2026-04-29.** See
+  Completed for the rationale; short version is that bricking
+  resistance is the load-bearing reason the compiled-in blob is
+  always the cold-boot path. Don't propose flash persistence
+  (NVS, DCT, EEPROM, LittleFS, etc.) as a "faster cold-boot" fix
+  — the re-fetch window is the *price* of brick-resistance, and
+  it's a price we're paying on purpose.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-29 — Rejected: Phase 5 OTA IR persistence.** Originally
+  scoped 2026-04-27 to skip the cold-boot re-fetch by writing
+  successfully-applied OTA blobs to non-volatile storage (NVS on
+  ESP32, DCT/EEPROM on Particle) and having `CritterEngine::begin()`
+  prefer the flash copy on boot. Rejected on a second read because
+  the compiled-in blob is the **bricking-resistance fallback**: if
+  a bad OTA blob ever gets pushed to KV (corrupted, malformed,
+  version-incompatible, crashes on this specific platform), every
+  device that reboots loads its compiled-in default and stays
+  recoverable — operator just clears or repoints the IR pointer
+  and the bad blob gets re-fetched into RAM only, where the next
+  reboot wipes it. The moment OTA bytes get persisted, that
+  recovery path is gone: a poison-pill push could brick the device
+  until physical USB recovery.
+
+  Cold-boot re-fetch (~1 minute typical) is the deliberate price
+  for that property. Memory `feedback_no_flash_writes_for_ota.md`
+  captures the decision and how to recognize the next time someone
+  proposes "let's just persist the OTA blob to NVS for faster
+  cold-boot" — that's not a mechanism question; it's a
+  brick-resistance question.
+
+  Pivot point if we ever revisit: the "no flash writes" invariant
+  itself, *not* the storage backend. Any future proposal needs to
+  start with "how do we recover a device with a poison-pill OTA
+  blob in its NVS?" before any code happens.
+
+- **2026-04-29 — ESP32 pull-OTA — Phase 1: publish tool + wire-layer
+  feasibility.** Validated that Stra2us can round-trip a 1MB binary
+  blob cleanly. `tools/publish_fw.py` stages a built firmware as
+  `critterchron/fw/<target>` (msgpack bin32) plus a sidecar at
+  `critterchron/fw/<target>/sha` (`<sha256>:<size>` string). Same
+  auth and tear-safe blob-then-sidecar ordering as `publish_ir.py`.
+  Pass `blob_bytes` (not str) to `client.put()` — opposite of the
+  IR fix because firmware is semantically binary, so msgpack `bin`
+  is the correct wire shape.
+
+  *Phase 1 round-trip findings (2026-04-29, with a 1MB random blob
+  pushed and re-fetched via authenticated GET):*
+  - **Both fetches return 200.** Server accepts and serves 1MB cleanly.
+  - **`Content-Length: 1048581`** (1MB payload + 5-byte msgpack bin32
+    header). **No `Transfer-Encoding: chunked`** — confirms uvicorn
+    doesn't switch to chunked above any size threshold up to 1MB.
+    Means we don't need a device-side chunked decoder for Phase 2.
+  - **First byte 0xc6** confirms bin32 encoding for the blob; the
+    existing on-device str+bin acceptance widening (2026-04-28)
+    handles this without further changes.
+  - **`Connection: close`** as expected — already handled by the
+    close-after-response code that landed 2026-04-28.
+  - **SHA round-trip is bit-exact** — wire integrity confirmed.
+  - **Latency: 259ms for 1MB (~4 MB/s).** ~20× the existing 5s
+    `read_response_` device timeout; even at 10× slower WiFi line
+    rates Phase 2 should fit comfortably without timeout extensions.
+    If ESP32-C3 throughput turns out to be drastically worse, lift
+    the timeout to 30s for the firmware path specifically — a
+    one-line change inline with the other Phase 2 work.
+
+  *Phase 2 unblocked.* The 1MB test blob currently sits at
+  `critterchron/fw/esp32c3` (sha `bea18128...`); since no device
+  knows how to pull it yet, it's harmless. Will get overwritten
+  when Phase 2 lands its first real test firmware. If it bothers
+  anyone, `stra2us del critterchron/fw/esp32c3` and
+  `stra2us del critterchron/fw/esp32c3/sha` clear it.
 
 - **2026-04-29 — WiFi reconnect kick — ESP32 mirror (Part 2).** Mechanical
   mirror of the 2026-04-28 Particle landing. Sole site:
