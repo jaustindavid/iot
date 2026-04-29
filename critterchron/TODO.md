@@ -35,19 +35,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   sustained outage; this is about recovering the *configured*
   network after a transient one.
 
-- **Time-of-day brightness schedule — ESP32 mirror (Part 2).** Particle
-  landed 2026-04-28 (see Completed below for the full design). Same
-  pattern needs to land in `hal/esp32/src/critterchron_esp32.ino`'s
-  brightness block. Mechanical work: copy the `parse_brightness_schedule`
-  / `schedule_match_max_bri` / `ScheduleSeg` definitions, add the
-  `g_sched_*` flags, mirror the heartbeat marker, and add string-cache
-  support to the ESP32 Stra2usClient (currently has the same
-  int/float-only Config interface as Particle did pre-landing). Wire
-  format and KV key are platform-agnostic — same `<app>/<device>/
-  brightness_schedule` with `<app>/brightness_schedule` fallback —
-  so once timmy gets the firmware, it speaks the same schedule
-  language as rachel.
-
 - **Night-force schedule (`night_force_schedule`).** Considered for
   v1 of the time-of-day work, deferred. Same parser shape as
   `brightness_schedule` but each segment names a window where the
@@ -714,6 +701,40 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — Time-of-day brightness schedule — ESP32 mirror (Part 2).**
+  Mechanical mirror of the Particle landing earlier today.
+  `hal/esp32/src/Stra2usClient.{h,cpp}` gained the `brightness_schedule()`
+  accessor + `brightness_schedule_[160]` slot + `poll_all` refresh with
+  device-then-app fallback (identical shape to the Particle port).
+  `hal/esp32/src/critterchron_esp32.ino` gained the `ScheduleSeg` struct,
+  `parse_brightness_schedule()`, `schedule_match_max_bri()` near the
+  existing `local_minute()` time helper, plus `g_sched_in_use` /
+  `g_sched_parse_err` heartbeat-visible flags. Brightness loop wired
+  to apply the override before the min/max clamp.
+
+  Time source: schedule reads off `g_real_clock` (un-wobbled
+  EspTimeSource), not `g_clock` (the wobbled engine clock) — matches
+  Particle's `Time.now()` semantics. Validity gate: `g_real_clock.valid()`
+  short-circuits when SNTP hasn't synced yet (returns false until epoch
+  is past 2024-01-01).
+
+  Heartbeat marker mirrored across both `CRIT_HAVE_LIGHT` and the
+  bare format strings — `bri=(...sched)` / `bri=(...sched-err)` /
+  bare-as-before, identical to Particle.
+
+  Schedule wire format and KV keys (`<app>/<device>/brightness_schedule`
+  with `<app>/brightness_schedule` fallback) are platform-agnostic, so
+  the same `stra2us set brightness_schedule "..."` works against rachel
+  or timmy without per-device translation. The catalog entry already
+  covers both (filed during Part 1).
+
+  Tests: `test_s2s_catalog.py` clean (37 call sites, 15 entries);
+  `test_functional.py` 10/10 (engine code untouched).
+
+  Soak: rachel's already running her Part-1 schedule; timmy can pick up
+  the same fleet-scope schedule via `<app>/brightness_schedule` if
+  desired, or get a per-device one via `<app>/timmy_tanuki/brightness_schedule`.
 
 - **2026-04-28 — Time-of-day brightness schedule on Particle (Part 1).**
   Operator-set schedule overrides sensor-driven `max_brightness` during

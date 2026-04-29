@@ -520,6 +520,29 @@ void Stra2usClient::poll_key(size_t idx) {
 void Stra2usClient::poll_all() {
     size_t n = cache_count_;
     for (size_t i = 0; i < n; ++i) poll_key(i);
+
+    // Brightness schedule (string-valued KV). Mirror of the Particle path —
+    // see hal/particle/src/Stra2usClient.cpp::poll_all for the full
+    // rationale. Try device-scope first, app-scope fallback; only
+    // overwrite the cached buffer on success so a transient miss doesn't
+    // drop a known-good schedule.
+    char full[KEY_MAX + 64];
+    char buf[sizeof(brightness_schedule_)];
+    size_t out_len = 0;
+
+    snprintf(full, sizeof(full), "%s/%s/brightness_schedule", app_, device_);
+    bool fetched = kv_fetch_str_(full, buf, sizeof(buf), out_len);
+    if (!fetched) {
+        snprintf(full, sizeof(full), "%s/brightness_schedule", app_);
+        fetched = kv_fetch_str_(full, buf, sizeof(buf), out_len);
+    }
+    if (fetched) {
+        size_t copy_len = out_len < sizeof(brightness_schedule_) - 1
+                        ? out_len
+                        : sizeof(brightness_schedule_) - 1;
+        memcpy(brightness_schedule_, buf, copy_len);
+        brightness_schedule_[copy_len] = '\0';
+    }
 }
 
 // ---------- OTA IR ----------

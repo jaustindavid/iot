@@ -361,6 +361,11 @@ static char          g_ota_loaded_sha [65]                 = {0};
 static volatile uint8_t g_bri     = MAX_BRIGHTNESS;
 static volatile uint8_t g_bri_min = MIN_BRIGHTNESS;
 static volatile uint8_t g_bri_max = MAX_BRIGHTNESS;
+// Schedule observability flags — written by the brightness loop, read by
+// the heartbeat formatter. Mirror of the Particle port; see the parser
+// site below for the wire format.
+static volatile bool    g_sched_in_use    = false;
+static volatile bool    g_sched_parse_err = false;
 #if CRIT_HAVE_LIGHT
 // Latest lux reading, captured by the sample loop and reported on the
 // next heartbeat. Written exactly once per 200ms sample, read once per
@@ -394,6 +399,84 @@ static int local_minute(const CritTimeSource& c) {
     struct tm tm;
     gmtime_r(&local, &tm);
     return tm.tm_min;
+}
+
+// ---------- Time-of-day brightness schedule ----------
+// Mirror of hal/particle/src/critterchron_particle.cpp; see that file's
+// detailed comment for the wire format and design rationale. Quick recap:
+//   "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
+// Comma-separated `HH:MM-HH:MM:max_bri` segments, first match wins,
+// wraparound by start > end. All-or-nothing parse. Empty = no schedule.
+// Schedule should follow REAL wall-clock time — on this port that means
+// reading off `g_real_clock` (un-wobbled), not `g_clock` (which the
+// engine reads for the panel's display clock).
+
+struct ScheduleSeg {
+    uint16_t start_min;
+    uint16_t end_min;
+    uint8_t  max_bri;
+};
+static constexpr int  SCHEDULE_MAX_SEGS = 8;
+static ScheduleSeg    s_sched_segs[SCHEDULE_MAX_SEGS];
+static uint8_t        s_sched_count = 0;
+static char           s_sched_last[160] = {0};
+static bool           s_sched_parse_ok = false;
+
+static bool parse_brightness_schedule(const char* s) {
+    s_sched_count = 0;
+    if (!s || !*s) return true;
+    int seg_idx = 0;
+    const char* p = s;
+    while (*p && seg_idx < SCHEDULE_MAX_SEGS) {
+        while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+        if (!*p) break;
+        int sh, sm, eh, em, mb, n = 0;
+        if (sscanf(p, "%d:%d-%d:%d:%d%n", &sh, &sm, &eh, &em, &mb, &n) != 5) {
+            const char* end = p;
+            while (*end && *end != ',') ++end;
+            int len = (int)(end - p);
+            if (len > 28) len = 28;
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: bad seg %d: %.*s", seg_idx, len, p);
+            s_sched_count = 0;
+            return false;
+        }
+        if (sh < 0 || sh > 23 || sm < 0 || sm > 59 ||
+            eh < 0 || eh > 23 || em < 0 || em > 59) {
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: bad time seg %d", seg_idx);
+            s_sched_count = 0;
+            return false;
+        }
+        if (mb < 0 || mb > 255) {
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: max_bri %d out of range seg %d", mb, seg_idx);
+            s_sched_count = 0;
+            return false;
+        }
+        s_sched_segs[seg_idx].start_min = (uint16_t)(sh * 60 + sm);
+        s_sched_segs[seg_idx].end_min   = (uint16_t)(eh * 60 + em);
+        s_sched_segs[seg_idx].max_bri   = (uint8_t)mb;
+        ++seg_idx;
+        p += n;
+    }
+    s_sched_count = (uint8_t)seg_idx;
+    return true;
+}
+
+// -1 = no segment matches; caller falls through to device default max_b.
+static int schedule_match_max_bri(uint16_t now_min) {
+    for (uint8_t i = 0; i < s_sched_count; ++i) {
+        const auto& seg = s_sched_segs[i];
+        bool in_seg;
+        if (seg.start_min <= seg.end_min) {
+            in_seg = (now_min >= seg.start_min && now_min < seg.end_min);
+        } else {
+            in_seg = (now_min >= seg.start_min || now_min < seg.end_min);
+        }
+        if (in_seg) return (int)seg.max_bri;
+    }
+    return -1;
 }
 
 static void draw_spinner(unsigned long now) {
@@ -492,13 +575,19 @@ static int telemetry_cycle() {
     char report[384];
     int  rssi = WiFi.isConnected() ? WiFi.RSSI() : -127;
 
+    // Schedule marker — see Particle shim for rationale. `sched` =
+    // schedule active and matched. `sched-err` = string set but parse
+    // failed. Empty otherwise.
+    const char* sched_tag = g_sched_parse_err ? " sched-err"
+                          : g_sched_in_use     ? " sched"
+                          : "";
 #if CRIT_HAVE_LIGHT
     // `lux=X.X` is the BH1750 raw reading; bri=(min<cur<max) is the
     // mapped-and-smoothed output the sink is actually using. Together
     // they answer "is the room light what we think it is" (lux) and "is
     // the curve+clamp producing sensible brightness" (bri triplet).
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u) lux=%.1f "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u%s) lux=%.1f "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -508,7 +597,7 @@ static int telemetry_cycle() {
         (int)esp_reset_reason(),
         APP_VERSION,
         script_tag,
-        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max,
+        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (double)g_lux,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
@@ -519,7 +608,7 @@ static int telemetry_cycle() {
         CONFIG_IDF_TARGET);
 #else
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u) "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -529,7 +618,7 @@ static int telemetry_cycle() {
         (int)esp_reset_reason(),
         APP_VERSION,
         script_tag,
-        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max,
+        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
         (unsigned long)g_interp_avg_us, (unsigned long)g_interp_max_us,
@@ -904,6 +993,37 @@ void loop() {
             last_light_ms = now;
             int min_b = g_cfg.get_int("min_brightness", MIN_BRIGHTNESS);
             int max_b = g_cfg.get_int("max_brightness", MAX_BRIGHTNESS);
+
+            // Time-of-day schedule override on max_b. See
+            // parse_brightness_schedule above for wire format and parsing.
+            // Re-parse on change (single strncmp/tick steady-state); apply
+            // when current local time falls inside a defined segment.
+            // g_real_clock is the un-wobbled time source — we want real
+            // wall time, not the engine's wobbled display clock.
+#if CRIT_HAVE_STRA2US
+            const char* sched_str = g_cfg.brightness_schedule();
+            if (strncmp(sched_str, s_sched_last, sizeof(s_sched_last)) != 0) {
+                strncpy(s_sched_last, sched_str, sizeof(s_sched_last) - 1);
+                s_sched_last[sizeof(s_sched_last) - 1] = '\0';
+                s_sched_parse_ok = parse_brightness_schedule(s_sched_last);
+            }
+            bool sched_in_use = false;
+            if (s_sched_parse_ok && s_sched_count > 0 && g_real_clock.valid()) {
+                time_t local = g_real_clock.wall_now()
+                             + (time_t)(g_real_clock.zone_offset_hours() * 3600.0f);
+                struct tm tm;
+                gmtime_r(&local, &tm);
+                uint16_t now_min = (uint16_t)(tm.tm_hour * 60 + tm.tm_min);
+                int sched_max = schedule_match_max_bri(now_min);
+                if (sched_max >= 0) {
+                    max_b = sched_max;
+                    sched_in_use = true;
+                }
+            }
+            g_sched_in_use    = sched_in_use;
+            g_sched_parse_err = (s_sched_last[0] != '\0' && !s_sched_parse_ok);
+#endif
+
             if (min_b < 1)   min_b = 1;
             if (max_b > 255) max_b = 255;
             if (min_b > max_b) min_b = max_b;

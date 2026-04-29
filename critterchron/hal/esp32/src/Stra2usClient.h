@@ -91,6 +91,14 @@ public:
         return ir_loaded_sha_[0] ? ir_loaded_sha_ : critter_ir::SCRIPT_SHA;
     }
 
+    // String tunable: time-of-day brightness schedule. Wire format
+    // documented at the parser site in critterchron_esp32.ino's brightness
+    // loop. Refreshed during poll_all() with the standard
+    // <app>/<device>/<key> → <app>/<key> fallback. NUL-terminated; empty
+    // string means the key is not set / not yet fetched. Mirrors
+    // hal/particle/src/Stra2usClient.h.
+    const char* brightness_schedule() const { return brightness_schedule_; }
+
 private:
     static constexpr size_t CACHE_CAP = 32;
     static constexpr size_t KEY_MAX   = 40;
@@ -160,6 +168,12 @@ private:
     char           ir_detected_to_name_  [IR_SCRIPT_NAME_MAX] = {0};
     char           ir_detected_to_sha_   [65] = {0};
     size_t         ir_detected_size_      = 0;
+
+    // Brightness schedule string buffer. Refreshed in poll_all() with
+    // device-then-app fallback; left untouched if both KV fetches fail
+    // so a transient network blip doesn't drop a known-good schedule.
+    // Mirrors hal/particle/src/Stra2usClient.h.
+    char           brightness_schedule_[160] = {0};
 };
 
 #endif  // ARDUINO_ARCH_ESP32
