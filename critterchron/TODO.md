@@ -20,21 +20,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   consider whether the field has accidentally become useful for
   *anything else* before pulling — if not, just revert.
 
-- **WiFi reconnect kick — ESP32 parity (Part 2).** Particle landed
-  2026-04-28; ESP32 still uses arduino-esp32's auto-reconnect with
-  no manual prompt path. Mirror the kick logic to
-  `hal/esp32/src/critterchron_esp32.ino`'s tel task: when the WiFi
-  status reads disconnected for ≥ `ir_poll_interval` seconds, force
-  a `WiFi.reconnect()` (or the equivalent — arduino-esp32's API is
-  different from Particle's). Same `g_errlog.record(ErrCat::Net,
-  "reconnect_kick offline=%lums", ...)` so heartbeat surfaces the
-  event identically across platforms. ErrCat::Net already exists
-  cross-platform via `hal/ErrLog.h`. Adjacent to the existing
-  "Hotspot-mode fallback when WiFi is unreachable (ESP32)" entry
-  but distinct: that's about *which network* to join after a
-  sustained outage; this is about recovering the *configured*
-  network after a transient one.
-
 - **Night-force schedule (`night_force_schedule`).** Considered for
   v1 of the time-of-day work, deferred. Same parser shape as
   `brightness_schedule` but each segment names a window where the
@@ -701,6 +686,48 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-29 — WiFi reconnect kick — ESP32 mirror (Part 2).** Mechanical
+  mirror of the 2026-04-28 Particle landing. Sole site:
+  `hal/esp32/src/critterchron_esp32.ino` `telemetry_task()`. Added a
+  `last_reconnect_kick_ms` static at task start; at the top of every
+  loop iteration, if `WiFi.status() != WL_CONNECTED` and ≥
+  `ir_poll_interval` seconds have elapsed since the last kick, log
+  to serial + record `err=net:reconnect_kick offline=Nms` via
+  `g_errlog`, then call `WiFi.reconnect()` and update the timestamp.
+  When connected, bump the timestamp so a brief future drop gets a
+  full grace period before the next kick.
+
+  ErrCat::Net already shared cross-platform from yesterday's
+  Particle work — no header changes needed. Wire format identical:
+  `err=net:reconnect_kick offline=Nms`, so a fleet-wide grep for
+  `reconnect_kick` works regardless of platform.
+
+  *Asymmetry called out at file scope*: arduino-esp32 has no
+  `WiFi.connecting()` equivalent, so we can't guard against racing
+  the auto-reconnect machinery the way Particle does. Cadence gate
+  (≥20 min default) is conservative enough that any in-flight
+  attempt has resolved by then; `WiFi.reconnect()` is documented as
+  idempotent. If a future repro shows the kick stomping an in-flight
+  reconnect (worse not-ready stretches than baseline), escalate to
+  state tracking via `WiFi.onEvent` callbacks, or fall back to the
+  heavier `WiFi.disconnect(); WiFi.begin();` pattern.
+
+  Architectural note: ESP32's tel task doesn't have an offline-skip
+  block like Particle's — it lets failed publishes drive the backoff
+  machinery instead. So the kick lands at the top of the loop
+  iteration, before any network attempt, rather than inside an
+  offline branch. Functionally equivalent but the placement reads
+  differently from the Particle version.
+
+  Tests: 10/10 functional, catalog drift clean (38 call sites; the
+  new `g_cfg.get_int("ir_poll_interval", ...)` inside the kick branch
+  reads an already-catalogued entry).
+
+  Soak: timmy gets the same kick mechanism rico has been
+  exercising since yesterday. If timmy's WiFi is healthier than
+  rico's, expect zero `err=net:reconnect_kick` records under steady
+  state — that's the right outcome.
 
 - **2026-04-28 — Time-of-day brightness schedule — ESP32 mirror (Part 2).**
   Mechanical mirror of the Particle landing earlier today.

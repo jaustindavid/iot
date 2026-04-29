@@ -692,6 +692,22 @@ static void telemetry_task(void*) {
     uint32_t last_ir_poll_ms = 0;
     bool     ir_first        = true;
 
+    // Periodic WiFi reconnect kick. Mirror of the Particle landing
+    // (2026-04-28). When WiFi drops, arduino-esp32's auto-reconnect
+    // machinery normally brings it back, but if the radio gets wedged
+    // (rico-equivalent on Gen 2 has been observed on Photon — same
+    // failure mode plausibly hits ESP32) we want a periodic
+    // `WiFi.reconnect()` to force a fresh attempt. Cadence borrowed
+    // from `ir_poll_interval` (default 1200s) — already user-tunable,
+    // already the right "wake up periodically and try things" rhythm.
+    //
+    // Note: arduino-esp32 has no `WiFi.connecting()` equivalent, so we
+    // can't guard against racing the auto-reconnect like Particle does.
+    // The cadence gate is conservative enough (≥20 min between kicks)
+    // that any reasonable in-flight attempt has resolved by then;
+    // `WiFi.reconnect()` is documented as idempotent in practice.
+    uint32_t last_reconnect_kick_ms = millis();
+
     // Pre-register heartbeep + ir_poll_interval so cycle 1's poll_all
     // pulls them live — otherwise a live override would only kick in
     // starting with cycle 3. Same rationale as the Particle shim.
@@ -701,6 +717,32 @@ static void telemetry_task(void*) {
 
     for (;;) {
         uint32_t now = millis();
+
+        // Reconnect kick. Runs before any network attempt in this
+        // iteration so a wedged radio gets a nudge before the rest of
+        // the loop wastes cycles on no-op publishes. Heartbeat-visible
+        // as `err=net:reconnect_kick offline=Nms` for fleet-wide
+        // diagnostics. When WiFi *is* connected, bump the timestamp so
+        // a brief future drop gets a full ir_poll_interval grace
+        // period before the next kick — avoids hammering on flaky
+        // networks.
+        if (WiFi.status() != WL_CONNECTED) {
+            int recon_int_s = g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
+            if (recon_int_s < 60) recon_int_s = 60;
+            uint32_t recon_int_ms = (uint32_t)recon_int_s * 1000UL;
+            if (now - last_reconnect_kick_ms >= recon_int_ms) {
+                Serial.printf("[net] reconnect kick (offline %lums, status=%d)\n",
+                              (unsigned long)(now - last_reconnect_kick_ms),
+                              (int)WiFi.status());
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "reconnect_kick offline=%lums",
+                                              (unsigned long)(now - last_reconnect_kick_ms));
+                WiFi.reconnect();
+                last_reconnect_kick_ms = now;
+            }
+        } else {
+            last_reconnect_kick_ms = now;
+        }
 
         // OTA lifecycle publishes. Run *before* the heartbeep `due` gate
         // so these fire as soon as the producer (ir_poll for detected,
