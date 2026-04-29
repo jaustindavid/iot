@@ -73,6 +73,18 @@ vars:
       fine for dev; in production the traffic is "one sidecar GET per
       device per interval" so 1200s is the sweet spot.
 
+      Secondary use (added 2026-04-28): also paces the WiFi reconnect
+      kick — when the device's radio is offline, the tel thread/task
+      will call WiFi.reconnect() at most once per `ir_poll_interval`
+      seconds (with a `!WiFi.connecting()` guard on Particle; ESP32
+      has no equivalent primitive and relies on the cadence alone).
+      Active on NO_IR_OTA devices too — rico's the device most prone
+      to wedged-radio recovery, despite having OTA disabled. If a
+      future need calls for tuning the two cadences independently,
+      file a `wifi_reconnect_interval` key separately rather than
+      coupling them through this one. Heartbeat surfaces each kick
+      as `err=net:reconnect_kick offline=Nms`.
+
   # ---------- WobblyTime ----------
 
   wobble_min_seconds:
