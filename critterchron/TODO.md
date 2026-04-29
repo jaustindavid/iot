@@ -4,52 +4,36 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
-- **At IR-poll interval, actively try to bring the network back up if
-  it's down.** Today, `telemetry_worker()`
-  (`hal/particle/src/critterchron_particle.cpp:506`) does
-  `if (!wifi_now) { delay(100); continue; }` and skips the entire
-  iteration — including the IR-poll branch — whenever `WiFi.ready()`
-  reports false. Implication: a device that loses WiFi (AP reboot,
-  RF glitch, network maintenance) waits for the radio stack to
-  recover *on its own*, and no IR pull happens until it does. For
-  short outages that's fine; for longer ones a stuck device is just
-  stuck. Want to use the IR-poll cadence as a heartbeat for "actively
-  attempt reconnection" — every `ir_poll_interval` seconds, if WiFi
-  isn't up, call `WiFi.connect()` (and/or `Particle.connect()` if the
-  cloud thread looks wedged) before deciding to skip.
+- **Remove the diagnostic `wall=<unix>` field from the heartbeat.** Added
+  2026-04-28 to compare `System.uptime()` against `Time.now()` while
+  diagnosing rico's apparent uptime drift; the comparison confirmed
+  Photon Gen 2's `millis()` runs at ~77% of real wall time (see memory
+  `debug_photon_gen2_systick_drift.md`). Decision was "don't fix the
+  drift, just know about it." The `wall=` field is currently kept in
+  for the same reason — answers "is this device's clock honest?" in
+  one heartbeat read instead of needing a reflash. Pull it back out
+  once we've stopped needing the live diagnostic; it's ~17 bytes per
+  heartbeat that don't carry their weight in the steady state. Site:
+  `hal/particle/src/critterchron_particle.cpp:333-340`. The
+  ESP32 heartbeat doesn't have it (didn't propagate the diagnostic
+  there since rico is the device with the drift). When dropping,
+  consider whether the field has accidentally become useful for
+  *anything else* before pulling — if not, just revert.
 
-  *Sketch.* In the tel-worker outer loop, before the `if (!wifi_now)
-  continue` skip, check whether enough time has passed since the
-  last reconnect attempt; if so, kick `WiFi.connect()` and continue
-  looping (give the radio a few seconds to settle). The IR poll
-  interval is a sensible cadence — already user-tunable via
-  `ir_poll_interval`, already the right "wake up periodically and
-  try things" rhythm. Track `last_reconnect_attempt_ms` separate
-  from `last_ir_poll_ms` so the reconnect doesn't piggyback on a
-  successful poll's timestamp.
-
-  *Open questions.*
-  - **Particle's auto-reconnect.** SYSTEM_THREAD(ENABLED) +
-    SYSTEM_MODE(AUTOMATIC) means Particle's system thread already
-    tries to reconnect on its own. Calling `WiFi.connect()` from
-    user code might race with or duplicate that. Worth checking
-    the DeviceOS docs / source for "is it harmful to call
-    `WiFi.connect()` if the system is already reconnecting?" If
-    yes, gate the call on `WiFi.connecting() == false`.
-  - **ESP32 parity.** ESP32 has its own reconnect machinery via
-    `WiFi.onEvent` callbacks. Same idea — periodically force a
-    reconnect attempt — but the API is different. Mirror to
-    `hal/esp32/src/critterchron_esp32.ino` if we land this.
-  - **Visibility.** The reconnect attempt should land in the
-    heartbeat error channel as `err=net:reconnect_kick` or similar,
-    so an operator monitoring fleet health sees "this device tried
-    to reconnect at HH:MM" rather than guessing why a long offline
-    window finally ended.
-
-  Adjacent to the existing "Hotspot-mode fallback when WiFi is
-  unreachable (ESP32)" entry but distinct: that's about *which
-  network* to join after a sustained outage; this is about
-  recovering the *configured* network after a transient one.
+- **WiFi reconnect kick — ESP32 parity (Part 2).** Particle landed
+  2026-04-28; ESP32 still uses arduino-esp32's auto-reconnect with
+  no manual prompt path. Mirror the kick logic to
+  `hal/esp32/src/critterchron_esp32.ino`'s tel task: when the WiFi
+  status reads disconnected for ≥ `ir_poll_interval` seconds, force
+  a `WiFi.reconnect()` (or the equivalent — arduino-esp32's API is
+  different from Particle's). Same `g_errlog.record(ErrCat::Net,
+  "reconnect_kick offline=%lums", ...)` so heartbeat surfaces the
+  event identically across platforms. ErrCat::Net already exists
+  cross-platform via `hal/ErrLog.h`. Adjacent to the existing
+  "Hotspot-mode fallback when WiFi is unreachable (ESP32)" entry
+  but distinct: that's about *which network* to join after a
+  sustained outage; this is about recovering the *configured*
+  network after a transient one.
 
 - **Time-of-day knobs for brightness / night mode.** Today brightness
   is purely a function of the ambient light sensor: lux (or CDS raw)
@@ -768,6 +752,45 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — WiFi reconnect kick on Particle (Part 1).** OG Photon
+  rico observed wedging in `WiFi.ready()==false` for long stretches
+  while DeviceOS's SYSTEM_THREAD auto-reconnect failed to bring the
+  radio back. `telemetry_worker()` previously short-circuited every
+  iteration with `if (!wifi_now) { delay(100); continue; }`, so a
+  stuck device just stayed stuck.
+
+  Fix: at the top of the offline branch, if it's been
+  ≥ `ir_poll_interval` seconds (default 1200 / 20 min) since the
+  last kick AND `WiFi.connecting()` is false, call `WiFi.connect()`
+  to force a fresh attempt. Tracked via `last_reconnect_kick_ms`
+  separate from any other timer. Bumped to `now` whenever the
+  device IS online so a brief drop doesn't fire an immediate kick
+  on its return. Site:
+  `hal/particle/src/critterchron_particle.cpp:516-540` (approx).
+
+  Heartbeat channel: a new `ErrCat::Net` enum value
+  (`hal/ErrLog.h:40`, tag `"net"`) carries
+  `err=net:reconnect_kick offline=%lums` per kick — operator-visible
+  fleet-wide via heartbeat history, no separate KV write needed
+  (the v1 plan considered an incrementable durable counter; deferred
+  since the heartbeat record is itself durable in the heartbeat
+  archive and trivially countable).
+
+  Active for *all* Particle devices, including NO_IR_OTA opt-outs.
+  Rico has NO_IR_OTA so no inner ir_poll runs, but the kick still
+  fires on her ir_poll_interval cadence — the macro and KV key are
+  unconditional so the cadence value is available regardless. The
+  kick costs nothing on devices that don't need it.
+
+  Open question deliberately deferred: **could `WiFi.connect()`
+  race with DeviceOS's auto-reconnect?** Guarded by
+  `!WiFi.connecting()` to minimize that risk; if it turns out to
+  cause regressions (worse not-ready stretches, hard faults, etc.),
+  the heartbeat err channel will name the failure mode and we'll
+  iterate. User to soak rico for a stretch and observe.
+
+  Open work: ESP32 mirror (Part 2 in Near-term).
 
 - **2026-04-28 — Particle Stra2usClient symmetry pass with ESP32 (Connection:close
   + granular OTA breadcrumbs).** Mirror of the 2026-04-28 ESP32 OTA-triage

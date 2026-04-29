@@ -37,6 +37,7 @@ enum class ErrCat : uint8_t {
     OtaApply  = 2,   // parse failed, reinit failed
     Boot      = 3,   // engine.begin() failed, rescue-hold trigger
     Sensor    = 4,   // future — light sensor calibration drift, etc.
+    Net       = 5,   // WiFi/cloud reconnect kicks, transient connectivity events
 };
 
 // Single-token snake_case names for the heartbeat wire format. Server

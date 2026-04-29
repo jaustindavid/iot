@@ -331,12 +331,13 @@ static int telemetry_cycle() {
         snprintf(script_tag, sizeof(script_tag), "default");
     }
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s "
+        "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s "
         "bri=(%u<%u<%u) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu",
         (unsigned long)System.uptime(),
+        (unsigned long)Time.now(),
         rssi,
         (unsigned long)System.freeMemory(),
         (int)System.resetReason(),
@@ -493,6 +494,19 @@ static void telemetry_worker() {
     bool          ir_first        = true;
 #endif
 
+    // Periodic WiFi reconnect kick. When the radio drops, DeviceOS's
+    // SYSTEM_THREAD reconnect machinery normally brings it back on its own,
+    // but the OG Photon (rico) has been observed to wedge in not-ready for
+    // long stretches — see the related "Hotspot-mode fallback" entry. Use
+    // the IR-poll cadence as a periodic prompt: if we're offline AND
+    // DeviceOS isn't already mid-connect, force a fresh `WiFi.connect()`.
+    // The guard is what keeps us from racing the system thread; without
+    // it, calling connect() on a half-connected radio could short-circuit
+    // a recovery already in progress. Tracked separately from
+    // last_ir_poll_ms so the kick cadence is bounded even if no IR poll
+    // ever succeeds.
+    unsigned long last_reconnect_kick_ms = thread_start_ms;
+
     while (true) {
         if (millis() - thread_start_ms < startup_delay_ms) { delay(100); continue; }
         unsigned long now = millis();
@@ -503,7 +517,34 @@ static void telemetry_worker() {
         bool wifi_now = WiFi.ready();
         bool edge     = wifi_now && !wifi_prev;
         wifi_prev     = wifi_now;
-        if (!wifi_now) { delay(100); continue; }
+        if (!wifi_now) {
+            // Offline. Consider a reconnect kick — at most once per
+            // ir_poll_interval, and only when DeviceOS isn't already trying.
+            // Visible in the heartbeat error channel as `err=net:reconnect_kick`
+            // so an operator monitoring the fleet can see how often a given
+            // device needed a nudge. Active for NO_IR_OTA devices too —
+            // rico in particular wedges in offline state for longer than
+            // the system thread's auto-reconnect comfortably handles, and
+            // the kick costs nothing on devices that don't need it.
+            int recon_int_s = g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
+            if (recon_int_s < 60) recon_int_s = 60;
+            unsigned long recon_int_ms = (unsigned long)recon_int_s * 1000UL;
+            if (now - last_reconnect_kick_ms >= recon_int_ms && !WiFi.connecting()) {
+                Log.warn("net: reconnect kick (offline %lums, "
+                         "wifi.ready=0 wifi.connecting=0)",
+                         now - last_reconnect_kick_ms);
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "reconnect_kick offline=%lums",
+                                              now - last_reconnect_kick_ms);
+                WiFi.connect();
+                last_reconnect_kick_ms = now;
+            }
+            delay(100); continue;
+        }
+        // Came online (or stayed online). Bump the kick timestamp so a
+        // brief future drop gets a full ir_poll_interval grace period
+        // before the next kick — avoids hammering on flaky networks.
+        last_reconnect_kick_ms = now;
 
         // OTA lifecycle publishes. Run *before* the heartbeep `due` gate
         // so these fire as soon as the main thread flips the flag —

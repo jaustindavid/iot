@@ -32,6 +32,7 @@ const char* err_cat_tag(ErrCat cat) {
         case ErrCat::OtaApply: return "ota_apply";
         case ErrCat::Boot:     return "boot";
         case ErrCat::Sensor:   return "sensor";
+        case ErrCat::Net:      return "net";
         case ErrCat::Other:    return "other";
     }
     return "other";
