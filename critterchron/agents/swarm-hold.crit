@@ -33,33 +33,38 @@ locust:
 
 --- behavior ---
 locust:
-  # holup
-  if random 5%:
-    pause 10
-  if random 25%:
-    pause 3
-  if random 50%:
-    pause
-
   # If there's a wrong cell, eat it.
   if extra:
     seek nearest extra
     if standing on extra:
+      pause 5
       erase
-
-  # paint an intended cell.
-  if missing:
-    seek nearest missing
-    if standing on missing:
-      draw leaf fade 600 # 1 min
-      pause 0-10
       done
 
-  # Nothing needed — park on an unoccupied leaf.
+  # Otherwise paint an intended cell.
+  if missing:
+    if random 5%:
+      pause 10
+    if random 25%:
+      pause 3
+    if random 50%:
+      pause
+    seek nearest missing
+    if standing on missing:
+      draw leaf hold 6000 # 300s
+      pause 6
+      done
+
+  # Nothing needed — park on an unoccupied leaf. `free` drops
+  # candidates another locust already stands on AND claims the
+  # winning cell, so 16 locusts don't all converge on the same
+  # Manhattan-nearest leaf and saturate A*. Timeout bails to
+  # `wander` if nothing reachable.
+  # We re-draw the current leaf if we leave, to hold it longer
   if on current:
+    draw leaf hold 4800 # 240s
     pause 5-20
     done
-
   seek nearest free current timeout 50
   pause
   done
