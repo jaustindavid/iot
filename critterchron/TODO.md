@@ -35,67 +35,29 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   sustained outage; this is about recovering the *configured*
   network after a transient one.
 
-- **Time-of-day knobs for brightness / night mode.** Today brightness
-  is purely a function of the ambient light sensor: lux (or CDS raw)
-  → curve → bri target → Schmitt-triggered night mode. Two real-world
-  failure modes argue for a time-of-day overlay on top:
-  1. **Bedside display at night.** A nightstand panel may sit in a
-     dim-but-not-pitch-black room — sensor reads bri=4, panel renders
-     at perceptible levels, but the human asleep next to it wants a
-     *much* dimmer or off panel during sleep hours regardless of
-     ambient. Today there's no way to say "between 11pm and 7am, cap
-     max_bri at 1, regardless of sensor."
-  2. **Workspace where bright-natural-light-via-windows during the
-     day biases the curve unrealistically.** A panel facing a window
-     during morning sun saturates lux high and then never adjusts
-     back down through the working day as the sun moves. Wanting
-     "max_bri=24 1pm-6pm regardless of sensor" is a different shape
-     of need but the same plumbing.
-  Both cases are solved by letting the panel's effective `max_bri`
-  (and possibly `min_bri`, `night_enter`, `night_exit`) be
-  time-of-day-modulated — the sensor still controls the *position*
-  on the curve but the curve's endpoints can shift through the day.
+- **Time-of-day brightness schedule — ESP32 mirror (Part 2).** Particle
+  landed 2026-04-28 (see Completed below for the full design). Same
+  pattern needs to land in `hal/esp32/src/critterchron_esp32.ino`'s
+  brightness block. Mechanical work: copy the `parse_brightness_schedule`
+  / `schedule_match_max_bri` / `ScheduleSeg` definitions, add the
+  `g_sched_*` flags, mirror the heartbeat marker, and add string-cache
+  support to the ESP32 Stra2usClient (currently has the same
+  int/float-only Config interface as Particle did pre-landing). Wire
+  format and KV key are platform-agnostic — same `<app>/<device>/
+  brightness_schedule` with `<app>/brightness_schedule` fallback —
+  so once timmy gets the firmware, it speaks the same schedule
+  language as rachel.
 
-  *Sketch of an interface, not a commitment.* A schedule string in
-  Stra2us KV, parsed once on cache update, evaluated against
-  `clock_.wall_now()` each time the brightness loop reads
-  `max_brightness`:
-  ```
-  brightness_schedule = "23:00-07:00:1, 07:00-09:00:8, 09:00-23:00:64"
-  ```
-  Each segment is `HH:MM-HH:MM:max_bri`; gaps fall through to the
-  device-header default. Wraps midnight via the segment ordering. A
-  parallel `night_force_schedule` could pin the engine into night
-  mode for a window even if bri stays above the Schmitt threshold,
-  for the bedroom case.
-
-  *Open questions.*
-  - Granularity: per-device only, per-device-with-app-fallback, or a
-    single fleet-wide schedule? Per-device most flexible but a pain
-    to manage; the heartbeep / cloud_heartbeep precedent suggests
-    `<app>/<device>/<key>` first then `<app>/<key>`.
-  - Edge transitions: hard cut at the segment boundary, or smooth
-    interpolation between segments? EMA on top of the light sensor
-    smoothing already (50× damping); a hard schedule cut would
-    propagate as a 50-tick fade naturally. Probably fine.
-  - DST / timezone: schedule is local-wall-clock, evaluated through
-    the existing `CritTimeSource::zone_offset_hours()`. WobblyTime
-    would wobble the schedule too — undesirable for "11pm bedtime"
-    semantics. Probably want to evaluate against the *real* time
-    source (un-wobbled), which means exposing the inner clock from
-    WobblyTimeSource or routing the schedule check around it.
-  - Discoverability: today a confused operator can grep `bri=` in a
-    heartbeat and see what the panel thinks. With a schedule active,
-    a richer heartbeat field like `bri=(min<cur<max @schedid)` or
-    `bri_src=schedule|sensor|override` would name *why* the panel is
-    where it is.
-
-  Loosely related to TODO entry "Light-sensor calibration poisons
-  itself; only reflash recovers" — that's about the sensor mapping
-  collapsing in stable lux conditions; this is about the operator
-  wanting human-clock-driven authority over the result. Both could
-  share a "what's actually driving bri right now?" diagnostic in the
-  heartbeat.
+- **Night-force schedule (`night_force_schedule`).** Considered for
+  v1 of the time-of-day work, deferred. Same parser shape as
+  `brightness_schedule` but each segment names a window where the
+  engine should pin into night-palette mode regardless of what the
+  sensor-driven Schmitt trigger says. Use case: bedside panel
+  whose room is dim-but-not-dark when the human goes to bed at 11pm,
+  needs forced-night for the palette swap to kick in even though the
+  sensor reading says "still day." Implementation should reuse the
+  schedule parser if/when this lands — fold the parser out of the
+  brightness block and into a shared utility at that point.
 
 - **One-shot device provisioning script.** Breaking out a fresh device is
   currently a 3-step manual sequence that's easy to botch — the too-big
@@ -752,6 +714,66 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-04-28 — Time-of-day brightness schedule on Particle (Part 1).**
+  Operator-set schedule overrides sensor-driven `max_brightness` during
+  configured time windows. Two motivating use cases: bedside panels
+  that should cap dim during sleep hours regardless of ambient, and
+  workspace panels that should anchor at a specific level during
+  daylight-flooded working hours.
+
+  *Wire format.* String-valued KV at
+  `<app>/<device>/brightness_schedule` (fallback to
+  `<app>/brightness_schedule`). Comma-separated segments, each
+  `HH:MM-HH:MM:max_bri`. Wraparound: start > end crosses midnight.
+  First match wins. Up to 8 segments per schedule.
+  ```
+  brightness_schedule = "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
+  ```
+
+  *Implementation.* `Stra2usClient` gained a single dedicated
+  string-cache slot (`brightness_schedule_[160]`) refreshed during
+  `poll_all` with the standard device-then-app fallback. Brightness
+  loop in `critterchron_particle.cpp` re-parses on change (single
+  strncmp per tick in steady state), evaluates current `Time.hour() *
+  60 + Time.minute()` against parsed segments, applies first-match
+  `max_bri` if any segment matches, falls through to device default
+  otherwise. Time evaluated via `Time.now()` (real wall-clock,
+  un-wobbled by WobblyTime, sidestepping the original entry's DST
+  question). Time.isValid() gates evaluation so a cold-boot device
+  before SNTP sync doesn't apply the schedule against zero-epoch.
+
+  *Signaling.* All-or-nothing parse; any malformed segment rejects
+  the whole schedule. Failures record `err=other:sched: <reason>`
+  via ErrLog (heartbeat-visible). Heartbeat `bri=(...)` field gains
+  a `sched` marker when a segment is matched, `sched-err` when the
+  string is set but parse failed. Examples:
+  - `bri=(1<5<24)` — no schedule active (unset, or no segment matches)
+  - `bri=(1<5<24 sched)` — schedule active, matched segment overriding max_b
+  - `bri=(1<5<128 sched-err)` — schedule string set but parse failed; max_b is device default
+  Parse-on-change deduplication ensures a broken schedule fires its
+  err record exactly once per unique input, not per-tick.
+
+  *Specific failure messages*: `sched: bad seg N: <text>`, `sched:
+  bad time seg N`, `sched: max_bri N out of range seg N`. All wrap to
+  ~50 chars to fit ErrEntry's 56-byte slot.
+
+  *Cap*: 8 segments per schedule. Static array, ~40B static memory,
+  zero heap.
+
+  *What's deliberately not in v1*: `min_brightness` / `night_enter` /
+  `night_exit` are not schedule-overridable (just `max_brightness`).
+  No interpolation between segments — hard cut, the existing 50× EMA
+  smoothing in the brightness loop covers the visual transition (~10s
+  fade). No KV write-back of schedule status — heartbeat
+  err-channel + bri= marker carry the same information for the
+  workflows we care about. ESP32 mirror (Part 2) and night-force
+  schedule deferred to separate Near-term entries.
+
+  *Soak plan*: rachel's bedside as test target, schedule like
+  `"23:00-07:00:1, 07:00-09:00:8, 09:00-23:00:64"` for a couple of
+  nights. Confirm the cut points behave, EMA smoothing covers the
+  perceptual gap, no spurious `sched-err` records appear.
 
 - **2026-04-28 — WiFi reconnect kick on Particle (Part 1).** OG Photon
   rico observed wedging in `WiFi.ready()==false` for long stretches

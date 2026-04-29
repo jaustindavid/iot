@@ -149,6 +149,16 @@ public:
         return ir_loaded_sha_[0] ? ir_loaded_sha_ : critter_ir::SCRIPT_SHA;
     }
 
+    // String tunable: time-of-day brightness schedule. Wire format is
+    // documented at the parser site in critterchron_particle.cpp's
+    // brightness loop. Refreshed during poll_all() with the standard
+    // <app>/<device>/<key> → <app>/<key> fallback. NUL-terminated;
+    // empty string means the key is not set / not yet fetched (treat
+    // as "no schedule, use device default max_brightness"). Currently
+    // the only string-valued tunable — generalize via a Config
+    // interface extension when a second string key shows up.
+    const char* brightness_schedule() const { return brightness_schedule_; }
+
 private:
     static constexpr size_t CACHE_CAP = 32;
     static constexpr size_t KEY_MAX   = 40;
@@ -274,6 +284,13 @@ private:
     char           ir_detected_to_name_  [IR_SCRIPT_NAME_MAX] = {0};
     char           ir_detected_to_sha_   [65] = {0};
     size_t         ir_detected_size_      = 0;
+
+    // Brightness schedule string buffer. 160 bytes is enough for ~6 segments
+    // at typical lengths ("HH:MM-HH:MM:NNN, " ≈ 20 chars). Refreshed in
+    // poll_all() with device-then-app fallback; left untouched if both KV
+    // fetches fail so a transient network blip doesn't drop a known-good
+    // schedule.
+    char           brightness_schedule_[160] = {0};
 };
 
 #endif  // PLATFORM_ID

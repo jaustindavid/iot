@@ -224,6 +224,13 @@ static char          g_ota_loaded_sha [65]                 = {0};
 static volatile uint8_t  g_bri             = MAX_BRIGHTNESS;
 static volatile uint8_t  g_bri_min         = MIN_BRIGHTNESS;
 static volatile uint8_t  g_bri_max         = MAX_BRIGHTNESS;
+// Schedule observability flags — written by the brightness loop, read by
+// the heartbeat formatter. `g_sched_in_use` true iff a parsed schedule
+// matched current time and is overriding `max_b`. `g_sched_parse_err`
+// true iff the schedule string is set but failed to parse. Mutually
+// exclusive with `g_sched_in_use`.
+static volatile bool     g_sched_in_use    = false;
+static volatile bool     g_sched_parse_err = false;
 static volatile uint32_t g_phys_avg_us     = 0;
 static volatile uint32_t g_phys_max_us     = 0;
 static volatile uint32_t g_rend_avg_us     = 0;
@@ -286,6 +293,104 @@ static bool is_crash_reset(int reason) {
     }
 }
 
+// ---------- Time-of-day brightness schedule ----------
+//
+// Wire format: comma-separated segments, each `HH:MM-HH:MM:max_bri`. e.g.:
+//   "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
+// Times are local wall-clock (TIMEZONE_OFFSET_HOURS already set in setup
+// via Time.zone). Wraparound is handled by start > end (e.g. 23:00-07:00
+// crosses midnight). Segments are tried in declaration order; first match
+// wins, which lets a tighter "morning" overlay sit on top of a broader
+// "day" segment without ambiguity.
+//
+// Parse-on-change: the brightness loop only re-parses when the source
+// string differs from the last-parsed copy, so a steady-state schedule
+// costs zero work per tick.
+//
+// All-or-nothing: if any segment fails to parse, the whole schedule is
+// rejected and we fall through to the device-default `max_brightness`.
+// Failure surfaces as `err=other:sched: <reason>` in the heartbeat; the
+// next heartbeat's `bri=(...sched-err)` marker stays sticky until the
+// schedule string is fixed (or cleared).
+//
+// Empty string = "no schedule active." Not an error.
+
+struct ScheduleSeg {
+    uint16_t start_min;   // 0..1439 (minutes since midnight, local)
+    uint16_t end_min;     // 0..1439
+    uint8_t  max_bri;
+};
+static constexpr int  SCHEDULE_MAX_SEGS = 8;
+static ScheduleSeg    s_sched_segs[SCHEDULE_MAX_SEGS];
+static uint8_t        s_sched_count = 0;
+static char           s_sched_last[160] = {0};   // last source string parsed
+static bool           s_sched_parse_ok = false;
+
+// Returns true if the input parses cleanly into s_sched_segs[0..s_sched_count).
+// On failure: returns false, s_sched_count = 0, error recorded in g_errlog.
+// Empty input: returns true with s_sched_count = 0 (no schedule, no error).
+static bool parse_brightness_schedule(const char* s) {
+    s_sched_count = 0;
+    if (!s || !*s) return true;
+    int seg_idx = 0;
+    const char* p = s;
+    while (*p && seg_idx < SCHEDULE_MAX_SEGS) {
+        while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+        if (!*p) break;
+        int sh, sm, eh, em, mb, n = 0;
+        if (sscanf(p, "%d:%d-%d:%d:%d%n", &sh, &sm, &eh, &em, &mb, &n) != 5) {
+            // Capture the offending segment text for the diagnostic.
+            const char* end = p;
+            while (*end && *end != ',') ++end;
+            int len = (int)(end - p);
+            if (len > 28) len = 28;
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: bad seg %d: %.*s", seg_idx, len, p);
+            s_sched_count = 0;
+            return false;
+        }
+        if (sh < 0 || sh > 23 || sm < 0 || sm > 59 ||
+            eh < 0 || eh > 23 || em < 0 || em > 59) {
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: bad time seg %d", seg_idx);
+            s_sched_count = 0;
+            return false;
+        }
+        if (mb < 0 || mb > 255) {
+            critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                "sched: max_bri %d out of range seg %d", mb, seg_idx);
+            s_sched_count = 0;
+            return false;
+        }
+        s_sched_segs[seg_idx].start_min = (uint16_t)(sh * 60 + sm);
+        s_sched_segs[seg_idx].end_min   = (uint16_t)(eh * 60 + em);
+        s_sched_segs[seg_idx].max_bri   = (uint8_t)mb;
+        ++seg_idx;
+        p += n;
+    }
+    s_sched_count = (uint8_t)seg_idx;
+    return true;
+}
+
+// Returns the matched segment's max_bri, or -1 if no segment matches the
+// current time (caller falls through to the device-default max_brightness).
+// Caller is responsible for ensuring s_sched_parse_ok is true and Time is
+// valid before consulting.
+static int schedule_match_max_bri(uint16_t now_min) {
+    for (uint8_t i = 0; i < s_sched_count; ++i) {
+        const auto& seg = s_sched_segs[i];
+        bool in_seg;
+        if (seg.start_min <= seg.end_min) {
+            in_seg = (now_min >= seg.start_min && now_min < seg.end_min);
+        } else {
+            // Wraparound midnight: e.g., start=23:00, end=07:00.
+            in_seg = (now_min >= seg.start_min || now_min < seg.end_min);
+        }
+        if (in_seg) return (int)seg.max_bri;
+    }
+    return -1;
+}
+
 #if defined(STRA2US_HOST)
 // Heartbeat + KV poll, called from the telemetry worker. Heartbeat payload
 // is diagnostic — grep-friendly k=v tokens, no JSON overhead. Policy:
@@ -330,9 +435,18 @@ static int telemetry_cycle() {
     } else {
         snprintf(script_tag, sizeof(script_tag), "default");
     }
+    // Schedule marker: appended inside the bri=(...) field so the operator
+    // sees "is the schedule driving this device's max_bri right now?" at a
+    // glance. `sched` = parsed schedule, current segment matched.
+    // `sched-err` = string is set but parse failed; max_b is the device
+    // default. Empty = no schedule active (either unset, or set with no
+    // matching segment for the current time).
+    const char* sched_tag = g_sched_parse_err ? " sched-err"
+                          : g_sched_in_use     ? " sched"
+                          : "";
     int rlen = snprintf(report, sizeof(report),
         "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s "
-        "bri=(%u<%u<%u) "
+        "bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu",
@@ -343,7 +457,7 @@ static int telemetry_cycle() {
         (int)System.resetReason(),
         APP_VERSION,
         script_tag,
-        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max,
+        (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
         (unsigned long)g_interp_avg_us, (unsigned long)g_interp_max_us,
@@ -901,6 +1015,33 @@ void loop() {
 
         int min_b = g_cfg.get_int("min_brightness", MIN_BRIGHTNESS);
         int max_b = g_cfg.get_int("max_brightness", MAX_BRIGHTNESS);
+
+        // Time-of-day schedule override on max_b. See parse_brightness_schedule
+        // above the loop for the wire format and parsing semantics.
+        // Re-parse only when the source string changes — steady state costs
+        // a single strncmp per tick. If the string is set but parses badly
+        // we keep the device default and surface `bri=(...sched-err)` in
+        // heartbeats (the parser already recorded the specific reason via
+        // g_errlog). Time.isValid() gates evaluation so a cold-boot device
+        // before SNTP sync doesn't apply a schedule against zero-epoch.
+        const char* sched_str = g_cfg.brightness_schedule();
+        if (strncmp(sched_str, s_sched_last, sizeof(s_sched_last)) != 0) {
+            strncpy(s_sched_last, sched_str, sizeof(s_sched_last) - 1);
+            s_sched_last[sizeof(s_sched_last) - 1] = '\0';
+            s_sched_parse_ok = parse_brightness_schedule(s_sched_last);
+        }
+        bool sched_in_use = false;
+        if (s_sched_parse_ok && s_sched_count > 0 && Time.isValid()) {
+            uint16_t now_min = (uint16_t)(Time.hour() * 60 + Time.minute());
+            int sched_max = schedule_match_max_bri(now_min);
+            if (sched_max >= 0) {
+                max_b = sched_max;
+                sched_in_use = true;
+            }
+        }
+        g_sched_in_use    = sched_in_use;
+        g_sched_parse_err = (s_sched_last[0] != '\0' && !s_sched_parse_ok);
+
         // Floor at 1, not 0: bri=0 turns the panel off entirely and is
         // reserved as a sentinel (see night_enter_brightness<=0 above).
         // Catalog range is already [1,255] but belt-and-suspenders here

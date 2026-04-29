@@ -188,3 +188,23 @@ vars:
       Smoothed-brightness threshold at which the night palette disengages.
       Device clamps to enter + 1 on read so a misconfigured pair can't
       deadlock the trigger.
+
+  brightness_schedule:
+    type: string
+    scope: [app, device]
+    help: |
+      Time-of-day override on max_brightness. Comma-separated segments
+      of the form `HH:MM-HH:MM:max_bri`; first match wins; wraparound
+      handled by start > end (e.g. `23:00-07:00:1` crosses midnight).
+      Up to 8 segments per schedule. Example:
+          "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
+      When set and a segment matches the current local wall-clock time,
+      the segment's max_bri replaces the value of `max_brightness`
+      for the brightness-loop calculation; sensor-driven smoothing
+      still drives the final on-panel brightness, so transitions
+      across segment boundaries fade over ~10s rather than snapping.
+      Empty string = no schedule active. All-or-nothing parse:
+      malformed segments reject the whole schedule (heartbeat
+      surfaces `bri=(...sched-err)` plus `err=other:sched: <reason>`).
+      Active schedule visible in heartbeat as `bri=(...sched)`.
+    ops_only: true    # device reads via Stra2usClient::brightness_schedule(), not get_int/get_float
