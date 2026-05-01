@@ -85,6 +85,36 @@ vars:
       coupling them through this one. Heartbeat surfaces each kick
       as `err=net:reconnect_kick offline=Nms`.
 
+  fw_target:
+    type: string
+    scope: [app, device]
+    help: |
+      Target firmware identifier the device should pull on its next
+      `fw_poll_interval` cycle (and on cold boot). Matches the suffix
+      used by `tools/publish_fw.py --target <name>`; today the only
+      shipped value is `esp32c3` (timmy's platform). Empty / unset
+      means "no firmware OTA — keep running whatever's flashed."
+      Device-then-app fallback: per-device override wins, otherwise
+      fleet-wide. Set with `tools/publish_fw.py` (Phase 1) and
+      `stra2us put critterchron/<device>/fw_target <target>` (or
+      `critterchron/fw_target <target>` for fleet-wide).
+    ops_only: true    # device reads via Stra2usClient::fw_poll(), not get_int/get_float
+
+  fw_poll_interval:
+    type: int
+    default: 86400
+    scope: [app, device]
+    range: [60, 604800]
+    help: |
+      Seconds between firmware OTA poll cycles. Decoupled from
+      `ir_poll_interval` because firmware updates are rare events
+      (typically weekly at most), much rarer than IR script changes —
+      borrowing `ir_poll_interval` here would generate hundreds of
+      needless sidecar GETs per device per day. 86400s = 1 day.
+      Floor 60s in the task loop for testing convenience. ESP32-only
+      today; Particle firmware OTA goes through Particle Cloud, not
+      this path.
+
   # ---------- WobblyTime ----------
 
   wobble_min_seconds:

@@ -27,6 +27,7 @@
 #include "ir/IrRuntime.h"
 #include "sha256.h"
 #include <Arduino.h>
+#include <Update.h>     // arduino-esp32 Update class for OTA partition writes
 #include <string.h>
 #include <strings.h>   // strcasestr (newlib GNU extension; available on
                        // Arduino-ESP32 under the default -D_GNU_SOURCE)
@@ -620,6 +621,11 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
         payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
                       ((size_t)b[3] << 8)  |  b[4];
         hdr_len = 5;
+    } else if (b[0] == 0xc0 || (b[0] & 0xf0) == 0x80) {
+        // nil (0xc0) or fixmap error envelope (0x8X) = key not found.
+        // Silent miss — caller decides whether absence is an error
+        // (fw_target/brightness_schedule both treat unset as normal).
+        return false;
     } else {
         g_errlog.record(ErrCat::OtaFetch, "kvs msgpack hdr=0x%02x", b[0]);
         return false;
@@ -635,6 +641,309 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
     if (hdr_len > 0) memmove(buf, buf + hdr_len, payload_len);
     buf[payload_len] = '\0';
     out_len = payload_len;
+    return true;
+}
+
+// Streaming KV fetch for large blobs (firmware OTA, ~1MB). Mirror of
+// kv_fetch_str_'s request side, but the body is forwarded chunk-by-chunk
+// to a caller-supplied callback rather than buffered in RAM. The msgpack
+// bin header (1-5 bytes depending on length) is consumed internally and
+// the callback only sees raw payload bytes — same semantic as
+// kv_fetch_str_'s in-place header strip, just streamed.
+//
+// Body HMAC verification stays in this layer: every response byte still
+// flows through hmac_sha256_update, and verification fires after the
+// last byte is consumed. So even though the callback can't validate
+// individual chunks, the *whole* fetch is HMAC-verified before this
+// function returns true. A trustworthy callback (one that actually
+// commits the bytes — e.g., Update.write) should still do its own
+// integrity check (e.g., compare a streaming SHA256 against the
+// sidecar's claimed sha) as belt-and-suspenders, since the HMAC
+// verification only catches in-flight tampering, not whatever happens
+// after the byte leaves this function.
+//
+// Timeout is 30s (vs 5s for kv_fetch_str_): 1MB at a slow WiFi line
+// rate (~50KB/s on a marginal AP) can take 20s to stream; 30s gives
+// margin without papering over genuine wedges.
+bool Stra2usClient::kv_fetch_stream_(const char* full_key,
+                                     ChunkCallback cb, void* userdata,
+                                     size_t* out_payload_size) {
+    if (out_payload_size) *out_payload_size = 0;
+    if (!cb) return false;
+
+    char uri[160];
+    snprintf(uri, sizeof(uri), "/kv/%s", full_key);
+
+    uint32_t ts = (uint32_t)::time(nullptr);
+    char sig[65];
+    sign_(uri, nullptr, 0, ts, sig);
+
+    char req[512];
+    int req_len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "X-Client-ID: %s\r\n"
+        "X-Timestamp: %lu\r\n"
+        "X-Signature: %s\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        uri, host_, port_, client_id_, (unsigned long)ts, sig);
+    if (req_len >= (int)sizeof(req)) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream req too big: %d", req_len);
+        return false;
+    }
+
+    bool sent = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensure_connected_()) { delay(100); continue; }
+        if (send_all_(req, req_len)) { sent = true; break; }
+        if (attempt == 1) {
+            g_errlog.record(ErrCat::OtaFetch, "kvstream send_all failed (2x)");
+            return false;
+        }
+    }
+    if (!sent) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream ensure_connected failed (2x)");
+        return false;
+    }
+
+    // ---------- read response headers (same shape as read_response_) ----------
+    unsigned long start = millis();
+    char hdr_buf[1024];
+    int total = 0;
+    while (millis() - start < 30000) {
+        if (tcp_.available()) {
+            int n = tcp_.read((uint8_t*)(hdr_buf + total),
+                              sizeof(hdr_buf) - 1 - total);
+            if (n <= 0) break;
+            total += n;
+            hdr_buf[total] = '\0';
+            if (strstr(hdr_buf, "\r\n\r\n")) break;
+        } else {
+            yield();
+        }
+        delay(10);
+    }
+    if (!strstr(hdr_buf, "\r\n\r\n")) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream hdr timeout total=%d", total);
+        close(); return false;
+    }
+
+    int status = -1;
+    const char* sp = strchr(hdr_buf, ' ');
+    if (!sp) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream bad status line");
+        close(); return false;
+    }
+    status = atoi(sp + 1);
+    if (status != 200) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream status=%d", status);
+        close(); return false;
+    }
+
+    int content_length = 0;
+    const char* cl = strcasestr(hdr_buf, "content-length:");
+    if (cl) {
+        cl += 15;
+        while (*cl == ' ') cl++;
+        content_length = atoi(cl);
+    }
+    if (content_length <= 0) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream missing content-length");
+        close(); return false;
+    }
+
+    char resp_ts [16] = {0};
+    char resp_sig[72] = {0};
+    char resp_conn[16] = {0};
+    auto copy_header = [&](const char* name, char* dst, size_t dst_cap) {
+        const char* h = strcasestr(hdr_buf, name);
+        if (!h) return;
+        h += strlen(name);
+        while (*h == ' ') h++;
+        size_t i = 0;
+        while (*h && *h != '\r' && *h != '\n' && i + 1 < dst_cap) {
+            dst[i++] = *h++;
+        }
+        dst[i] = '\0';
+    };
+    copy_header("x-response-timestamp:", resp_ts,  sizeof(resp_ts));
+    copy_header("x-response-signature:", resp_sig, sizeof(resp_sig));
+    copy_header("connection:",           resp_conn, sizeof(resp_conn));
+    bool server_will_close = (strcasecmp(resp_conn, "close") == 0);
+
+    const bool verify = resp_ts[0] != '\0' && resp_sig[0] != '\0';
+    if (!verify) {
+        g_errlog.record(ErrCat::OtaFetch, "kvstream 2xx unsigned");
+        close(); return false;
+    }
+
+    HMAC_SHA256_CTX hctx;
+    {
+        uint8_t secret[32];
+        hex_to_bytes_(secret_hex_, secret, 32);
+        hmac_sha256_init(&hctx, secret, 32);
+        hmac_sha256_update(&hctx, (const uint8_t*)uri, strlen(uri));
+    }
+
+    const char* hdr_end = strstr(hdr_buf, "\r\n\r\n");
+    int hdr_size      = (int)(hdr_end - hdr_buf) + 4;
+    int body_have_buf = total - hdr_size;
+    const uint8_t* body_start = (const uint8_t*)hdr_buf + hdr_size;
+
+    // ---------- msgpack bin header state machine ----------
+    // First byte is the type marker; subsequent 1, 2, or 4 bytes are
+    // length prefix. We accept bin8/bin16/bin32 for parity with
+    // kv_fetch_str_'s widening (str variants too — same wire layout,
+    // different type byte). For 1MB firmware, expected type is bin32
+    // (0xc6) since payload > 64KB.
+    uint8_t  mp_hdr[5] = {0};
+    int      mp_hdr_filled = 0;
+    int      mp_hdr_total  = 0;     // 0 = type byte not yet seen; 2/3/5 once known
+    size_t   payload_size = 0;
+    bool     payload_known = false;
+    size_t   payload_consumed = 0;
+    bool     callback_aborted = false;
+
+    auto consume = [&](const uint8_t* data, size_t n) -> bool {
+        // Phase 1: feed bytes into the msgpack header until we know the size.
+        while (!payload_known && n > 0) {
+            if (mp_hdr_filled == 0) {
+                mp_hdr[0] = data[0];
+                uint8_t b0 = mp_hdr[0];
+                if (b0 == 0xc4 || b0 == 0xd9)        mp_hdr_total = 2;
+                else if (b0 == 0xc5 || b0 == 0xda)   mp_hdr_total = 3;
+                else if (b0 == 0xc6 || b0 == 0xdb)   mp_hdr_total = 5;
+                else {
+                    g_errlog.record(ErrCat::OtaFetch,
+                                    "kvstream msgpack hdr=0x%02x", b0);
+                    return false;
+                }
+                mp_hdr_filled = 1;
+                data++; n--;
+                continue;
+            }
+            int want = mp_hdr_total - mp_hdr_filled;
+            int take = (int)n < want ? (int)n : want;
+            memcpy(mp_hdr + mp_hdr_filled, data, (size_t)take);
+            mp_hdr_filled += take;
+            data += take;
+            n    -= (size_t)take;
+            if (mp_hdr_filled == mp_hdr_total) {
+                if (mp_hdr_total == 2) {
+                    payload_size = mp_hdr[1];
+                } else if (mp_hdr_total == 3) {
+                    payload_size = ((size_t)mp_hdr[1] << 8) | mp_hdr[2];
+                } else {  // 5
+                    payload_size = ((size_t)mp_hdr[1] << 24)
+                                 | ((size_t)mp_hdr[2] << 16)
+                                 | ((size_t)mp_hdr[3] <<  8)
+                                 |  mp_hdr[4];
+                }
+                payload_known = true;
+                if (out_payload_size) *out_payload_size = payload_size;
+            }
+        }
+        // Phase 2: forward payload bytes to the callback.
+        if (payload_known && n > 0) {
+            size_t remaining_payload = (payload_consumed < payload_size)
+                                     ? (payload_size - payload_consumed) : 0;
+            size_t forward = n < remaining_payload ? n : remaining_payload;
+            if (forward > 0) {
+                if (!cb(userdata, data, forward)) {
+                    callback_aborted = true;
+                    return false;
+                }
+                payload_consumed += forward;
+            }
+        }
+        return true;
+    };
+
+    // Fold the header-buffer's body tail into HMAC + consume pipeline.
+    if (body_have_buf > 0) {
+        hmac_sha256_update(&hctx, body_start, (size_t)body_have_buf);
+        if (!consume(body_start, (size_t)body_have_buf)) {
+            close();
+            if (callback_aborted) {
+                g_errlog.record(ErrCat::OtaFetch, "kvstream cb aborted early");
+            }
+            return false;
+        }
+    }
+
+    // ---------- stream remaining body ----------
+    int remaining = content_length - body_have_buf;
+    while (remaining > 0 && (millis() - start < 30000)) {
+        if (tcp_.available()) {
+            uint8_t chunk[1024];
+            int to_read = remaining < (int)sizeof(chunk) ? remaining : (int)sizeof(chunk);
+            int n = tcp_.read(chunk, to_read);
+            if (n <= 0) {
+                g_errlog.record(ErrCat::OtaFetch,
+                                "kvstream body EOF cl=%d consumed=%u rem=%d",
+                                content_length, (unsigned)payload_consumed, remaining);
+                close(); return false;
+            }
+            hmac_sha256_update(&hctx, chunk, (size_t)n);
+            if (!consume(chunk, (size_t)n)) {
+                close();
+                if (callback_aborted) {
+                    g_errlog.record(ErrCat::OtaFetch,
+                                    "kvstream cb aborted at consumed=%u",
+                                    (unsigned)payload_consumed);
+                }
+                return false;
+            }
+            remaining -= n;
+        } else {
+            yield();
+        }
+        delay(1);
+    }
+    if (remaining > 0) {
+        g_errlog.record(ErrCat::OtaFetch,
+                        "kvstream timeout cl=%d rem=%d consumed=%u",
+                        content_length, remaining, (unsigned)payload_consumed);
+        close(); return false;
+    }
+    if (!payload_known || payload_consumed != payload_size) {
+        g_errlog.record(ErrCat::OtaFetch,
+                        "kvstream short payload size=%u consumed=%u",
+                        (unsigned)payload_size, (unsigned)payload_consumed);
+        close(); return false;
+    }
+
+    // Drain residual chunked-encoding fragments (mirror read_response_).
+    int empty_loops = 0;
+    while (empty_loops < 5) {
+        if (tcp_.available()) { tcp_.read(); empty_loops = 0; }
+        else { delay(10); empty_loops++; }
+    }
+
+    // ---------- HMAC verify ----------
+    long ts_val = atol(resp_ts);
+    long now    = (long)::time(nullptr);
+    if (now > 0 && (now - ts_val > 300 || ts_val - now > 300)) {
+        g_errlog.record(ErrCat::OtaFetch,
+                        "kvstream ts drift now=%ld resp=%ld", now, ts_val);
+        close(); return false;
+    }
+    hmac_sha256_update(&hctx, (const uint8_t*)resp_ts, strlen(resp_ts));
+    uint8_t mac[32];
+    hmac_sha256_final(&hctx, mac);
+    char mac_hex[65];
+    for (int i = 0; i < 32; ++i)
+        snprintf(&mac_hex[i*2], 3, "%02x", mac[i]);
+    mac_hex[64] = '\0';
+    if (!hex_equal_(mac_hex, resp_sig)) {
+        g_errlog.record(ErrCat::OtaFetch,
+                        "kvstream HMAC fail consumed=%u",
+                        (unsigned)payload_consumed);
+        close(); return false;
+    }
+
+    if (server_will_close) close();
     return true;
 }
 
@@ -974,6 +1283,183 @@ bool Stra2usClient::ir_apply_if_ready() {
     // pointer has to change) before we'll try again.
     ir_pending_len_ = 0;
     return ok;
+}
+
+// ---------- OTA Firmware (Phase 2 of pull-OTA) ----------
+
+void Stra2usClient::set_running_fw_sha(const char* sha_hex_64) {
+    if (!sha_hex_64) { fw_running_sha_[0] = '\0'; return; }
+    size_t i = 0;
+    while (sha_hex_64[i] && i + 1 < sizeof(fw_running_sha_)) {
+        fw_running_sha_[i] = sha_hex_64[i];
+        ++i;
+    }
+    fw_running_sha_[i] = '\0';
+}
+
+// Streaming-fetch callback context for fw_poll. Carries:
+//   - the SHA256 ctx that hashes the payload as it arrives (compared
+//     against the sidecar's claimed sha after the stream completes)
+//   - bytes-consumed counter (sanity check vs. sidecar's claimed size)
+namespace {
+struct FwApplyCtx {
+    SHA256_CTX sha_ctx;
+    size_t     consumed = 0;
+};
+
+bool fw_chunk_cb_(void* userdata, const uint8_t* chunk, size_t len) {
+    auto* ctx = (FwApplyCtx*)userdata;
+    sha256_update(&ctx->sha_ctx, chunk, len);
+    // Update.write returns bytes-actually-written. Anything other than
+    // `len` means flash error (out of partition space, hardware fault,
+    // wrong U_FLASH command). Abort the stream by returning false; the
+    // outer fw_poll will see this, call Update.abort(), and record an
+    // ErrLog entry.
+    size_t wrote = Update.write((uint8_t*)chunk, len);
+    if (wrote != len) return false;
+    ctx->consumed += len;
+    return true;
+}
+}  // anonymous namespace
+
+void Stra2usClient::fw_poll() {
+    // 1) Read target pointer with the standard device-then-app fallback.
+    char ptr_buf[48];
+    size_t ptr_len = 0;
+    char ptr_key[96];
+    snprintf(ptr_key, sizeof(ptr_key), "%s/%s/fw_target", app_, device_);
+    bool got_target = kv_fetch_str_(ptr_key, ptr_buf, sizeof(ptr_buf), ptr_len);
+    if (!got_target || ptr_len == 0) {
+        snprintf(ptr_key, sizeof(ptr_key), "%s/fw_target", app_);
+        got_target = kv_fetch_str_(ptr_key, ptr_buf, sizeof(ptr_buf), ptr_len);
+    }
+    if (!got_target || ptr_len == 0) {
+        // No target set at either scope. Not an error — just nothing to do.
+        return;
+    }
+    // ptr_buf is now the target name (e.g. "esp32c3").
+
+    // 2) Fetch the sidecar.
+    char sha_key[96 + sizeof(ptr_buf) + 16];
+    snprintf(sha_key, sizeof(sha_key), "%s/fw/%s/sha", app_, ptr_buf);
+    char sidecar[96] = {0};
+    size_t sidecar_len = 0;
+    if (!kv_fetch_str_(sha_key, sidecar, sizeof(sidecar), sidecar_len)) {
+        g_errlog.record(ErrCat::OtaFetch, "fw sidecar fetch failed");
+        return;
+    }
+    // Format: "<64 hex>:<decimal size>"
+    if (sidecar_len < 66 || sidecar[64] != ':') {
+        g_errlog.record(ErrCat::OtaFetch, "fw sidecar malformed len=%u",
+                        (unsigned)sidecar_len);
+        return;
+    }
+    char expected_sha[65];
+    memcpy(expected_sha, sidecar, 64);
+    expected_sha[64] = '\0';
+    size_t expected_size = 0;
+    for (size_t i = 65; i < sidecar_len; ++i) {
+        char c = sidecar[i];
+        if (c < '0' || c > '9') {
+            g_errlog.record(ErrCat::OtaFetch, "fw sidecar bad size");
+            return;
+        }
+        expected_size = expected_size * 10 + (size_t)(c - '0');
+    }
+    if (expected_size == 0) {
+        g_errlog.record(ErrCat::OtaFetch, "fw sidecar size=0");
+        return;
+    }
+
+    // 3) Already running this firmware? Skip.
+    if (fw_running_sha_[0] && strcmp(expected_sha, fw_running_sha_) == 0) {
+        return;
+    }
+
+    LOG_INFO("fw_poll: candidate %s sidecar=%.8s size=%u (running=%.8s)",
+             ptr_buf, expected_sha, (unsigned)expected_size,
+             fw_running_sha_[0] ? fw_running_sha_ : "00000000");
+
+    // 4) Reserve OTA partition + start streaming write.
+    if (!Update.begin(expected_size, U_FLASH)) {
+        g_errlog.record(ErrCat::OtaFetch, "fw Update.begin failed: %s",
+                        Update.errorString());
+        return;
+    }
+
+    char blob_key[96 + sizeof(ptr_buf)];
+    snprintf(blob_key, sizeof(blob_key), "%s/fw/%s", app_, ptr_buf);
+    LOG_INFO("fw_poll: fetching blob %s (%u bytes)",
+             blob_key, (unsigned)expected_size);
+
+    FwApplyCtx ctx;
+    sha256_init(&ctx.sha_ctx);
+
+    size_t streamed_payload_size = 0;
+    if (!kv_fetch_stream_(blob_key, fw_chunk_cb_, &ctx, &streamed_payload_size)) {
+        Update.abort();
+        // kv_fetch_stream_ recorded the specific failure; the abort here
+        // is just to release the OTA partition reservation. Note: if the
+        // failure was inside fw_chunk_cb_ (Update.write returned short),
+        // kv_fetch_stream_'s "kvstream cb aborted" record names that —
+        // distinct from network-side failures.
+        return;
+    }
+
+    // 5) Verify size matches sidecar's claim.
+    if (streamed_payload_size != expected_size) {
+        g_errlog.record(ErrCat::OtaFetch, "fw size mismatch sc=%u got=%u",
+                        (unsigned)expected_size, (unsigned)streamed_payload_size);
+        Update.abort();
+        return;
+    }
+    if (ctx.consumed != expected_size) {
+        // Should be impossible if streamed_payload_size matches and the
+        // callback wrote every byte, but belt-and-suspenders.
+        g_errlog.record(ErrCat::OtaFetch, "fw consumed mismatch sc=%u wrote=%u",
+                        (unsigned)expected_size, (unsigned)ctx.consumed);
+        Update.abort();
+        return;
+    }
+
+    // 6) Verify SHA matches sidecar's claim. The sidecar itself was
+    // HMAC-verified at fetch time (kv_fetch_str_'s response signing
+    // path), so a matching computed-vs-sidecar sha proves the firmware
+    // body was not tampered with in transit. The kv_fetch_stream_ call
+    // also did response-body HMAC verification, so this is
+    // belt-and-suspenders against weird MITM scenarios that affect
+    // body bytes after our HMAC verification (unlikely, but cheap).
+    uint8_t digest[32];
+    sha256_final(&ctx.sha_ctx, digest);
+    char computed_sha[65];
+    static const char HEX_DIGITS[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        computed_sha[2*i]   = HEX_DIGITS[(digest[i] >> 4) & 0xf];
+        computed_sha[2*i+1] = HEX_DIGITS[digest[i] & 0xf];
+    }
+    computed_sha[64] = '\0';
+    if (strcmp(computed_sha, expected_sha) != 0) {
+        g_errlog.record(ErrCat::OtaFetch,
+                        "fw sha mismatch ours=%.8s expected=%.8s",
+                        computed_sha, expected_sha);
+        Update.abort();
+        return;
+    }
+
+    // 7) Finalize the partition and reboot. After Update.end(true),
+    // the new partition is marked for next-boot. ESP.restart() picks
+    // it up; if anything in the new image fails before mark-valid
+    // (Phase 2 step 5), the bootloader rolls back.
+    if (!Update.end(true)) {
+        g_errlog.record(ErrCat::OtaFetch, "fw Update.end failed: %s",
+                        Update.errorString());
+        return;
+    }
+
+    LOG_INFO("fw_poll: applied %s sha=%.8s, rebooting", ptr_buf, computed_sha);
+    delay(500);  // let serial drain
+    ESP.restart();
+    // unreachable
 }
 
 #endif  // ARDUINO_ARCH_ESP32

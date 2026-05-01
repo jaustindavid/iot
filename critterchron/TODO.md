@@ -4,6 +4,92 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Network latency observability — heartbeat stats + optional on-device
+  graph.** Two layered features sharing the same instrumentation. The
+  goal is *deviation from norm* detection, not absolute network
+  performance — operator wants to spot "rico is having a bad
+  afternoon," not measure the internet.
+
+  *Architectural framing.* The graph is a **host feature**, not a
+  script feature. Scripts are pure VM programs that describe agent
+  behavior; they don't (and shouldn't) know whether the host is
+  also painting a network-latency overlay on the panel. The
+  graph-vs-no-graph decision is a per-device operator choice, not
+  authored into the script. This means **zero changes to**: the
+  engine, the IR wire format, the compiler, any `.crit` script, or
+  the DSL. Three sites change:
+
+  1. `hal/{particle,esp32}/src/Stra2usClient.{h,cpp}` — instrument
+     `read_response_` to capture `(timestamp_ms, rtt_ms)` per
+     successful call into a small ring buffer (size 32 or 64; one
+     entry per call). Failures record a sentinel (e.g. 0xFFFF) so
+     loss is distinguishable from "slow but reachable." Expose
+     summary accessors: `last_rtt_ms()`, `recent_p50_ms()`,
+     `recent_p95_ms()`, `recent_loss_pct()`. Cross-platform from
+     day one — the .cpp files are mechanically diff-able.
+
+  2. `hal/{particle,esp32}/src/critterchron_*.{cpp,ino}` — heartbeat
+     format string gains `rtt=(p50<p95<loss%)`. After
+     `g_engine.render(...)` and before `g_sink.show()`, if
+     `latency_graph_enabled` is true, paint the overlay row by
+     reading the ring buffer and calling `g_sink.set(col, row, r,
+     g, b)` for each column. Last-write-wins overpaints whatever
+     the engine put there.
+
+  3. `critterchron.s2s.yaml` — new tunable knobs:
+     - `latency_graph_enabled` (int 0/1, default 0, scope app+device)
+     - `latency_graph_row` (int, default `GRID_HEIGHT-1`, scope app+device) — which row to use; -1 sentinel for "top"
+
+  *No new traffic.* Heartbeat publishes happen every `heartbeep`
+  seconds; `poll_all` runs ~6 KV GETs per heartbeat cycle; IR poll
+  adds 1-2 more per `ir_poll_interval`. Steady state: 7+ samples per
+  heartbeep period. Over a 32-sample ring, that's ~5 heartbeep
+  cycles ≈ 25 minutes of graph history at default cadence. If the
+  operator wants denser samples for the graph, lowering `heartbeep`
+  naturally densifies — no separate ping cadence needed.
+
+  *Color mapping (per the original POC sketch).*
+  - 0–20ms → (0, 255, 0) full green
+  - 20–100ms → green→yellow gradient
+  - 100–500ms → yellow→dim
+  - timeout / sentinel → (255, 0, 0) pure red, distinct from any
+    "slow but successful" color
+  Hardcoded for v1; expose thresholds via KV later if needed.
+
+  *Night mode interaction.* Overlay row goes through the existing
+  sink-side scale, so it dims with everything else at night. If
+  the graph needs to remain readable while the rest of the panel
+  is at night-floor brightness, the overlay paint can bypass the
+  sink scaling — but that's a v2 decision; v1 dims with the rest.
+
+  *Implementation order, with each step independently verifiable:*
+
+  1. **Instrument `read_response_`** — add the timing capture +
+     ring buffer + accessors in `Stra2usClient`. No display change
+     yet. Verify by exposing the values via Log.info temporarily.
+
+  2. **Heartbeat `rtt=(p50<p95<loss%)` field.** Useful in its own
+     right — operator gets fleet-wide latency telemetry from any
+     device, no on-device display needed. If the heartbeat data
+     turns out to answer the operator's "is performance degraded"
+     question, the graph overlay (step 3) might be skippable.
+
+  3. **Graph overlay** — paint the row in the .ino render path,
+     gated on `latency_graph_enabled`. v1 enables on rachel as
+     test target; soak overnight.
+
+  *Cross-platform.* All three steps land on Particle and ESP32
+  simultaneously. Instrumentation is in shared Stra2usClient code.
+  Heartbeat format strings exist in both shims and are mechanically
+  diff-able. Overlay code is small and follows the same pattern
+  cross-platform.
+
+  *Future v2 work, deferred.* Anomaly flag — long-EMA baseline +
+  `err=net:degraded` record when current p50 >> baseline. Worth it
+  once we've established what "normal" looks like per device; would
+  surface degradation events on the heartbeat error channel for
+  fleet-wide alerting. Not v1.
+
 - **Remove the diagnostic `wall=<unix>` field from the heartbeat.** Added
   2026-04-28 to compare `System.uptime()` against `Time.now()` while
   diagnosing rico's apparent uptime drift; the comparison confirmed
@@ -606,18 +692,21 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   first field-deployable ESP32 build is credential-recoverable.
 
 - **ESP32 pull-OTA — Phase 2: device-side pull + apply + auto-rollback.**
-  *Blocked on Phase 1.* Device-side pipeline that fetches a
-  staged firmware from Stra2us KV (same wire format Phase 1
-  validates), verifies it, flashes it via `Update.writeStream`,
-  reboots into the new image, and uses ESP32 A/B partition
-  rollback to recover from a bad firmware. Auto-rollback is
-  folded in deliberately — without it, pull-OTA has a meaningful
-  bricking surface (firmware that boots cleanly then crashes mid-
-  loop, or loses Stra2us auth in the new build, can't be remotely
+  *Phase 1 landed 2026-04-29 — wire layer validated end-to-end with
+  a 1MB blob, no chunked encoding, ~4 MB/s round-trip on the test
+  network, existing on-device str+bin acceptance covers the
+  payload type. Phase 2 unblocked.* Device-side pipeline that
+  fetches a staged firmware from Stra2us KV (same wire format Phase
+  1 confirmed), verifies it, flashes it via `Update.writeStream`,
+  reboots into the new image, and uses ESP32 A/B partition rollback
+  to recover from a bad firmware. Auto-rollback is folded in
+  deliberately — without it, pull-OTA has a meaningful bricking
+  surface (firmware that boots cleanly then crashes mid-loop, or
+  loses Stra2us auth in the new build, can't be remotely
   recovered). They're functionally one piece of code.
 
-  *Wire format (Phase 1 establishes this):* device-then-app
-  fallback for the target pointer:
+  *Wire format (Phase 1 confirmed):* device-then-app fallback for
+  the target pointer:
   - `critterchron/<device>/fw_target` → target name (e.g. `esp32c3`)
   - `critterchron/fw_target` → fleet-wide fallback
   Plus the blob + sidecar at `critterchron/fw/<target>` and

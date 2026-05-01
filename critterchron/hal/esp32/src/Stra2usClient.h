@@ -60,6 +60,22 @@ public:
 
     size_t cache_size() const { return cache_count_; }
 
+    // ---------- OTA Firmware (ESP32 only — Phase 2 of pull-OTA) ----------
+    // fw_poll: read target pointer (device-then-app), fetch sidecar,
+    // compare to running-image sha, stream new firmware through Update,
+    // reboot on success. Call from the tel task on `fw_poll_interval`
+    // cadence + once on boot. Idempotent — does nothing if no target
+    // pointer is set, or if running sha already matches.
+    void fw_poll();
+
+    // Set the running image's SHA256 (64-hex string + NUL). Called once
+    // at boot from setup() after `esp_partition_get_sha256()` returns.
+    // Empty string (default) means "never set" — fw_poll always proceeds
+    // to fetch on first call. Step 4 of Phase 2 wires this up; until
+    // then the field is harmlessly empty and every poll re-fetches.
+    void set_running_fw_sha(const char* sha_hex_64);
+    const char* running_fw_sha() const { return fw_running_sha_; }
+
     // ---------- OTA IR ----------
     // Present here for source parity with the Particle port; M3 wires up the
     // KV/heartbeat side only, so nothing in the .ino calls these yet. They
@@ -121,6 +137,25 @@ private:
     bool kv_fetch_str_(const char* full_key,
                        char* buf, size_t buf_cap, size_t& out_len);
 
+    // Streaming-fetch chunk callback. Called repeatedly with payload
+    // bytes (msgpack bin header already stripped) as they arrive from
+    // the server. Returning false aborts the fetch. `userdata` is
+    // opaque forward — pass whatever the caller needs as context.
+    using ChunkCallback = bool (*)(void* userdata,
+                                   const uint8_t* chunk, size_t len);
+
+    // Stream a large KV value through a callback rather than buffering
+    // it. Used for firmware OTA fetches where the value is ~1MB and
+    // the device can't afford a buffer that size. Returns true on a
+    // clean, HMAC-verified, full-length fetch where every callback
+    // invocation returned true. Sets *out_payload_size to the parsed
+    // msgpack payload length (i.e., the actual binary size, not the
+    // wrapped response length). Mirror of `kv_fetch_str_` for the
+    // streaming case.
+    bool kv_fetch_stream_(const char* full_key,
+                          ChunkCallback cb, void* userdata,
+                          size_t* out_payload_size);
+
     bool ensure_connected_();
     bool send_all_(const char* data, int len);
     int  read_response_(const char* uri,
@@ -174,6 +209,12 @@ private:
     // so a transient network blip doesn't drop a known-good schedule.
     // Mirrors hal/particle/src/Stra2usClient.h.
     char           brightness_schedule_[160] = {0};
+
+    // Running firmware SHA256 (64 lowercase hex chars + NUL). Populated
+    // once at boot from `esp_partition_get_sha256()` (Phase 2 step 4);
+    // empty string until then. fw_poll() compares this against the
+    // sidecar's sha to decide whether to fetch. Empty = always fetch.
+    char           fw_running_sha_[65] = {0};
 };
 
 #endif  // ARDUINO_ARCH_ESP32

@@ -48,6 +48,9 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <esp_ota_ops.h>          // M8: partition-state inspection + mark-valid
+#include <esp_partition.h>        // running-image SHA256 for fw_sha heartbeat field
+#include <esp_image_format.h>     // esp_image_get_metadata for true image_len
+#include "src/sha256.h"           // SHA over raw partition bytes
 #include "src/EspTimeSource.h"
 #else
 #define CRIT_HAVE_WIFI 0
@@ -138,6 +141,18 @@ static inline uint32_t physics_tick_ms() { return critter_ir::RUNTIME_TICK_MS; }
 // at 60s in the task loop. Mirrors the Particle shim.
 #ifndef IR_POLL_INTERVAL_DEFAULT
 #define IR_POLL_INTERVAL_DEFAULT 1200
+#endif
+
+// Cadence for firmware OTA poll. Firmware updates are rare events
+// (typically weekly at most), much rarer than IR script changes —
+// borrowing `ir_poll_interval` here would generate hundreds of
+// needless sidecar GETs per device per day. 86400s = 1 day. Floored
+// at 60s in the task loop for testing convenience. Plus a one-shot
+// fire on boot via `fw_first` so a staged update that landed during
+// an offline overnight gets picked up at next power-on without
+// waiting out the full poll interval.
+#ifndef FW_POLL_INTERVAL_DEFAULT
+#define FW_POLL_INTERVAL_DEFAULT 86400
 #endif
 
 // Deliberate user-visible hold between "blob staged" and "engine swaps
@@ -262,6 +277,64 @@ static void ota_log_partition_state() {
     Serial.printf("[ota] partition=%s state=%s rollback_possible=%d\n",
                   running->label, s,
                   esp_ota_check_rollback_is_possible() ? 1 : 0);
+}
+
+// Compute SHA256 of the currently-running partition. Used by the
+// `fw_sha=<8 hex>` heartbeat field for at-a-glance "what build is
+// timmy actually running" without parsing build dates. Must match
+// `tools/publish_fw.py`'s `sha256(open(firmware.bin).read())` exactly
+// — fw_poll uses the equality check to decide skip-vs-fetch, so any
+// mismatch turns into a crashloop (observed 2026-04-30: applied
+// sha=81f977db, post-reboot esp_partition_get_sha256=bde6d32d → loop).
+//
+// `esp_partition_get_sha256` returns the SHA stored in the image
+// header, hashed by the linker over the image's logical structure
+// — *not* the bytes of the .bin file. So we hash the raw partition
+// bytes ourselves: read `image_len` bytes (the .bin's true length on
+// flash, including appended SHA + padding) and feed them through
+// sha256_update. One-shot in setup(); the running image doesn't
+// change without a reboot.
+static void compute_running_fw_sha(char out_hex_64[65]) {
+    out_hex_64[0] = '\0';
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!running) {
+        Serial.println("[ota] running partition unknown — fw_sha empty");
+        return;
+    }
+    esp_partition_pos_t pos = { running->address, running->size };
+    esp_image_metadata_t meta = {};
+    esp_err_t err = esp_image_get_metadata(&pos, &meta);
+    if (err != ESP_OK) {
+        Serial.printf("[ota] esp_image_get_metadata failed: %s\n",
+                      esp_err_to_name(err));
+        return;
+    }
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    uint8_t chunk[1024];
+    uint32_t off = 0;
+    while (off < meta.image_len) {
+        uint32_t n = meta.image_len - off;
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        err = esp_partition_read(running, off, chunk, n);
+        if (err != ESP_OK) {
+            Serial.printf("[ota] esp_partition_read failed at %u: %s\n",
+                          (unsigned)off, esp_err_to_name(err));
+            return;
+        }
+        sha256_update(&ctx, chunk, n);
+        off += n;
+    }
+    uint8_t digest[32];
+    sha256_final(&ctx, digest);
+    static const char hex_chars[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        out_hex_64[2*i]   = hex_chars[(digest[i] >> 4) & 0xf];
+        out_hex_64[2*i+1] = hex_chars[digest[i] & 0xf];
+    }
+    out_hex_64[64] = '\0';
+    Serial.printf("[ota] running image sha=%.8s... (image_len=%u)\n",
+                  out_hex_64, (unsigned)meta.image_len);
 }
 #endif  // CRIT_HAVE_WIFI
 
@@ -581,13 +654,26 @@ static int telemetry_cycle() {
     const char* sched_tag = g_sched_parse_err ? " sched-err"
                           : g_sched_in_use     ? " sched"
                           : "";
+
+    // Running firmware identity — first 8 hex of the partition SHA256,
+    // computed once at boot. Lets an operator match the deployed device
+    // against the sha printed by `tools/publish_fw.py` without needing
+    // to parse build dates. Empty string sentinel if compute_running_fw_sha
+    // failed at boot (rare; means the partition lookup failed).
+    const char* fw_sha = g_cfg.running_fw_sha();
+    char fw_sha_field[16];
+    if (fw_sha && fw_sha[0]) {
+        snprintf(fw_sha_field, sizeof(fw_sha_field), " fw_sha=%.8s", fw_sha);
+    } else {
+        fw_sha_field[0] = '\0';
+    }
 #if CRIT_HAVE_LIGHT
     // `lux=X.X` is the BH1750 raw reading; bri=(min<cur<max) is the
     // mapped-and-smoothed output the sink is actually using. Together
     // they answer "is the room light what we think it is" (lux) and "is
     // the curve+clamp producing sensible brightness" (bri triplet).
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u%s) lux=%.1f "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s bri=(%u<%u<%u%s) lux=%.1f "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -596,6 +682,7 @@ static int telemetry_cycle() {
         (unsigned long)ESP.getFreeHeap(),
         (int)esp_reset_reason(),
         APP_VERSION,
+        fw_sha_field,
         script_tag,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (double)g_lux,
@@ -608,7 +695,7 @@ static int telemetry_cycle() {
         CONFIG_IDF_TARGET);
 #else
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s script=%s bri=(%u<%u<%u%s) "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -617,6 +704,7 @@ static int telemetry_cycle() {
         (unsigned long)ESP.getFreeHeap(),
         (int)esp_reset_reason(),
         APP_VERSION,
+        fw_sha_field,
         script_tag,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
@@ -692,6 +780,14 @@ static void telemetry_task(void*) {
     uint32_t last_ir_poll_ms = 0;
     bool     ir_first        = true;
 
+    // OTA Firmware poll timer. Same first-on-boot pattern as IR poll, much
+    // longer cadence (1 day vs 20 min) since firmware updates are rare.
+    // The fw_poll() call internally short-circuits when no `fw_target`
+    // pointer is set, so this loop is harmless on devices nobody has
+    // pointed at a firmware target.
+    uint32_t last_fw_poll_ms = 0;
+    bool     fw_first        = true;
+
     // Periodic WiFi reconnect kick. Mirror of the Particle landing
     // (2026-04-28). When WiFi drops, arduino-esp32's auto-reconnect
     // machinery normally brings it back, but if the radio gets wedged
@@ -713,6 +809,7 @@ static void telemetry_task(void*) {
     // starting with cycle 3. Same rationale as the Particle shim.
     (void)g_cfg.get_int("heartbeep",        HEARTBEEP_DEFAULT);
     (void)g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
+    (void)g_cfg.get_int("fw_poll_interval", FW_POLL_INTERVAL_DEFAULT);
     (void)g_cfg.get_int("max_brightness",   MAX_BRIGHTNESS);
 
     for (;;) {
@@ -854,6 +951,24 @@ static void telemetry_task(void*) {
             last_ir_poll_ms = millis();
             ir_first = false;
         }
+
+        // OTA Firmware poll on a separate, slower cadence (default 1 day).
+        // Same connect/close bracket as ir_poll so the sidecar + blob GETs
+        // don't interleave with concurrent publishes. fw_poll itself
+        // short-circuits on missing `fw_target` pointer, so this is a
+        // cheap no-op when no firmware target is staged. On a successful
+        // OTA, fw_poll calls ESP.restart() and never returns from this
+        // line.
+        int fw_int_s = g_cfg.get_int("fw_poll_interval", FW_POLL_INTERVAL_DEFAULT);
+        if (fw_int_s < 60) fw_int_s = 60;
+        uint32_t fw_int_ms = (uint32_t)fw_int_s * 1000UL;
+        if (fw_first || (millis() - last_fw_poll_ms >= fw_int_ms)) {
+            g_cfg.connect();
+            g_cfg.fw_poll();
+            g_cfg.close();
+            last_fw_poll_ms = millis();
+            fw_first = false;
+        }
     }
 }
 #endif  // CRIT_HAVE_STRA2US
@@ -886,6 +1001,18 @@ void setup() {
     // sees for us. PENDING_VERIFY means "this is your first boot after
     // an OTA flash; mark valid or get rolled back."
     ota_log_partition_state();
+
+    // Compute the running image's SHA256 once and stash it in Stra2usClient
+    // for use in the heartbeat (`fw_sha=...`) and by fw_poll's "are we
+    // already running this firmware" short-circuit. One-shot: the running
+    // image doesn't change without a reboot, and reboot reruns setup().
+#if CRIT_HAVE_STRA2US
+    {
+        char fw_sha[65];
+        compute_running_fw_sha(fw_sha);
+        if (fw_sha[0]) g_cfg.set_running_fw_sha(fw_sha);
+    }
+#endif
 #endif
 
     g_sink.begin();
