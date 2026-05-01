@@ -691,19 +691,27 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   and Stra2us integration — landing it before Stra2us means the very
   first field-deployable ESP32 build is credential-recoverable.
 
-- **ESP32 pull-OTA — Phase 2: device-side pull + apply + auto-rollback.**
-  *Phase 1 landed 2026-04-29 — wire layer validated end-to-end with
-  a 1MB blob, no chunked encoding, ~4 MB/s round-trip on the test
-  network, existing on-device str+bin acceptance covers the
-  payload type. Phase 2 unblocked.* Device-side pipeline that
-  fetches a staged firmware from Stra2us KV (same wire format Phase
-  1 confirmed), verifies it, flashes it via `Update.writeStream`,
-  reboots into the new image, and uses ESP32 A/B partition rollback
-  to recover from a bad firmware. Auto-rollback is folded in
-  deliberately — without it, pull-OTA has a meaningful bricking
-  surface (firmware that boots cleanly then crashes mid-loop, or
-  loses Stra2us auth in the new build, can't be remotely
-  recovered). They're functionally one piece of code.
+- ~~**ESP32 pull-OTA — Phase 2: device-side pull + apply.**~~
+  Landed 2026-04-30. Pull pipeline (sidecar + blob fetch via
+  streaming HMAC-verified KV, `Update.writeStream` apply, reboot)
+  works end-to-end. `fw_sha=` heartbeat field, `fw_target` /
+  `fw_poll_interval` KV keys, `tools/publish_fw.py` shipping.
+  Live-tested 2026-04-30 with a happy-path OTA cycle (verified
+  fetch + apply + reboot + new sha shows in heartbeat) and
+  2026-05-01 with a deliberately-bad firmware (verified fetch +
+  apply works for broken builds; recovery via USB).
+
+  **Auto-rollback was scoped into this entry but is NOT done.**
+  Live-tested 2026-05-01 and the shipped arduino-esp32 bootloader
+  does not auto-rollback despite `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`
+  in its sdkconfig — the bootloader binary itself doesn't have the
+  rollback code compiled in. App-side `esp_ota_mark_app_valid_cancel_rollback()`
+  + `esp_ota_check_rollback_is_possible()` return plausible values
+  but are essentially decorative on this bootloader. A bad firmware
+  push WILL crashloop the device until USB recovery. See follow-up
+  entry below.
+
+  Original Phase 2 plan (kept for context):
 
   *Wire format (Phase 1 confirmed):* device-then-app fallback for
   the target pointer:
@@ -773,6 +781,33 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   in heartbeat (`fw_sha` flips, then heartbeat publish=200 on
   the new image), verified rollback on a deliberately-broken
   test firmware (e.g. one that fails to connect WiFi).
+
+- **ESP32 pull-OTA — bootloader auto-rollback (was Phase 2 criterion B).**
+  Carved out 2026-05-01 after live-testing showed arduino-esp32's
+  shipped bootloader doesn't auto-rollback (see the Phase 2 entry
+  above and `memory/debug_arduino_esp32_no_bootloader_rollback.md`).
+  Real fix requires building a custom bootloader from ESP-IDF with
+  `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` and flashing it via
+  esptool at offset 0x0, replacing arduino-esp32's. Substantial
+  build-system work — NOT a config flip.
+
+  *Why this matters:* without it, a bad firmware push (one that
+  fetches + applies cleanly but crashes/reboots before the +60s
+  mark-valid window) crashloops the device until USB recovery.
+  Today the safety net is "have the cable handy."
+
+  *Possible alternatives if the bootloader work is too heavy:*
+  - **App-mediated rollback**: track pending-verify in NVS; on
+    boot, if state was pending-verify and previous shutdown wasn't
+    clean, actively call `esp_ota_mark_app_invalid_rollback_and_reboot`.
+    Adds NVS writes (architecturally fine for fw-OTA, unlike
+    IR-OTA — fw-OTA already writes to flash). Untested; might race
+    badly with esptool's USB flash flow.
+  - **Document and accept**: declare USB recovery the safety net.
+    Acceptable for the current device count; doesn't scale.
+
+  Done definition: deliberately-bad firmware OTA recovers without
+  USB intervention within ~30s of the bad app's first crash.
 
 ## Phase 2+ (per HAL_SPEC)
 
