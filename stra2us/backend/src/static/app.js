@@ -106,9 +106,15 @@ async function fetchStats() {
     const sortedKvs = [...data.kvs].sort((a, b) => a.key.localeCompare(b.key));
     kvList.innerHTML = sortedKvs.map(k => {
         const key = escapeHtml(k.key);
+        // Encrypted records get a lock badge so an operator scanning the list
+        // can tell at a glance which values are confidential. The flag comes
+        // from the server's per-record sidecar, surfaced in /stats.
+        const encBadge = k.encrypted
+            ? ' <span class="badge" style="background:rgba(138,43,226,0.15);color:var(--accent-purple);border:1px solid var(--accent-purple);font-size:0.7rem;" title="Encrypted on the wire to devices">🔒 encrypted</span>'
+            : '';
         return `
         <div class="data-item">
-            <div><strong>${key}</strong></div>
+            <div><strong>${key}</strong>${encBadge}</div>
             <div>
                 <button class="btn-sm" onclick="editData('kv', '${key}')">Edit</button>
                 <button class="btn-sm" onclick="peekData('kv', '${key}')">Read</button>
@@ -126,8 +132,15 @@ async function peekData(type, keyId) {
     if (data.status === 'empty') {
         code.innerText = 'Empty / Value Not Found';
     } else {
+        // Peek shows the *stored* value (plaintext) regardless of the
+        // encrypted flag — encryption only happens on the device-facing
+        // GET path. The flag annotation just tells the operator what
+        // device clients see on the wire.
+        const encLine = (type === 'kv' && data.encrypted)
+            ? 'Encrypted: yes (device GETs return msgpack ext 0x21)\n\n'
+            : (type === 'kv' ? 'Encrypted: no\n\n' : '');
         const decoded = JSON.stringify(data.message, null, 2);
-        code.innerText = `Decoded MessagePack:\n${decoded}\n\nHex Format:\n${data.hex}`;
+        code.innerText = `${encLine}Decoded MessagePack:\n${decoded}\n\nHex Format:\n${data.hex}`;
     }
     modal.style.display = 'block';
 }
@@ -152,9 +165,10 @@ document.querySelectorAll('.close-btn').forEach(btn => {
 });
 
 // KV Management
-function openKvModal(key = '', val = '') {
+function openKvModal(key = '', val = '', encrypted = false) {
     document.getElementById('kvKeyInput').value = key;
     document.getElementById('kvValueInput').value = val;
+    document.getElementById('kvEncryptedInput').checked = !!encrypted;
     document.getElementById('kvModalTitle').innerText = key ? 'Edit KV Pair' : 'Add KV Pair';
     document.getElementById('kvKeyInput').disabled = !!key; // Disable modifying the key if editing
     document.getElementById('kvKeyInput').style.opacity = key ? '0.6' : '1';
@@ -170,18 +184,23 @@ async function editData(type, keyId) {
     const { data } = await fetchAPI(`/peek/kv/${keyId}`);
     if (data.status === 'ok') {
         const val = typeof data.message === 'object' ? JSON.stringify(data.message) : String(data.message);
-        openKvModal(keyId, val);
+        // Pre-fill the Encrypted checkbox from the current sidecar state.
+        // Without this, the FR's "demote to plaintext on bare set" semantic
+        // would silently downgrade an encrypted record any time someone
+        // opened Edit and clicked Save without re-checking the box.
+        openKvModal(keyId, val, !!data.encrypted);
     }
 }
 
 async function saveKv() {
     const key = document.getElementById('kvKeyInput').value.trim();
     const val = document.getElementById('kvValueInput').value.trim();
+    const encrypted = document.getElementById('kvEncryptedInput').checked;
     if (!key || val === '') {
         alert("Both Key and Value are required.");
         return;
     }
-    const { ok, status } = await fetchAPI(`/kv/${key}`, 'POST', { value: val });
+    const { ok, status } = await fetchAPI(`/kv/${key}`, 'POST', { value: val, encrypted });
     if (!ok) {
         alert(`Failed to save KV pair (HTTP ${status})`);
         return;

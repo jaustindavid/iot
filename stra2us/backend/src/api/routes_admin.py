@@ -186,11 +186,17 @@ async def get_stats(admin_ctx: dict = Depends(get_admin_context)):
     for kvk in kv_keys:
         if isinstance(kvk, bytes): kvk = kvk.decode('utf-8')
         name = kvk.split(":", 1)[1]
+        # Skip the encrypted-flag sidecars (`kv:foo:enc`) — they're metadata
+        # for `kv:foo`, not standalone records, and would otherwise show up
+        # as ghost rows in the admin list.
+        if name.endswith(":enc"):
+            continue
         try:
             await check_acl(admin_ctx, f"kv/{name}", mode="read")
         except HTTPException:
             continue
-        kvs.append({"key": name})
+        encrypted = bool(await redis.get(f"kv:{name}:enc"))
+        kvs.append({"key": name, "encrypted": encrypted})
 
     return {
         "queues": queues,

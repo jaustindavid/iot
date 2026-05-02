@@ -49,7 +49,13 @@ python create_admin.py your_username your_password
 
 Then open `http://<your-ip>:8000/admin` in a browser.
 
-### 4. Raspberry Pi Deployment Tips
+### 4. Running the live test suite locally
+
+See [`docs/staging.md`](docs/staging.md) for the host-side bring-up
+(skipping the docker-assumed paths), provisioning a test client
+straight in Redis, and running `tools/tests/test_*_live.py` against it.
+
+### 5. Raspberry Pi Deployment Tips
 - **Auto-start Redis:** `sudo systemctl enable redis-server`
 - **Firewall:** `sudo ufw allow 8000`
 - **Run in background:** `nohup ./start.sh --host 0.0.0.0 &`
