@@ -159,6 +159,30 @@ public:
     // interface extension when a second string key shows up.
     const char* brightness_schedule() const { return brightness_schedule_; }
 
+    // ---------- Procyon rescue: target WiFi credentials ----------
+    // Returns the live values fetched in poll_all() with the standard
+    // <app>/<device> → <app> fallback. Empty string when the key is
+    // unset or never fetched. Heartbeat-cycle code reads these, hashes
+    // the pair, and calls WiFi.setCredentials when the hash changes
+    // — see step 2 of the "Procyon rescue WiFi" TODO entry.
+    // Mirror of brightness_schedule() in shape.
+    const char* wifi_ssid()     const { return wifi_ssid_; }
+    const char* wifi_password() const { return wifi_password_; }
+
+    // ---------- Network latency stats ----------
+    // Mirror of hal/esp32/src/Stra2usClient.h. Per-call elapsed-time
+    // samples accumulate across publish() and the small kv_fetch_ /
+    // kv_fetch_str_ paths (single TCP segment, response < ~1KB);
+    // streaming OTA fetches are intentionally excluded (n/a here —
+    // Particle has no kv_fetch_stream_ — but kept for source parity).
+    // Heartbeat code calls consume_latency_stats() once per cycle:
+    // returns the triple over the window since the last call and
+    // resets the accumulator. Returns false (stats untouched) when
+    // the window had no samples.
+    bool consume_latency_stats(uint32_t* out_min_ms,
+                               uint32_t* out_mean_ms,
+                               uint32_t* out_max_ms);
+
 private:
     static constexpr size_t CACHE_CAP = 32;
     static constexpr size_t KEY_MAX   = 40;
@@ -291,6 +315,37 @@ private:
     // fetches fail so a transient network blip doesn't drop a known-good
     // schedule.
     char           brightness_schedule_[160] = {0};
+
+    // ---------- Procyon rescue: target WiFi credential buffers ----------
+    // Refreshed in poll_all() with device-then-app fallback; left
+    // untouched if both KV fetches fail so a transient network blip
+    // doesn't drop a known-good value. SSID max per 802.11 is 32
+    // bytes; we round up. WPA2 password max is 63 bytes; round up too
+    // (and keep room for a NUL).
+    char           wifi_ssid_     [40] = {0};
+    char           wifi_password_ [72] = {0};
+
+    // ---------- Network latency accumulator ----------
+    // Mirror of hal/esp32/src/Stra2usClient.h. record_latency_(ms) is
+    // called at the exit of publish/kv_fetch_/kv_fetch_str_, including
+    // failure paths (a 5s timeout sample showing red on the sparkline
+    // is exactly the signal an operator wants).
+    void record_latency_(uint32_t ms);
+    uint32_t latency_min_ms_   = UINT32_MAX;
+    uint32_t latency_max_ms_   = 0;
+    uint32_t latency_sum_ms_   = 0;
+    uint32_t latency_count_    = 0;
+
+    // RAII helper — `LatencyScope _t(*this);` at function top records
+    // `millis() - t0` on scope exit (every return path).
+    class LatencyScope {
+    public:
+        explicit LatencyScope(Stra2usClient& c) : c_(c), t0_(millis()) {}
+        ~LatencyScope() { c_.record_latency_(millis() - t0_); }
+    private:
+        Stra2usClient& c_;
+        uint32_t       t0_;
+    };
 };
 
 #endif  // PLATFORM_ID

@@ -76,7 +76,47 @@ public:
             scale_ch(b, brightness_));
     }
 
-    void show() override { FastLED.show(); }
+    void show() override {
+        // Apply overlay row (if active) just before pushing to LEDs.
+        // Engine writes its non-zero pixels via set() earlier this
+        // frame; here we paint overlay pixels ONLY where no engine
+        // output exists (leds_[idx] == 0). Net effect: sparkline is
+        // background, agents on the overlay row render on top of it.
+        // sink.clear() at frame start guarantees leds_ begins zeroed,
+        // so "is zero" cleanly means "no agent here this frame."
+        if (overlay_active_) {
+            for (int x = 0; x < GRID_WIDTH; ++x) {
+                int rx, ry;
+                rotate(x, overlay_y_, rx, ry);
+                if (rx < 0 || rx >= post_rot_w_() ||
+                    ry < 0 || ry >= post_rot_h_()) continue;
+                int idx = rx * post_rot_h_() +
+                          ((rx & 1) ? (post_rot_h_() - 1 - ry) : ry);
+                if (leds_[idx].r || leds_[idx].g || leds_[idx].b) continue;
+                const uint8_t* p = &overlay_pixels_[x * 3];
+                leds_[idx] = CRGB(
+                    scale_ch(p[0], brightness_),
+                    scale_ch(p[1], brightness_),
+                    scale_ch(p[2], brightness_));
+            }
+        }
+        FastLED.show();
+    }
+
+    // Latency-sparkline overlay. n MUST be GRID_WIDTH (each entry is
+    // 3 bytes: r,g,b). The sink copies the pixel data so the caller's
+    // buffer doesn't need to outlive the call. Brightness scaling +
+    // grid rotation are applied in show() via the same set() path the
+    // engine uses, so the overlay matches the rest of the panel's
+    // brightness regime instead of overpowering low-light scenes.
+    void set_overlay_row(int y, const uint8_t* rgb_pixels) {
+        if (y < 0 || y >= GRID_HEIGHT) return;
+        overlay_y_ = y;
+        memcpy(overlay_pixels_, rgb_pixels, sizeof(overlay_pixels_));
+        overlay_active_ = true;
+    }
+
+    void clear_overlay() { overlay_active_ = false; }
 
 private:
     static void rotate(int x, int y, int& rx, int& ry) {
@@ -120,6 +160,10 @@ private:
 
     CRGB    leds_[GRID_WIDTH * GRID_HEIGHT];
     uint8_t brightness_;
+
+    bool    overlay_active_              = false;
+    int     overlay_y_                   = 0;
+    uint8_t overlay_pixels_[GRID_WIDTH * 3] = {0};
 };
 
 #endif  // ARDUINO_ARCH_ESP32

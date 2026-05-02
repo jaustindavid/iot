@@ -10,6 +10,43 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   performance — operator wants to spot "rico is having a bad
   afternoon," not measure the internet.
 
+  **Status (2026-05-01):** Step 1 (instrumentation) and step 3 (graph
+  overlay) landed for ESP32 only, simpler shape than the original
+  plan. Stra2usClient accumulates min/mean/max per heartbeat window
+  (publish + small kv_fetch_* contribute samples; kv_fetch_stream_
+  excluded). Bottom-row sparkline gated by `latency_display` int knob
+  (0/1, default off), color map 20→200ms green→dim-green, >200ms red.
+  Mean is hardcoded as the displayed metric.
+
+  Open follow-ups:
+
+  - **Rotation: render to physical bottom, not logical.** Sparkline
+    currently sits at engine `y=GRID_HEIGHT-1` and goes through the
+    sink's rotation path. On `GRID_ROTATION=0` (timmy) that lands on
+    the physical bottom; on 90/180/270 it would land on whichever
+    physical edge maps to the engine's bottom. Want: physical-bottom
+    always, regardless of rotation. Either invert-rotate at
+    set_overlay_row time, or take physical (x,y) coordinates in the
+    overlay path and skip rotation in show().
+  - **Heartbeat `rtt=(p50<p95<loss%)` field.** Step 2 of the original
+    plan, not done. The accumulator currently only carries
+    min/mean/max — would need a richer ring buffer (32-64 samples)
+    for p50/p95, plus loss tracking (failed-fetch counter). Useful
+    even without the on-device graph, since fleet-wide telemetry
+    answers "which device is degraded" without enabling the overlay.
+  - **Cross-platform: Particle port.** ESP32-only today. Mirror
+    the timing wraps in `hal/particle/src/Stra2usClient.cpp`, the
+    overlay support in `NeoPixelSink.h`, and the heartbeat hook
+    in `critterchron_particle.cpp`. Mostly mechanical from the
+    ESP32 changes.
+  - **Selectable display metric (min|mean|max).** Today mean is
+    hardcoded. Add a knob (e.g. `latency_metric` string or int
+    enum) so an operator can pick which of the three triple values
+    drives the overlay color. Captured-but-unused min/max already
+    in the accumulator.
+
+  Original plan kept below for reference:
+
   *Architectural framing.* The graph is a **host feature**, not a
   script feature. Scripts are pure VM programs that describe agent
   behavior; they don't (and shouldn't) know whether the host is
@@ -90,6 +127,49 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   surface degradation events on the heartbeat error channel for
   fleet-wide alerting. Not v1.
 
+- **`brightness_schedule` segment format extension — specify min too.**
+  Current segment shape is `HH:MM-HH:MM:max_bri`, which clamps the
+  schedule's max but leaves min_brightness untouched. Add an alternate
+  form `HH:MM-HH:MM:min_bri-max_bri` so a segment can pin both ends —
+  useful for "force panel to 1-1 at bedtime" (full clamp, no
+  sensor-driven smoothing within the segment) vs the current "ceiling
+  only, sensor still drives the floor."
+
+  Both forms coexist; parser distinguishes by whether the colon-tail
+  contains a dash. Single-value form keeps existing semantics
+  (max-only, min unchanged). Two-value form replaces both bounds for
+  segments that match. Example:
+
+      "23:00-07:00:1-1, 07:00-09:00:16, 09:00-23:00:64"
+       ^^^^^^^^^^^^^^^^  hard-pinned to 1                 (new form)
+                         ^^^^^^^^^^^^^^^^                 max=16, min unchanged (existing)
+
+  Implementation surface: parser in the brightness_schedule consumer
+  (Particle: `critterchron_particle.cpp`; ESP32:
+  `critterchron_esp32.ino`). When this lands, fold the parser into a
+  shared utility — third consumer (procyon's wifi_ssid/wifi_password
+  doesn't share this format, but a future schedule-shaped key well
+  might). Catalog `brightness_schedule` help text updated to document
+  both forms. Heartbeat surfacing unchanged (`bri=(...sched)` still
+  reports the active values).
+
+- **(low priority) Suppress wifi-creds chaser overlay during OTA "rain"
+  animation.** During the OTA-loading window (g_ota_loading == true on
+  Particle), the IR-OTA fetch animates a downward-rain pattern. The
+  wifi-creds blue-chaser overlay is applied during sink.show() and
+  paints on top of the rain's bottom row, producing two simultaneous
+  visuals that don't fight pixel-wise but read as overlapping. Observed
+  2026-05-02 on rachel: blue chaser triggered at t=33s on a procyon
+  apply, ota_loading entered at t=34s, both rendered concurrently
+  until t=39s. Functionally fine — the operator-actionable signal was
+  delivered — just not pretty.
+
+  Fix: gate the wifi-creds-chaser overlay update on `!g_ota_loading`,
+  or have the sink itself suppress the overlay pass when the OTA
+  animation owns the frame. Two-line change either way. Hold for
+  whenever someone polishes the rescue-flow visuals; the requirement
+  ("visual indicator that new creds got applied") is met today.
+
 - **Remove the diagnostic `wall=<unix>` field from the heartbeat.** Added
   2026-04-28 to compare `System.uptime()` against `Time.now()` while
   diagnosing rico's apparent uptime drift; the comparison confirmed
@@ -106,16 +186,21 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   consider whether the field has accidentally become useful for
   *anything else* before pulling — if not, just revert.
 
-- **Night-force schedule (`night_force_schedule`).** Considered for
-  v1 of the time-of-day work, deferred. Same parser shape as
-  `brightness_schedule` but each segment names a window where the
-  engine should pin into night-palette mode regardless of what the
-  sensor-driven Schmitt trigger says. Use case: bedside panel
-  whose room is dim-but-not-dark when the human goes to bed at 11pm,
-  needs forced-night for the palette swap to kick in even though the
-  sensor reading says "still day." Implementation should reuse the
-  schedule parser if/when this lands — fold the parser out of the
-  brightness block and into a shared utility at that point.
+- ~~**Night-force schedule (`night_force_schedule`).**~~ Closed
+  2026-05-01 as redundant. The original use case (bedside panel
+  forced to night palette at bedtime regardless of sensor reading)
+  is already covered by `brightness_schedule` with a low value:
+  `"23:00-07:00:1"` clamps max_brightness to 1, the smoothed
+  brightness trends to 1, and the existing Schmitt trigger flips
+  the palette to night as a side effect. Works on all devices
+  (rachel night_enter=1, ricky=3, rico=32 all satisfy
+  smoothed≤enter once the clamp settles). The pattern is
+  documented in the `brightness_schedule` catalog help.
+
+  *Future reopen condition:* if a use case actually wants to
+  decouple the two — night palette at *normal* brightness, or low
+  brightness *without* the palette swap — then revisit. Both are
+  niche; not worth the complexity until someone asks.
 
 - **One-shot device provisioning script.** Breaking out a fresh device is
   currently a 3-step manual sequence that's easy to botch — the too-big
@@ -667,29 +752,249 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   value). Not worth chasing while devices are behaving; revisit if
   another device shows the symptom or during a quiet period.
 
-- **Hotspot-mode fallback when WiFi is unreachable (ESP32).** On
-  Particle, WiFi creds live in DCT and DeviceOS handles the "can't
-  associate" case by holding in listening mode for serial/BLE
-  reconfiguration. ESP32 has no such service — the M2 plan is to
-  compile `WIFI_SSID` / `WIFI_PASSWORD` into `hal/devices/<name>.h`,
-  which means a moved/renamed/replaced home network turns the device
-  into a brick that requires a reflash to recover. Want a fallback:
-  when `WiFi.begin()` fails to associate within a budget (e.g. 60s),
-  flip to SoftAP mode with a deterministic SSID (`critterchron-<device
-  name>`, maybe a short PSK derived from `STRA2US_SECRET_HEX` so the
-  owner can precompute it) and stand up a tiny HTTP endpoint that
-  accepts new SSID/PSK. Write them to NVS; on reboot the station-mode
-  path tries NVS first, falls back to compiled-in creds, falls back to
-  hotspot. Visible state on the grid so an operator across the room
-  knows which mode the device is in — maybe re-use the amber rescue
-  chase for "hotspot up, awaiting config." Nice-to-have: advertise via
-  mDNS (`critterchron-<name>.local`) while in hotspot mode so the user
-  doesn't need to find its AP IP. Probably wants a physical trigger
-  too (hold a boot button during reset) to force hotspot mode even
-  when WiFi is fine, so you can rotate credentials without a flash.
-  Scope this as its own milestone (M2.5?) between plain-WiFi bring-up
-  and Stra2us integration — landing it before Stra2us means the very
-  first field-deployable ESP32 build is credential-recoverable.
+- **Procyon rescue WiFi + KV-driven cred install.** A fleet-uniform
+  recovery story for "device can't reach its target network" that
+  doesn't require Particle's mobile app, a Particle-account-claimed
+  device, a captive portal, or USB cable. Subsumes the original
+  ESP32-only hotspot-fallback design (kept below, marked superseded).
+
+  *Operator workflow.*
+  1. Set `<app>/<device>/wifi_ssid` and `<app>/<device>/wifi_password`
+     in Stra2us with the new target network's credentials.
+  2. Ship the device. Operator at the install site fires up an
+     internet-tethered phone hotspot named `procyon` with passphrase
+     `horology` (WPA2). They don't need any account or app — just a
+     hotspot.
+  3. Device boots, fails its primary cred cycle, falls to procyon
+     (always-present rescue cred), connects to the operator's hotspot
+     so it can reach Stra2us.
+  4. Next `poll_all` pulls `wifi_ssid` + `wifi_password`, calls
+     `WiFi.setCredentials` (Particle DCT) / equivalent (ESP32) — new
+     creds persist.
+  5. Visual signal on the panel — one full sweep of a blue chase, ~1s,
+     distinct from the rescue-mode amber. Operator sees confirmation
+     across the room.
+  6. Operator stops their hotspot. Device disassociates, cycles
+     credentials, joins the now-installed target network. Done.
+
+  *Components.*
+  - **Hardcoded rescue cred.** `procyon` / `horology` / WPA2,
+    registered idempotently at boot via `WiFi.setCredentials` (Particle)
+    or the equivalent persistent-list store on ESP32. Lives as
+    `#define`s in a shared header. Procyon is **immune to LRU
+    eviction** (see below) so it's always present as a last-resort
+    fallback throughout the device's life.
+  - **Two new Stra2us KV keys** (both `ops_only: true`):
+    - `wifi_ssid`     — string, scope `[app, device]`
+    - `wifi_password` — string, scope `[app, device]`
+    Both empty / unset = "no override active, leave existing creds
+    alone." Operator does not need to clear after install — the
+    device tracks last-applied via in-RAM hash and only re-calls
+    setCredentials when the value changes.
+
+  *Procyon's slot in the credential cycle.* Last-tried, never first.
+  Need to verify Particle's setCredentials append-vs-prepend behavior
+  before assuming order. On ESP32 we own the cycle order ourselves so
+  it's enforced at the call site.
+
+  *DCT-full handling — nuke-and-restore.* Originally scoped as
+  selective LRU eviction via `WiFi.removeCredentials(ssid)`, but that
+  API does not exist in DeviceOS (verified 2026-05-02 by compile test
+  on photon2 and photon). Since `getCredentials()` returns SSIDs but
+  never passwords, selective eviction with password preservation is
+  impossible.
+
+  Landed design (2026-05-02): when `setCredentials` fails — typically
+  because the DCT is full (Photon=5 slots, Photon 2/Argon=10) — we
+  nuke the entire DCT via `clearCredentials()` and re-install only the
+  two credentials whose passwords we actually know:
+  1. Procyon (compiled-in `PROCYON_PASSPHRASE`)
+  2. The just-pulled target (from KV)
+
+  Trade-off: any other primary networks accumulated on the device are
+  lost. Acceptable for the pathological "device has been re-primed
+  across many distinct networks" case (rare in practice — most devices
+  stay on one home network for life). The much more common case —
+  device with procyon + 1 home network — won't trigger this code path
+  at all because the DCT never fills.
+
+  Lifecycle:
+  - DCT full → setCredentials fails → log warn, nuke, re-add procyon,
+    re-add target.
+  - If procyon re-add fails, errlog `wifi_creds: procyon lost in
+    nuke+restore` — boot-time `register_procyon_credential_` will
+    re-add it on next reboot, but operator notices in the meantime.
+  - If target re-add fails, errlog regular `setCred fail` — next
+    heartbeat cycle retries.
+
+  Future tightening (deferred): track passwords ourselves in EEPROM/NVS
+  so we could do true LRU instead of nuking. Only worth doing if the
+  fleet starts hitting the nuke path frequently.
+
+  *Heartbeat loudness when on procyon.* Connecting to procyon is
+  abnormal and the operator must not miss it.
+  - New heartbeat field `net=<ssid>`. Normal: `net=YourWifiName`. On
+    rescue: `net=procyon` — obvious to anyone tailing the stream.
+  - Errlog entry on first transition into procyon
+    (`err=net:rescue`), so the standard `err=` slot in the heartbeat
+    surfaces it for one cycle.
+  - Re-records `err=net:rescue` every N heartbeats while still on
+    procyon (e.g. every 10), so the alert can't roll off the operator's
+    attention even after the initial entry is acked.
+
+  *Target visibility while on procyon — required for remote installs.*
+  Cloud-visible diagnostic so an operator can debug "why is this
+  remote device on procyon?" without driving over with a cable. Marked
+  required 2026-05-02 because the fleet will include genuinely-remote
+  devices (someone else's home, distant install) where physical
+  intervention is non-trivial.
+
+  Originally scoped as "auth_fail vs no_ap" but **simplified after
+  realizing we can't actually distinguish auth-fail from RSSI-prefer**
+  without forcing a connection attempt (which we're explicitly NOT
+  doing per the design). What `WiFi.scan()` can answer is binary:
+  is the target AP physically visible from this device's location.
+
+  Refined design:
+  - File-scope state: `target_state ∈ {unknown, visible, missing}`
+    plus a next-scan deadline.
+  - While on procyon: run `WiFi.scan()` once every 5 min (after the
+    heartbeat publish, so the ~2–3s blocking scan doesn't push out
+    cadence). Look for the target SSID from `g_cfg.wifi_ssid()` in
+    scan results. Update state.
+  - Off procyon: reset state to `unknown`, no scans.
+  - Heartbeat field, present only when state != unknown:
+    `target=visible` / `target=missing` / `target=unknown`.
+
+  Operator interpretation:
+  - `target=missing` — home AP is genuinely down / out of range / SSID
+    changed. Concrete signal; remote operator can reach out to the
+    install site about the network.
+  - `target=visible` — AP is up and in range, yet device is on procyon.
+    Plausible causes: password wrong, RSSI-prefer of nearby procyon,
+    or DeviceOS hand-off lag. Remote operator's first move: try
+    correcting `wifi_password` in stra2us; if no change, the cause is
+    likely RSSI dominance and operator-side intervention is needed.
+
+  Implementation surface: tel thread (after telemetry_cycle), Particle
+  Stra2usClient already exposes `wifi_ssid()`. Heartbeat snprintf gets
+  a conditional `target=` field. ~50 lines total in
+  critterchron_particle.cpp.
+
+  *(Original auth_fail/no_ap-error-channel design retained below for
+  context, but superseded by the heartbeat-field approach above —
+  fields are louder than errlog ring drains for an
+  always-while-on-procyon signal.)*
+
+  - Target SSID present in scan results AND device fell to procyon →
+    auth failed (password is the prime suspect): record
+    `err=net:auth_fail ssid=<name>`.
+  - Target SSID absent → AP not reachable (router off, out of range):
+    record `err=net:no_ap ssid=<name>`.
+
+  *Failure modes captured.*
+  - KV pull succeeds but `setCredentials` fails (slot management bug,
+    bad input). Log + `err=net:setcreds_fail`. Don't fire blue-sweep
+    signal. Retry next poll.
+  - KV pull returns empty. Silent no-op.
+  - Operator typos a credential. Device joins procyon → applies bad
+    creds → tries them after disassociation → fails → falls back to
+    procyon. Loop continues until operator fixes the KV; each cycle
+    re-emits the loud heartbeat fields. Self-healing once corrected,
+    no operator-side recovery needed.
+  - Operator stops procyon hotspot before the apply completes
+    (rare — apply is fast, ~1 KV-poll cycle). Worst case device
+    drops back to its old credentials and waits for the next time
+    procyon comes up. No corruption, no stuck state.
+
+  *Encryption of `wifi_password` over the wire.* v1 ships plaintext
+  (HTTP-with-HMAC-signed-responses; eavesdropper on procyon can sniff).
+  Documented as accepted risk:
+  - Anyone running a procyon hotspot is already in the device's
+    physical proximity, and procyon-mode use is rare and operator-
+    supervised.
+  - Particle Cloud (when used as transport) uses TLS already; Stra2us
+    on private LAN is the exposed surface.
+  Sub-followup: investigate confidentiality. Constraints: no bare-XOR
+  with the device secret (predictable plaintext like ASCII passphrases
+  and length prefixes makes known-plaintext recovery of the secret
+  trivial). Real options:
+  - **HMAC-derived stream cipher** — `keystream = HMAC(secret, nonce)`,
+    XOR plaintext with keystream, send `(nonce, ciphertext)` to client.
+    No secret leakage from known plaintext as long as nonces don't
+    repeat. Cheap (we already have HMAC).
+  - **AES-128-CTR** if mbedTLS is available cheaply on both platforms.
+    Heavier dep; reach for it only if HMAC-stream isn't enough.
+  - **Status quo** — keep plaintext, document the exposure surface,
+    rely on operational discipline.
+
+  *Cross-platform split.*
+  - **Particle first** — DCT does the persistence, listening mode
+    isn't relevant (we're not using it), `setCredentials` /
+    `removeCredentials` / `getCredentials` / `clearCredentials` cover
+    the API surface. Smaller landing.
+  - **ESP32 second** — needs persistent-list management (NVS-backed
+    or rolled in firmware), blue-sweep through FastLEDSink, scan-based
+    auth-fail detection. Larger landing; deserves its own pass.
+
+  *Implementation order.*
+  1. Particle: hardcode procyon registration at boot. Just adds the
+     cred to DCT, nothing else changes. Verify it shows up in
+     `getCredentials`.
+  2. Particle: catalog entries + KV-pull + setCredentials apply +
+     in-RAM dedup hash. Enable on a single test device (rico or
+     ricky), set wifi_ssid/wifi_password to a known network, trigger
+     fall-to-procyon manually (toggle target router), watch for the
+     install + reconnect sequence.
+  3. Particle: heartbeat `net=` field + `err=net:rescue` /
+     `err=net:auth_fail` / `err=net:no_ap`. Verify in normal AND
+     rescue runs.
+  4. Particle: blue-sweep visual on successful apply.
+  5. Particle: LRU eviction + procyon-immunity. Test with a forced
+     full slot list.
+  6. ESP32 mirror — separate landing, mostly cross-platform-diff-able
+     from steps 1–5 except for persistence + scan APIs.
+  7. Encryption sub-bullet — separate work entirely; doesn't gate v1.
+
+  *Done definition.* On a primed Particle device with stale primary
+  creds (e.g. wrong password), powering up while a procyon hotspot is
+  active and `wifi_ssid`/`wifi_password` are set in Stra2us results in:
+  device joins procyon → blue-sweep fires → setCredentials succeeds →
+  on procyon shutdown, device joins target network without operator
+  intervention. Heartbeat clearly shows `net=procyon` while in rescue,
+  `net=<target>` after recovery, and auth-fail attribution if/when
+  primary fails.
+
+- ~~**Hotspot-mode fallback when WiFi is unreachable (ESP32).**~~
+  Superseded 2026-05-02 by the procyon rescue-WiFi entry above —
+  same goal (recover from "can't reach target network" without USB),
+  better mechanism (fleet-shared rescue cred + KV-driven install
+  vs DIY SoftAP + captive portal). Entry kept below for context on
+  the rejected design.
+
+  *Original (rejected) plan:* On Particle, WiFi creds live in DCT and
+  DeviceOS handles the "can't associate" case by holding in listening
+  mode for serial/BLE reconfiguration. ESP32 has no such service — the
+  M2 plan is to compile `WIFI_SSID` / `WIFI_PASSWORD` into
+  `hal/devices/<name>.h`, which means a moved/renamed/replaced home
+  network turns the device into a brick that requires a reflash to
+  recover. Want a fallback: when `WiFi.begin()` fails to associate
+  within a budget (e.g. 60s), flip to SoftAP mode with a deterministic
+  SSID (`critterchron-<device name>`, maybe a short PSK derived from
+  `STRA2US_SECRET_HEX` so the owner can precompute it) and stand up a
+  tiny HTTP endpoint that accepts new SSID/PSK. Write them to NVS; on
+  reboot the station-mode path tries NVS first, falls back to compiled-
+  in creds, falls back to hotspot. Visible state on the grid so an
+  operator across the room knows which mode the device is in — maybe
+  re-use the amber rescue chase for "hotspot up, awaiting config."
+  Nice-to-have: advertise via mDNS (`critterchron-<name>.local`) while
+  in hotspot mode so the user doesn't need to find its AP IP. Probably
+  wants a physical trigger too (hold a boot button during reset) to
+  force hotspot mode even when WiFi is fine, so you can rotate
+  credentials without a flash. Scope this as its own milestone (M2.5?)
+  between plain-WiFi bring-up and Stra2us integration — landing it
+  before Stra2us means the very first field-deployable ESP32 build is
+  credential-recoverable.
 
 - ~~**ESP32 pull-OTA — Phase 2: device-side pull + apply.**~~
   Landed 2026-04-30. Pull pipeline (sidecar + blob fetch via

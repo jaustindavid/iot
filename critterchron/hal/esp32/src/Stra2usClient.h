@@ -115,6 +115,30 @@ public:
     // hal/particle/src/Stra2usClient.h.
     const char* brightness_schedule() const { return brightness_schedule_; }
 
+    // ---------- Procyon rescue: target WiFi credentials ----------
+    // Mirror of hal/particle/src/Stra2usClient.h. Returns the live
+    // values fetched in poll_all() with the standard <app>/<device> →
+    // <app> fallback. Empty string when the key is unset or never
+    // fetched. Heartbeat-cycle code reads these, hashes the pair, and
+    // calls into the WiFi-cred apply path when the hash changes — see
+    // procyon TODO step 6 (ESP32 mirror).
+    const char* wifi_ssid()     const { return wifi_ssid_; }
+    const char* wifi_password() const { return wifi_password_; }
+
+    // ---------- Network latency stats ----------
+    // Per-call elapsed-time samples accumulate across publish() and the
+    // small kv_fetch_ / kv_fetch_str_ paths (single TCP segment, response
+    // < ~1KB). The streaming kv_fetch_stream_ is intentionally excluded —
+    // a 1MB OTA fetch would dominate the metric and the user reading the
+    // sparkline cares about steady-state heartbeat latency, not OTA
+    // throughput. Heartbeat code calls consume_latency_stats() once per
+    // cycle: returns the triple over the window since the last call and
+    // resets the accumulator. Returns false (stats untouched) when the
+    // window had no samples.
+    bool consume_latency_stats(uint32_t* out_min_ms,
+                               uint32_t* out_mean_ms,
+                               uint32_t* out_max_ms);
+
 private:
     static constexpr size_t CACHE_CAP = 32;
     static constexpr size_t KEY_MAX   = 40;
@@ -210,11 +234,45 @@ private:
     // Mirrors hal/particle/src/Stra2usClient.h.
     char           brightness_schedule_[160] = {0};
 
+    // Procyon-rescue target WiFi credential buffers. Same shape as the
+    // brightness_schedule buffer above. SSID max per 802.11 is 32; pad
+    // to 40. WPA2 password max is 63; pad to 72. Mirror of
+    // hal/particle/src/Stra2usClient.h.
+    char           wifi_ssid_     [40] = {0};
+    char           wifi_password_ [72] = {0};
+
     // Running firmware SHA256 (64 lowercase hex chars + NUL). Populated
     // once at boot from `esp_partition_get_sha256()` (Phase 2 step 4);
     // empty string until then. fw_poll() compares this against the
     // sidecar's sha to decide whether to fetch. Empty = always fetch.
     char           fw_running_sha_[65] = {0};
+
+    // ---------- Network latency accumulator ----------
+    // record_latency_(ms) is called at the exit of publish/kv_fetch_/
+    // kv_fetch_str_, regardless of success. Failures (timeouts) ARE
+    // recorded — a 5s timeout sample showing red on the sparkline is
+    // exactly the signal an operator wants. consume_latency_stats()
+    // reads + resets atomically with respect to the tel task (only the
+    // tel task touches these — main thread reads via the consumer).
+    // Cap latency_count_ at UINT32_MAX/2 so the sum never wraps even
+    // if no consumer ever runs.
+    void record_latency_(uint32_t ms);
+    uint32_t latency_min_ms_   = UINT32_MAX;
+    uint32_t latency_max_ms_   = 0;
+    uint32_t latency_sum_ms_   = 0;
+    uint32_t latency_count_    = 0;
+
+    // RAII helper — `LatencyScope _t(*this);` at function top records
+    // `millis() - t0` on scope exit (every return path). Cleaner than
+    // hand-pairing record_latency_ calls at each exit site.
+    class LatencyScope {
+    public:
+        explicit LatencyScope(Stra2usClient& c) : c_(c), t0_(millis()) {}
+        ~LatencyScope() { c_.record_latency_(millis() - t0_); }
+    private:
+        Stra2usClient& c_;
+        uint32_t       t0_;
+    };
 };
 
 #endif  // ARDUINO_ARCH_ESP32

@@ -156,6 +156,33 @@ static ParticleTimeSource   g_real_clock(TIMEZONE_OFFSET_HOURS);
 static WobblyTimeSource     g_clock(g_real_clock, g_cfg);
 static critterchron::CritterEngine g_engine(g_sink, g_clock);
 
+// ---------- Latency sparkline ----------
+// Mirror of hal/esp32/src/critterchron_esp32.ino. Rolling row of
+// GRID_WIDTH RGB pixels, shifted left + extended once per heartbeat.
+// Pushed to NeoPixelSink as a destructive overlay row at y=GRID_HEIGHT-1
+// (underneath agents — see NeoPixelSink::show() for the under-agent
+// gating). Color: ≤20ms green, 20-200ms green dimming linearly, >200ms
+// red. See the ESP32 .ino for the full design rationale.
+//
+// Lives OUTSIDE the LIGHT_SENSOR_TYPE conditional below: the sparkline
+// is independent of whether the device has a light sensor (sensor-less
+// devices like ranier still want network observability). Was briefly
+// mis-scoped inside the gate, broke ranier compile 2026-05-02.
+static uint8_t g_latency_row[GRID_WIDTH * 3] = {0};
+
+static void latency_color_(uint32_t ms,
+                           uint8_t& r, uint8_t& g, uint8_t& b) {
+    if (ms > 200) { r = 255; g = 0;   b = 0; return; }
+    if (ms <= 20) { r = 0;   g = 255; b = 0; return; }
+    long span  = 255 - 1;          // 254
+    long range = 200 - 20;         // 180
+    long val   = (long)ms - 20;    // 0..180
+    long gv    = 255 - (val * span) / range;
+    if (gv < 1) gv = 1;
+    if (gv > 255) gv = 255;
+    r = 0; g = (uint8_t)gv; b = 0;
+}
+
 #if defined(LIGHT_SENSOR_TYPE)
 static LightSensor          g_light(g_cfg);
 
@@ -291,6 +318,75 @@ static bool is_crash_reset(int reason) {
         default:
             return false;
     }
+}
+
+// ---------- Procyon rescue WiFi credential ----------
+//
+// Fleet-shared fallback credential for recovery when a device can't
+// reach any of its primary networks. Operator at the install site fires
+// up a phone hotspot named `procyon` with passphrase `horology` (WPA2);
+// the device joins it as a last-resort credential and can fetch new
+// primary creds via Stra2us. See TODO entry "Procyon rescue WiFi +
+// KV-driven cred install" for the full design.
+//
+// This is step 1 of that plan — boot-time registration only. The
+// KV-pull-and-apply path (step 2), heartbeat loudness (step 3),
+// blue-sweep visual (step 4), and LRU eviction (step 5) all land
+// separately. With just this in place, a device whose primary creds
+// fail will still try procyon as a credential in DeviceOS's normal
+// cycle, but won't yet self-update its primary creds — that's the
+// payoff of step 2.
+//
+// The passphrase is not a secret. It's compiled into every fleet
+// binary and recoverable from any flashed device. The point is a
+// knowable shared channel for recovery, not authn against attackers —
+// physical access is already root-equivalent (cable). Document, don't
+// hide. Rotate by reflashing the fleet if/when needed.
+#define PROCYON_SSID       "procyon"
+#define PROCYON_PASSPHRASE "horology"
+
+static void register_procyon_credential_() {
+    // Idempotent: only call setCredentials if procyon isn't already in
+    // the persistent list. setCredentials behavior across DeviceOS
+    // versions varies (some return false on duplicate, some silently
+    // overwrite); the explicit pre-check sidesteps both and also
+    // avoids unnecessary DCT writes on every boot.
+    WiFiAccessPoint aps[10];
+    int n = WiFi.getCredentials(aps, sizeof(aps) / sizeof(aps[0]));
+    for (int i = 0; i < n; ++i) {
+        if (strcmp(aps[i].ssid, PROCYON_SSID) == 0) {
+            Log.info("procyon: already registered (slot %d of %d)", i, n);
+            return;
+        }
+    }
+    bool ok = WiFi.setCredentials(PROCYON_SSID, PROCYON_PASSPHRASE, WPA2);
+    Log.info("procyon: setCredentials -> %s (was %d slot(s), now %d)",
+             ok ? "OK" : "FAIL", n, ok ? n + 1 : n);
+}
+
+// Wifi-creds-applied visual signal. `g_wifi_signal_until_ms` is the
+// deadline; loop()'s render hook draws an animated blue chase along
+// the bottom row when (now < deadline) AND we're currently joined to
+// procyon. Operator-actionable state: "you applied creds while I was
+// on the rescue hotspot — drop the hotspot now and I'll cycle to the
+// new network." 10s duration is wide enough that an operator across
+// the room won't miss it on a casual glance; restartable on each
+// successful apply (back-to-back fixes don't quit early).
+#define WIFI_APPLY_SIGNAL_MS 10000
+static unsigned long g_wifi_signal_until_ms = 0;
+
+// FNV-1a 32-bit hash over (ssid + NUL + password). Used by the
+// heartbeat-cycle wifi-cred apply path to dedup re-applies on every
+// poll: only call WiFi.setCredentials when the hashed pair differs
+// from the last successfully-applied pair. NUL separator prevents
+// boundary aliasing ("abc"/"d" vs "ab"/"cd"). Cheap, zero-deps,
+// 4-byte state.
+static uint32_t hash_wifi_creds_(const char* ssid, const char* pw) {
+    uint32_t h = 2166136261u;
+    for (const char* p = ssid; *p; ++p) { h ^= (uint8_t)*p; h *= 16777619u; }
+    h *= 16777619u;  // NUL separator: XOR-with-0 is a no-op, just multiply
+    for (const char* p = pw;   *p; ++p) { h ^= (uint8_t)*p; h *= 16777619u; }
+    return h;
 }
 
 // ---------- Time-of-day brightness schedule ----------
@@ -444,8 +540,16 @@ static int telemetry_cycle() {
     const char* sched_tag = g_sched_parse_err ? " sched-err"
                           : g_sched_in_use     ? " sched"
                           : "";
+    // `net=<ssid>` makes the rescue case loud: steady state shows the
+    // primary network's name; `net=procyon` is the obvious "this device
+    // is on the rescue hotspot" signal in any heartbeat tail. Empty
+    // when WiFi.SSID() returns null (pre-association). Mirror landing
+    // on ESP32 is separate work.
+    const char* cur_ssid = WiFi.SSID();
+    if (!cur_ssid) cur_ssid = "";
+
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s "
+        "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s net=%s "
         "bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
@@ -457,6 +561,7 @@ static int telemetry_cycle() {
         (int)System.resetReason(),
         APP_VERSION,
         script_tag,
+        cur_ssid,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
@@ -522,6 +627,93 @@ static int telemetry_cycle() {
     }
     g_cfg.poll_all();
     g_cfg.close();
+
+    // Latency sparkline — mirror of hal/esp32/src/critterchron_esp32.ino.
+    // After publish + poll_all (and any ir_poll between heartbeats), drain
+    // Stra2usClient's accumulator into the rolling row. Knob off ⇒ clear
+    // any latent overlay so flipping the display off mid-session doesn't
+    // leave a stale row painted.
+    int show_lat = g_cfg.get_int("latency_display", 0);
+    if (show_lat) {
+        uint32_t lmin = 0, lmean = 0, lmax = 0;
+        if (g_cfg.consume_latency_stats(&lmin, &lmean, &lmax)) {
+            memmove(g_latency_row, g_latency_row + 3,
+                    (GRID_WIDTH - 1) * 3);
+            uint8_t r, g, b;
+            latency_color_(lmean, r, g, b);
+            uint8_t* p = &g_latency_row[(GRID_WIDTH - 1) * 3];
+            p[0] = r; p[1] = g; p[2] = b;
+            g_sink.set_overlay_row(GRID_HEIGHT - 1, g_latency_row);
+            Log.info("[lat] min=%lums mean=%lums max=%lums",
+                     (unsigned long)lmin, (unsigned long)lmean,
+                     (unsigned long)lmax);
+        }
+    } else {
+        g_sink.clear_overlay();
+    }
+
+    // Procyon-rescue WiFi credential apply. After poll_all has refreshed
+    // wifi_ssid/wifi_password (device-then-app fallback), if BOTH are
+    // non-empty AND the hashed pair differs from the last successful
+    // apply, write them to DCT. Hash dedup makes the steady state a
+    // no-op — DCT only sees a write when the operator changes the
+    // value in Stra2us. Step 2 of the procyon TODO.
+    {
+        const char* w_ssid = g_cfg.wifi_ssid();
+        const char* w_pw   = g_cfg.wifi_password();
+        if (w_ssid && w_pw && w_ssid[0] && w_pw[0]) {
+            uint32_t h = hash_wifi_creds_(w_ssid, w_pw);
+            static uint32_t last_applied_hash = 0;
+            if (h != last_applied_hash) {
+                bool ok = WiFi.setCredentials(w_ssid, w_pw, WPA2);
+                if (!ok) {
+                    // DCT is most likely full (Photon=5 slots,
+                    // Photon 2/Argon=10). DeviceOS doesn't expose a
+                    // per-SSID remove primitive, and getCredentials
+                    // doesn't return passwords, so selective LRU
+                    // eviction isn't possible. Fallback: nuke
+                    // everything and re-install only the two
+                    // credentials whose passwords we actually know —
+                    // procyon (compiled-in) and the just-pulled target
+                    // (from KV). Loses any other primary-network
+                    // entries the device had accumulated. Acceptable
+                    // for the pathological "device re-primed across
+                    // many distinct networks" case; should be
+                    // extremely rare in practice. See procyon TODO
+                    // step 5 for the full reasoning.
+                    Log.warn("wifi_creds: setCredentials failed; "
+                             "nuke+restore (procyon + target)");
+                    WiFi.clearCredentials();
+                    bool procyon_ok = WiFi.setCredentials(
+                        PROCYON_SSID, PROCYON_PASSPHRASE, WPA2);
+                    ok = WiFi.setCredentials(w_ssid, w_pw, WPA2);
+                    Log.info("wifi_creds: nuke+restore: procyon=%s "
+                             "target=%s",
+                             procyon_ok ? "OK" : "FAIL",
+                             ok ? "OK" : "FAIL");
+                    if (!procyon_ok) {
+                        // Procyon dropped — boot-time
+                        // register_procyon_credential_ will re-add it
+                        // on next reboot, but flag the gap until then.
+                        critterchron::g_errlog.record(
+                            critterchron::ErrCat::Other,
+                            "wifi_creds: procyon lost in nuke+restore");
+                    }
+                }
+                if (ok) {
+                    last_applied_hash = h;
+                    g_wifi_signal_until_ms = millis() + WIFI_APPLY_SIGNAL_MS;
+                    Log.info("wifi_creds: applied ssid=\"%s\"", w_ssid);
+                } else {
+                    critterchron::g_errlog.record(
+                        critterchron::ErrCat::Other,
+                        "wifi_creds setCred fail ssid=%s", w_ssid);
+                    // Don't update last_applied_hash on failure — next
+                    // cycle will retry with the same pair.
+                }
+            }
+        }
+    }
 
     // Brightness ceiling: pull unconditionally so remote `max_brightness`
     // tuning reaches sensor-less devices too (they never call LightSensor::
@@ -594,6 +786,7 @@ static void telemetry_worker() {
     (void)g_cfg.get_int("ir_poll_interval",        IR_POLL_INTERVAL_DEFAULT);
     (void)g_cfg.get_int("night_enter_brightness",  NIGHT_ENTER_BRIGHTNESS);
     (void)g_cfg.get_int("night_exit_brightness",   NIGHT_EXIT_BRIGHTNESS);
+    (void)g_cfg.get_int("latency_display",         0);
 
     Log.info("tel heap: after key pre-register, free=%lu",
              (unsigned long)System.freeMemory());
@@ -899,6 +1092,13 @@ void setup() {
     // to do this for us, but calling it explicitly is documented-safe and
     // cheap — on OG Photon the implicit path has been flaky.
     WiFi.on();
+
+    // Register procyon rescue credential. Idempotent — only writes DCT
+    // on first boot of a fleet build, no-op afterward. Done before
+    // Particle.connect() so the credential is in place if the primary
+    // creds fail and DeviceOS cycles through the rest.
+    register_procyon_credential_();
+
     Particle.connect();
 
     if (!g_engine.begin()) {
@@ -1324,6 +1524,38 @@ void loop() {
         if (!g_clock.valid()) {
             draw_spinner(now);
             return;
+        }
+
+        // Wifi-creds-applied signal. Animated blue chase on the bottom
+        // row, gated on (within signal window) AND (currently joined to
+        // procyon). Both conditions matter: the signal is for the
+        // operator who fired up the rescue hotspot to know "I can drop
+        // the hotspot now"; firing it while already on the home network
+        // would just be cosmetic noise. Mutually-exclusive with the
+        // latency sparkline overlay (same row); when the signal ends,
+        // a clear_overlay() on the falling edge wipes the chase, and
+        // the next telemetry_cycle reasserts latency if that's enabled.
+        {
+            const char* cur_ssid_r = WiFi.SSID();
+            bool on_procyon = cur_ssid_r &&
+                              strcmp(cur_ssid_r, PROCYON_SSID) == 0;
+            bool sig_active = on_procyon && now < g_wifi_signal_until_ms;
+            static bool was_signaling = false;
+            if (sig_active) {
+                uint8_t chase[GRID_WIDTH * 3] = {0};
+                int span = GRID_WIDTH + 4;             // small over-roll
+                int pos  = (int)((now / 80) % (uint32_t)span);
+                for (int t = 0; t < 4; ++t) {          // head + 3-px tail
+                    int x = pos - t;
+                    if (x < 0 || x >= GRID_WIDTH) continue;
+                    uint8_t bri = (uint8_t)(255 - (t * 64));  // 255,191,127,63
+                    chase[x * 3 + 2] = bri;            // blue channel
+                }
+                g_sink.set_overlay_row(GRID_HEIGHT - 1, chase);
+            } else if (was_signaling) {
+                g_sink.clear_overlay();
+            }
+            was_signaling = sig_active;
         }
 
         float blend = (float)(now - last_physics_tick) / (float)physics_tick_ms();

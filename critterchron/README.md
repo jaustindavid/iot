@@ -2,7 +2,16 @@
 
 Agent-based pixel clock on a 16×16 or 32×8 LED grid. Agents (defined in `.crit` files) collectively converge the grid's state to the current wall-clock time, rendered as `HH` over `MM` (square grids) or `HH MM` (wide grids) via a 5×6 font.
 
-Runs in two places: the Python sim (gold master, pygame-visualized) and on a Particle Photon 2 via the C++ HAL in `hal/`. See `HAL_SPEC.md` for the hardware architecture and `handoff.md` for current status. `handoff.txt` is the original project vision.
+Runs in two places: the Python sim (gold master, pygame-visualized) and on hardware via the C++ HAL in `hal/`. The fleet today is a mix of Particle (Photon, Photon 2) and ESP32-C3 devices, both running the same engine + IR. See `HAL_SPEC.md` for the hardware architecture and `handoff.md` for original-vintage status notes. `handoff.txt` is the original project vision.
+
+## Companion docs
+
+- `HAL_SPEC.md` — hardware abstraction layer, per-device headers, sink + clock interfaces
+- `OTA_IR.md` — IR script over-the-air pull from Stra2us KV
+- `PROCYON.md` — rescue-WiFi flow for installed devices that can't reach their target network
+- `STRA2US_CATALOG_FR.md` — KV-tunable knobs catalog format
+- `MARKERS_SPEC.md` — landmark/marker render semantics
+- `TODO.md` — live punch list (open issues + recently-landed entries)
 
 ## Running
 

@@ -231,6 +231,35 @@ vars:
       Device clamps to enter + 1 on read so a misconfigured pair can't
       deadlock the trigger.
 
+  # ---------- Network latency display ----------
+
+  latency_display:
+    type: int
+    default: 0
+    scope: [app, device]
+    range: [0, 1]
+    help: |
+      Toggle the rolling network-latency sparkline along the bottom row
+      of the panel. 0 = off (engine renders normally edge-to-edge); 1 =
+      on (each heartbeat, the bottom row shifts left and a new pixel is
+      drawn at (max_x, max_y) colored by this cycle's mean network
+      latency).
+
+      Color mapping: ≤20ms = bright green, 20-200ms = green channel
+      linearly dimming to 1, >200ms = red. Hardcoded for now — the
+      operator regulates the visible time-window via heartbeep cadence
+      (longer cadence = wider history per pixel).
+
+      Source samples: every publish() and small kv_fetch_ / kv_fetch_str_
+      contributes one elapsed-ms sample. Streaming OTA fetches are
+      excluded so a 1MB firmware pull doesn't dominate the metric.
+
+      Destructive overlay — agents that wander into the bottom row are
+      visually clipped while the display is on; the engine doesn't see
+      the overlay so pathfinding/physics are unaffected. ESP32-only.
+
+  # ---------- Brightness schedule ----------
+
   brightness_schedule:
     type: string
     scope: [app, device]
@@ -249,4 +278,49 @@ vars:
       malformed segments reject the whole schedule (heartbeat
       surfaces `bri=(...sched-err)` plus `err=other:sched: <reason>`).
       Active schedule visible in heartbeat as `bri=(...sched)`.
+
+      Side effect — forced night palette: clamping max_bri below
+      `night_enter_brightness` will engage night-palette mode via
+      the existing Schmitt trigger once the smoothed brightness
+      settles. So `"23:00-07:00:1"` works as a "force night palette
+      at bedtime" override on any device whose `night_enter_brightness`
+      is ≥1. No separate `night_force_schedule` knob needed.
     ops_only: true    # device reads via Stra2usClient::brightness_schedule(), not get_int/get_float
+
+  # ---------- Procyon rescue WiFi: KV-driven cred install ----------
+
+  wifi_ssid:
+    type: string
+    scope: [app, device]
+    help: |
+      Target WiFi SSID for the procyon rescue-recovery flow. Set on a
+      device before it ships; once the device joins procyon (the fleet-
+      shared rescue hotspot — see TODO entry "Procyon rescue WiFi"), it
+      pulls this key + `wifi_password` and calls WiFi.setCredentials to
+      install them into DCT. After the operator stops the procyon
+      hotspot, the device joins the network specified here.
+
+      Empty / unset = no override active; device's existing creds
+      remain unchanged. Device-side dedup hashes the (ssid, password)
+      pair and skips re-applying when unchanged, so leaving these set
+      after install is harmless — operator does NOT need to clear
+      after recovery succeeds. Particle-only today; ESP32 mirror is
+      separate work.
+    ops_only: true    # device reads via Stra2usClient::wifi_ssid()
+
+  wifi_password:
+    type: string
+    scope: [app, device]
+    help: |
+      Target WiFi password for the procyon rescue-recovery flow. Paired
+      with `wifi_ssid`. WPA2-PSK assumed (covers ~all home/office
+      networks). Empty / unset = no override active.
+
+      v1 ships plaintext over the Stra2us HTTP layer — anyone who can
+      sniff the procyon-network traffic during the install pull can
+      see this value. Accepted risk for v1: physical proximity to the
+      procyon hotspot is already required, and this password is the
+      operator's choice to expose by setting up the rescue flow.
+      Confidentiality investigation (HMAC-stream-cipher / AES-128) is
+      a separate sub-task in the procyon TODO entry.
+    ops_only: true    # device reads via Stra2usClient::wifi_password()

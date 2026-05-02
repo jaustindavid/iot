@@ -118,6 +118,34 @@ float Stra2usClient::get_float(const char* key, float def) const {
 
 // -------- Telemetry side --------
 
+void Stra2usClient::record_latency_(uint32_t ms) {
+    if (ms < latency_min_ms_) latency_min_ms_ = ms;
+    if (ms > latency_max_ms_) latency_max_ms_ = ms;
+    // Don't let the sum/count grow unboundedly if a consumer never runs.
+    // 1<<30 samples worth of headroom is far more than a sane heartbeat
+    // cadence will ever produce, but the cap prevents overflow if a
+    // consumer is wired wrong and never drains.
+    if (latency_count_ < (1u << 30)) {
+        latency_sum_ms_ += ms;
+        latency_count_  += 1;
+    }
+}
+
+bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
+                                          uint32_t* out_mean_ms,
+                                          uint32_t* out_max_ms) {
+    if (latency_count_ == 0) return false;
+    uint32_t mean = latency_sum_ms_ / latency_count_;
+    if (out_min_ms)  *out_min_ms  = latency_min_ms_;
+    if (out_mean_ms) *out_mean_ms = mean;
+    if (out_max_ms)  *out_max_ms  = latency_max_ms_;
+    latency_min_ms_ = UINT32_MAX;
+    latency_max_ms_ = 0;
+    latency_sum_ms_ = 0;
+    latency_count_  = 0;
+    return true;
+}
+
 bool Stra2usClient::connect() {
     if (tcp_.connected()) tcp_.stop();
     return tcp_.connect(host_, port_);
@@ -389,6 +417,7 @@ int Stra2usClient::read_response_(const char* uri,
 }
 
 int Stra2usClient::publish(const char* topic, const char* message) {
+    LatencyScope _t(*this);
     char uri[64];
     snprintf(uri, sizeof(uri), "/q/%s", topic);
 
@@ -423,6 +452,7 @@ int Stra2usClient::publish(const char* topic, const char* message) {
 
 bool Stra2usClient::kv_fetch_(const char* full_key,
                               bool& is_float, int& out_i, float& out_f) {
+    LatencyScope _t(*this);
     char uri[160];
     snprintf(uri, sizeof(uri), "/kv/%s", full_key);
 
@@ -544,12 +574,53 @@ void Stra2usClient::poll_all() {
         memcpy(brightness_schedule_, buf, copy_len);
         brightness_schedule_[copy_len] = '\0';
     }
+
+    // Procyon-rescue WiFi credentials (two string-valued KVs). Mirror
+    // of hal/particle/src/Stra2usClient.cpp. Same device-then-app
+    // fallback shape; only-overwrite-on-success so a transient KV miss
+    // doesn't drop a known-good value (the wifi-cred apply path on
+    // the .ino reads these and the hash dedup would treat a temporary
+    // empty as "operator unset the value" — bad).
+    {
+        char ssid_buf[sizeof(wifi_ssid_)];
+        size_t ssid_len = 0;
+        snprintf(full, sizeof(full), "%s/%s/wifi_ssid", app_, device_);
+        bool ssid_ok = kv_fetch_str_(full, ssid_buf, sizeof(ssid_buf), ssid_len);
+        if (!ssid_ok) {
+            snprintf(full, sizeof(full), "%s/wifi_ssid", app_);
+            ssid_ok = kv_fetch_str_(full, ssid_buf, sizeof(ssid_buf), ssid_len);
+        }
+        if (ssid_ok) {
+            size_t copy_len = ssid_len < sizeof(wifi_ssid_) - 1
+                            ? ssid_len
+                            : sizeof(wifi_ssid_) - 1;
+            memcpy(wifi_ssid_, ssid_buf, copy_len);
+            wifi_ssid_[copy_len] = '\0';
+        }
+
+        char pw_buf[sizeof(wifi_password_)];
+        size_t pw_len = 0;
+        snprintf(full, sizeof(full), "%s/%s/wifi_password", app_, device_);
+        bool pw_ok = kv_fetch_str_(full, pw_buf, sizeof(pw_buf), pw_len);
+        if (!pw_ok) {
+            snprintf(full, sizeof(full), "%s/wifi_password", app_);
+            pw_ok = kv_fetch_str_(full, pw_buf, sizeof(pw_buf), pw_len);
+        }
+        if (pw_ok) {
+            size_t copy_len = pw_len < sizeof(wifi_password_) - 1
+                            ? pw_len
+                            : sizeof(wifi_password_) - 1;
+            memcpy(wifi_password_, pw_buf, copy_len);
+            wifi_password_[copy_len] = '\0';
+        }
+    }
 }
 
 // ---------- OTA IR ----------
 
 bool Stra2usClient::kv_fetch_str_(const char* full_key,
                                   char* buf, size_t buf_cap, size_t& out_len) {
+    LatencyScope _t(*this);
     out_len = 0;
     if (!buf || buf_cap < 2) return false;
 

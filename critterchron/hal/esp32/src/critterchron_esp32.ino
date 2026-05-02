@@ -44,6 +44,7 @@
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
 #define CRIT_HAVE_WIFI 1
 #include <WiFi.h>
+#include <Preferences.h>          // NVS-backed KV for procyon target persistence
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
@@ -336,6 +337,118 @@ static void compute_running_fw_sha(char out_hex_64[65]) {
     Serial.printf("[ota] running image sha=%.8s... (image_len=%u)\n",
                   out_hex_64, (unsigned)meta.image_len);
 }
+
+// ---------- Procyon rescue WiFi (ESP32 mirror) ----------
+// Mirror of hal/particle/src/critterchron_particle.cpp. Same fleet-
+// shared rescue credential (`procyon` / `horology`) and KV-driven
+// target-cred install via `wifi_ssid` / `wifi_password`. Differences
+// from the Particle path:
+//   * No DCT — credential storage is rolled here using NVS via the
+//     Preferences library. Two slots: target (NVS-persisted, default
+//     to compiled-in WIFI_SSID/WIFI_PASSWORD) and procyon (compiled-
+//     in fallback).
+//   * No DeviceOS-managed cred cycle — manual cycler swaps between
+//     target and procyon when WiFi.status() stays unconnected past a
+//     budget. RSSI-prefer behavior matches Particle in practice
+//     because once a strong AP (procyon hotspot) is found, WiFi.begin
+//     stays on it.
+//   * No selective-remove issue — we control storage; full nuke-and-
+//     restore semantics not needed.
+#define PROCYON_SSID       "procyon"
+#define PROCYON_PASSPHRASE "horology"
+
+// Per-slot SSID/password buffers. 802.11 SSID max is 32 bytes; WPA2
+// password max is 63. Round up + NUL.
+static char g_target_ssid_[40] = {0};
+static char g_target_pw_  [72] = {0};
+
+// Cycler state. 15s budget per slot before we swap. Once WL_CONNECTED
+// is hit, the cycler idles until the next disconnect.
+enum WifiPhase { WIFI_TRY_TARGET, WIFI_TRY_PROCYON };
+static WifiPhase     g_wifi_phase             = WIFI_TRY_TARGET;
+static unsigned long g_wifi_phase_started_ms  = 0;
+static const unsigned long WIFI_PHASE_BUDGET_MS = 15000;
+
+// NVS keys (namespace "critterchron"). Loaded at boot, written when
+// telemetry_cycle's KV-apply path commits a new target cred.
+#define NVS_NAMESPACE      "critterchron"
+#define NVS_KEY_WIFI_SSID  "wifi_ssid"
+#define NVS_KEY_WIFI_PW    "wifi_pw"
+
+static void load_target_creds_from_nvs_() {
+    Preferences prefs;
+    if (!prefs.begin(NVS_NAMESPACE, /*read-only*/ true)) {
+        // First-boot or NVS-unavailable: fall back to compiled-in.
+        strncpy(g_target_ssid_, WIFI_SSID,     sizeof(g_target_ssid_) - 1);
+        strncpy(g_target_pw_,   WIFI_PASSWORD, sizeof(g_target_pw_)   - 1);
+        Serial.println("[procyon] NVS empty; using compiled-in target");
+        return;
+    }
+    String ssid = prefs.getString(NVS_KEY_WIFI_SSID, WIFI_SSID);
+    String pw   = prefs.getString(NVS_KEY_WIFI_PW,   WIFI_PASSWORD);
+    prefs.end();
+    strncpy(g_target_ssid_, ssid.c_str(), sizeof(g_target_ssid_) - 1);
+    strncpy(g_target_pw_,   pw.c_str(),   sizeof(g_target_pw_)   - 1);
+    g_target_ssid_[sizeof(g_target_ssid_) - 1] = '\0';
+    g_target_pw_  [sizeof(g_target_pw_)   - 1] = '\0';
+    Serial.printf("[procyon] loaded target ssid=\"%s\" from NVS\n",
+                  g_target_ssid_);
+}
+
+static bool save_target_creds_to_nvs_(const char* ssid, const char* pw) {
+    Preferences prefs;
+    if (!prefs.begin(NVS_NAMESPACE, /*read-only*/ false)) return false;
+    bool ok = prefs.putString(NVS_KEY_WIFI_SSID, ssid) > 0
+           && prefs.putString(NVS_KEY_WIFI_PW,   pw)   > 0;
+    prefs.end();
+    return ok;
+}
+
+// Manual cycler step. Called from the main loop on each iteration.
+// No-op when connected; otherwise advances to the next slot when the
+// current attempt's budget elapses. The first call of the boot session
+// is responsible for kicking off WIFI_TRY_TARGET (setup() does that).
+static void wifi_cycle_step_(unsigned long now) {
+    if (WiFi.status() == WL_CONNECTED) return;
+    if ((unsigned long)(now - g_wifi_phase_started_ms) < WIFI_PHASE_BUDGET_MS) {
+        return;
+    }
+    if (g_wifi_phase == WIFI_TRY_TARGET) {
+        Serial.printf("[procyon] target \"%s\" budget elapsed; trying procyon\n",
+                      g_target_ssid_);
+        WiFi.disconnect(true, true);
+        WiFi.begin(PROCYON_SSID, PROCYON_PASSPHRASE);
+        g_wifi_phase = WIFI_TRY_PROCYON;
+    } else {
+        Serial.printf("[procyon] procyon budget elapsed; trying target \"%s\"\n",
+                      g_target_ssid_);
+        WiFi.disconnect(true, true);
+        WiFi.begin(g_target_ssid_, g_target_pw_);
+        g_wifi_phase = WIFI_TRY_TARGET;
+    }
+    g_wifi_phase_started_ms = now;
+}
+
+// Force-restart the cycler from the target slot. Called after a
+// successful KV-apply that may have changed g_target_ssid_/pw_, so the
+// device tries the new creds immediately rather than waiting out the
+// budget on whatever it's currently associated with.
+static void wifi_cycle_restart_target_(unsigned long now) {
+    WiFi.disconnect(true, true);
+    WiFi.begin(g_target_ssid_, g_target_pw_);
+    g_wifi_phase             = WIFI_TRY_TARGET;
+    g_wifi_phase_started_ms  = now;
+}
+
+// Wifi-creds-applied visual signal — animated blue chase along the
+// bottom row, fired only when we're currently on procyon AND the apply
+// just landed. Mirror of the Particle path; same 10s window. The
+// chase pattern lives in g_wifi_apply_chase_row_, refreshed each
+// render frame from a deadline state.
+#define WIFI_APPLY_SIGNAL_MS 10000
+static unsigned long g_wifi_signal_until_ms = 0;
+static uint8_t       g_wifi_apply_chase_row_[GRID_WIDTH * 3] = {0};
+
 #endif  // CRIT_HAVE_WIFI
 
 #if CRIT_HAVE_WIFI
@@ -407,6 +520,42 @@ static bool is_crash_reset(esp_reset_reason_t r) {
 // Task handle so we don't spawn twice. Nulled at boot; set once SNTP is
 // valid and the task is launched.
 static TaskHandle_t g_tel_task = nullptr;
+
+// ---------- Latency sparkline ----------
+// Rolling row of GRID_WIDTH RGB pixels showing the last N heartbeats'
+// network latency. Owned by the tel task: shifted-and-extended once per
+// heartbeat after publish + poll_all + ir/fw poll have all contributed
+// their samples to Stra2usClient::consume_latency_stats. Pushed into
+// FastLEDSink as a destructive overlay row at y = GRID_HEIGHT - 1.
+//
+// Color mapping (Arduino-style linear `map`):
+//   ms <= 20   → (0, 255, 0)         bright green
+//   20 < ms ≤ 200 → (0, G, 0) where G = map(ms, 20, 200, 255, 1)
+//   ms > 200   → (255, 0, 0)         red — saturated "this is bad"
+// Single-channel-1 is plenty visible on this fleet (see memory note
+// `feedback_low_rgb_visible.md`); the floor at 1 keeps a slow-but-not-
+// terrible reading distinguishable from "off".
+//
+// Scale rationale: 20-200ms covers a small POST + response over LAN
+// WiFi to a local Stra2us server. Below 20ms is unrealistic over WiFi
+// (treat as max-good); above 200ms means the network path is degraded
+// enough to notice. Hardcoded for now — operator regulates the time
+// axis via heartbeep cadence (longer cadence = wider visible history).
+static uint8_t g_latency_row[GRID_WIDTH * 3] = {0};
+
+static void latency_color_(uint32_t ms,
+                           uint8_t& r, uint8_t& g, uint8_t& b) {
+    if (ms > 200) { r = 255; g = 0;   b = 0; return; }
+    if (ms <= 20) { r = 0;   g = 255; b = 0; return; }
+    // Linear interp on the green channel: 20→255, 200→1.
+    long span  = 255 - 1;          // 254
+    long range = 200 - 20;         // 180
+    long val   = (long)ms - 20;    // 0..180
+    long gv    = 255 - (val * span) / range;
+    if (gv < 1) gv = 1;
+    if (gv > 255) gv = 255;
+    r = 0; g = (uint8_t)gv; b = 0;
+}
 
 // OTA IR lifecycle publish handoff (main thread → tel task) for the
 // `ota_matrix` and `ota_loaded` events. The `ota_detected` event is
@@ -667,13 +816,20 @@ static int telemetry_cycle() {
     } else {
         fw_sha_field[0] = '\0';
     }
+    // `net=<ssid>` makes the rescue case loud: steady state shows the
+    // primary network's name; `net=procyon` is the obvious "this device
+    // is on the rescue hotspot" signal in any heartbeat tail. Mirror of
+    // the Particle path. Empty if WiFi.SSID() returns null/empty.
+    String cur_ssid_str = WiFi.SSID();
+    const char* cur_ssid = cur_ssid_str.c_str();
+    if (!cur_ssid) cur_ssid = "";
 #if CRIT_HAVE_LIGHT
     // `lux=X.X` is the BH1750 raw reading; bri=(min<cur<max) is the
     // mapped-and-smoothed output the sink is actually using. Together
     // they answer "is the room light what we think it is" (lux) and "is
     // the curve+clamp producing sensible brightness" (bri triplet).
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s bri=(%u<%u<%u%s) lux=%.1f "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) lux=%.1f "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -684,6 +840,7 @@ static int telemetry_cycle() {
         APP_VERSION,
         fw_sha_field,
         script_tag,
+        cur_ssid,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (double)g_lux,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
@@ -695,7 +852,7 @@ static int telemetry_cycle() {
         CONFIG_IDF_TARGET);
 #else
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s bri=(%u<%u<%u%s) "
+        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
@@ -706,6 +863,7 @@ static int telemetry_cycle() {
         APP_VERSION,
         fw_sha_field,
         script_tag,
+        cur_ssid,
         (unsigned)g_bri_min, (unsigned)g_bri, (unsigned)g_bri_max, sched_tag,
         (unsigned long)g_phys_avg_us,   (unsigned long)g_phys_max_us,   (unsigned long)PHYS_BUDGET_US,
         (unsigned long)g_rend_avg_us,   (unsigned long)g_rend_max_us,   (unsigned long)REND_BUDGET_US,
@@ -744,6 +902,80 @@ static int telemetry_cycle() {
     }
     g_cfg.poll_all();
     g_cfg.close();
+
+    // Latency sparkline: shift the rolling row left and append a new
+    // pixel colored from this cycle's mean. The publish + poll_all
+    // above (plus any ir_poll / fw_poll between heartbeats) have all
+    // contributed samples to Stra2usClient's accumulator — drain it
+    // here. When the knob is off, clear any latent overlay so flipping
+    // the display off mid-session doesn't leave a stale row painted.
+    int show_lat = g_cfg.get_int("latency_display", 0);
+    if (show_lat) {
+        uint32_t lmin = 0, lmean = 0, lmax = 0;
+        if (g_cfg.consume_latency_stats(&lmin, &lmean, &lmax)) {
+            memmove(g_latency_row, g_latency_row + 3,
+                    (GRID_WIDTH - 1) * 3);
+            uint8_t r, g, b;
+            latency_color_(lmean, r, g, b);
+            uint8_t* p = &g_latency_row[(GRID_WIDTH - 1) * 3];
+            p[0] = r; p[1] = g; p[2] = b;
+            g_sink.set_overlay_row(GRID_HEIGHT - 1, g_latency_row);
+            Serial.printf("[lat] min=%lums mean=%lums max=%lums\n",
+                          (unsigned long)lmin, (unsigned long)lmean,
+                          (unsigned long)lmax);
+        }
+        // consume_latency_stats=false (no samples this window) leaves
+        // the row untouched — better than a blank insert that suggests
+        // a 0ms reading.
+    } else {
+        g_sink.clear_overlay();
+    }
+
+    // Procyon-rescue WiFi credential apply. Mirror of the Particle
+    // path. After poll_all has refreshed wifi_ssid/wifi_password
+    // (device-then-app fallback), if BOTH are non-empty AND the
+    // hashed pair differs from the last successful apply, persist to
+    // NVS and force-restart the WiFi cycler at the new target so the
+    // device tries the new creds immediately rather than waiting for
+    // the existing slot's budget to expire. Hash dedup makes the
+    // steady state a no-op.
+    {
+        const char* w_ssid = g_cfg.wifi_ssid();
+        const char* w_pw   = g_cfg.wifi_password();
+        if (w_ssid && w_pw && w_ssid[0] && w_pw[0]) {
+            // FNV-1a 32-bit over (ssid + NUL + password). Same hash
+            // shape as the Particle side.
+            uint32_t hh = 2166136261u;
+            for (const char* p = w_ssid; *p; ++p) { hh ^= (uint8_t)*p; hh *= 16777619u; }
+            hh *= 16777619u;
+            for (const char* p = w_pw;   *p; ++p) { hh ^= (uint8_t)*p; hh *= 16777619u; }
+            static uint32_t last_applied_hash = 0;
+            if (hh != last_applied_hash) {
+                bool ok = save_target_creds_to_nvs_(w_ssid, w_pw);
+                if (ok) {
+                    strncpy(g_target_ssid_, w_ssid, sizeof(g_target_ssid_) - 1);
+                    strncpy(g_target_pw_,   w_pw,   sizeof(g_target_pw_)   - 1);
+                    g_target_ssid_[sizeof(g_target_ssid_) - 1] = '\0';
+                    g_target_pw_  [sizeof(g_target_pw_)   - 1] = '\0';
+                    last_applied_hash = hh;
+                    g_wifi_signal_until_ms = millis() + WIFI_APPLY_SIGNAL_MS;
+                    Serial.printf("[procyon] wifi_creds: applied ssid=\"%s\"\n",
+                                  w_ssid);
+                    // Force a fresh attempt with the new creds. If
+                    // we're currently on procyon, this disassociates
+                    // and tries the new target immediately. If we're
+                    // already on the (old) target, this is a no-op
+                    // reassociate; minor blip, then either back on
+                    // the same network or onto the new one.
+                    wifi_cycle_restart_target_(millis());
+                } else {
+                    critterchron::g_errlog.record(
+                        critterchron::ErrCat::Net,
+                        "wifi_creds NVS save failed ssid=%s", w_ssid);
+                }
+            }
+        }
+    }
 
 #if !CRIT_HAVE_LIGHT
     // Pull live max_brightness so a remote tune reaches the sink even
@@ -810,6 +1042,11 @@ static void telemetry_task(void*) {
     (void)g_cfg.get_int("heartbeep",        HEARTBEEP_DEFAULT);
     (void)g_cfg.get_int("ir_poll_interval", IR_POLL_INTERVAL_DEFAULT);
     (void)g_cfg.get_int("fw_poll_interval", FW_POLL_INTERVAL_DEFAULT);
+    (void)g_cfg.get_int("latency_display",  0);
+    // wifi_ssid / wifi_password are string-typed, fetched via the
+    // dedicated Stra2usClient::wifi_ssid()/wifi_password() accessors
+    // (driven by poll_all's string-fallback block). No get_int
+    // pre-register needed.
     (void)g_cfg.get_int("max_brightness",   MAX_BRIGHTNESS);
 
     for (;;) {
@@ -1048,7 +1285,17 @@ void setup() {
 #if CRIT_HAVE_WIFI
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    // Procyon rescue WiFi: load NVS-persisted target cred (or fall
+    // back to compiled-in WIFI_SSID/WIFI_PASSWORD if NVS is empty),
+    // then kick the cycler at the target slot. wifi_cycle_step_ in
+    // the main loop will swap to procyon if the target doesn't
+    // associate within WIFI_PHASE_BUDGET_MS.
+    load_target_creds_from_nvs_();
+    WiFi.begin(g_target_ssid_, g_target_pw_);
+    g_wifi_phase            = WIFI_TRY_TARGET;
+    g_wifi_phase_started_ms = millis();
+
     configTime(0, 0, SNTP_SERVER_1, SNTP_SERVER_2, SNTP_SERVER_3);
 
     // ArduinoOTA: push-flash over LAN via espota.py (wrapped by
@@ -1125,6 +1372,11 @@ void loop() {
     // pre-SNTP spinner wait — the whole point of the rescue hold is
     // that OTA stays reachable when nothing else is.
     ArduinoOTA.handle();
+
+    // Procyon WiFi cycler: swap target↔procyon when the current slot
+    // fails to associate within WIFI_PHASE_BUDGET_MS. No-op when
+    // WL_CONNECTED. Cheap to run every iteration.
+    wifi_cycle_step_(now);
 
     if (g_ota_active) {
         // Flash in progress. Everything else is off: render, physics,
@@ -1447,6 +1699,42 @@ void loop() {
     // Render tick
     if (now - last_render_tick >= RENDER_TICK_MS) {
         last_render_tick = now;
+
+#if CRIT_HAVE_WIFI
+        // Wifi-creds-applied signal. Mirror of the Particle render-side
+        // block. Animated blue chase on the bottom row, gated on
+        // (within signal window) AND (currently joined to procyon).
+        // Mutually-exclusive with the latency sparkline overlay (same
+        // row); when the signal ends, falling-edge clear_overlay()
+        // wipes the chase, and the next telemetry_cycle reasserts
+        // latency if that's enabled.
+        {
+            String cur_ssid_str = WiFi.SSID();
+            const char* cur_ssid_r = cur_ssid_str.c_str();
+            bool on_procyon = cur_ssid_r &&
+                              strcmp(cur_ssid_r, PROCYON_SSID) == 0;
+            bool sig_active = on_procyon && now < g_wifi_signal_until_ms;
+            static bool was_signaling = false;
+            if (sig_active) {
+                memset(g_wifi_apply_chase_row_, 0,
+                       sizeof(g_wifi_apply_chase_row_));
+                int span = GRID_WIDTH + 4;             // small over-roll
+                int pos  = (int)((now / 80) % (uint32_t)span);
+                for (int t = 0; t < 4; ++t) {          // head + 3-px tail
+                    int x = pos - t;
+                    if (x < 0 || x >= GRID_WIDTH) continue;
+                    uint8_t bri = (uint8_t)(255 - (t * 64));
+                    g_wifi_apply_chase_row_[x * 3 + 2] = bri;
+                }
+                g_sink.set_overlay_row(GRID_HEIGHT - 1,
+                                       g_wifi_apply_chase_row_);
+            } else if (was_signaling) {
+                g_sink.clear_overlay();
+            }
+            was_signaling = sig_active;
+        }
+#endif
+
         float blend = (float)(now - last_physics_tick) / (float)physics_tick_ms();
         if (blend > 1.0f) blend = 1.0f;
         uint32_t t0 = micros();

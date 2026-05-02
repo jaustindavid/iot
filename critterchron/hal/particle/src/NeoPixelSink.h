@@ -56,7 +56,46 @@ public:
             scale_ch(b, brightness_)));
     }
 
-    void show() override { strip_.show(); }
+    void show() override {
+        // Apply overlay row (if active) just before pushing to LEDs.
+        // Engine writes its non-zero pixels via set() earlier this
+        // frame; here we paint overlay pixels ONLY where no engine
+        // output exists (strip_ pixel == 0). Net effect: sparkline
+        // is background, agents on the overlay row render on top.
+        // Mirror of hal/esp32/src/FastLEDSink.h::show().
+        if (overlay_active_) {
+            for (int x = 0; x < GRID_WIDTH; ++x) {
+                int rx, ry;
+                rotate(x, overlay_y_, rx, ry);
+                if (rx < 0 || rx >= post_rot_w_() ||
+                    ry < 0 || ry >= post_rot_h_()) continue;
+                int idx = rx * post_rot_h_() +
+                          ((rx & 1) ? (post_rot_h_() - 1 - ry) : ry);
+                if (strip_.getPixelColor(idx) != 0) continue;
+                const uint8_t* p = &overlay_pixels_[x * 3];
+                strip_.setPixelColor(idx, strip_.Color(
+                    scale_ch(p[0], brightness_),
+                    scale_ch(p[1], brightness_),
+                    scale_ch(p[2], brightness_)));
+            }
+        }
+        strip_.show();
+    }
+
+    // Latency-sparkline overlay. rgb_pixels MUST be GRID_WIDTH * 3 bytes
+    // (each entry is r,g,b). Sink copies the data so the caller's
+    // buffer doesn't need to outlive the call. Brightness scaling +
+    // grid rotation are applied in show() via the same path the
+    // engine uses, so the overlay matches the rest of the panel.
+    // Mirror of hal/esp32/src/FastLEDSink.h.
+    void set_overlay_row(int y, const uint8_t* rgb_pixels) {
+        if (y < 0 || y >= GRID_HEIGHT) return;
+        overlay_y_ = y;
+        memcpy(overlay_pixels_, rgb_pixels, sizeof(overlay_pixels_));
+        overlay_active_ = true;
+    }
+
+    void clear_overlay() { overlay_active_ = false; }
 
 private:
     // Pre-rotation (x, y) in a GRID_WIDTH x GRID_HEIGHT frame →
@@ -107,6 +146,10 @@ private:
 
     Adafruit_NeoPixel strip_;
     uint8_t           brightness_;
+
+    bool    overlay_active_                  = false;
+    int     overlay_y_                       = 0;
+    uint8_t overlay_pixels_[GRID_WIDTH * 3]  = {0};
 };
 
 #endif  // PLATFORM_ID
