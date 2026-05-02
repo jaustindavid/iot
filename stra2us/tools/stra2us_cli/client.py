@@ -26,6 +26,26 @@ import requests
 
 CLOCK_DRIFT_SECONDS = 300  # matches server + device-client policy
 
+# Per-key KV value encryption — must match server core/security.py.
+KVENC_LABEL = b"stra2us-kvenc-v1"
+KVENC_EXT_TYPE = 0x21
+
+
+def _kvenc_xor(secret: bytes, nonce: int, data: bytes) -> bytes:
+    """HMAC-SHA256 keystream XOR. nonce is uint32 BE; counter increments per
+    32-byte block. Symmetric, so used for both encrypt and decrypt."""
+    nonce_bytes = nonce.to_bytes(4, "big")
+    out = bytearray()
+    counter = 0
+    while len(out) < len(data):
+        out.extend(hmac.new(
+            secret,
+            KVENC_LABEL + nonce_bytes + bytes([counter]),
+            hashlib.sha256,
+        ).digest())
+        counter += 1
+    return bytes(a ^ b for a, b in zip(data, out[:len(data)]))
+
 
 class Stra2usError(RuntimeError):
     """Any signing, transport, or server-error failure."""
@@ -74,6 +94,7 @@ class Stra2usClient:
         uri: str,
         body: bytes,
         content_type: str | None,
+        extra_headers: dict | None = None,
     ) -> requests.Response:
         ts = int(time.time())
         sig = self._sign(uri, body, ts)
@@ -84,6 +105,8 @@ class Stra2usClient:
         }
         if content_type:
             headers["Content-Type"] = content_type
+        if extra_headers:
+            headers.update(extra_headers)
         try:
             r = requests.request(
                 method,
@@ -103,11 +126,21 @@ class Stra2usClient:
         # URL-encode each path segment so slashes stay as separators.
         return "/kv/" + "/".join(quote(p, safe="") for p in key.split("/"))
 
-    def put(self, key: str, value) -> requests.Response:
-        """POST /kv/<key>. msgpack-encodes `value` before sending."""
+    def put(self, key: str, value, encrypted: bool = False) -> requests.Response:
+        """POST /kv/<key>. msgpack-encodes `value` before sending.
+
+        When `encrypted=True`, sends `X-Encrypted: 1` so the server stores
+        the encrypted-flag sidecar; the value bytes themselves are still
+        sent as plaintext over the request channel (writes are authenticated
+        but not confidential — the FR's threat model is response sniffing).
+        Bare `put()` without `encrypted=True` clears the flag, matching
+        the server's "demote to plaintext" semantic.
+        """
         body = msgpack.packb(value, use_bin_type=True)
+        extra = {"X-Encrypted": "1"} if encrypted else None
         r = self._request(
-            "POST", self._kv_uri(key), body, "application/x-msgpack"
+            "POST", self._kv_uri(key), body, "application/x-msgpack",
+            extra_headers=extra,
         )
         if not (200 <= r.status_code < 300):
             raise Stra2usError(
@@ -142,6 +175,20 @@ class Stra2usClient:
             value = msgpack.unpackb(r.content, raw=False)
         except Exception as e:
             raise Stra2usError(f"GET {key}: invalid msgpack response: {e}") from e
+        if isinstance(value, msgpack.ExtType) and value.code == KVENC_EXT_TYPE:
+            # Encrypted record (see docs/fr_encrypted_values.md). Decrypt
+            # using the response timestamp as nonce and return the plaintext
+            # transparently — callers don't need to know it was encrypted.
+            ts_hdr = r.headers.get("X-Response-Timestamp")
+            if ts_hdr is None:
+                raise Stra2usError(
+                    f"GET {key}: encrypted response missing X-Response-Timestamp"
+                )
+            plaintext = _kvenc_xor(self._secret_bytes(), int(ts_hdr), value.data)
+            try:
+                return plaintext.decode("utf-8")
+            except UnicodeDecodeError:
+                return plaintext
         if isinstance(value, dict) and value.get("status") == "not_found":
             return None
         return value

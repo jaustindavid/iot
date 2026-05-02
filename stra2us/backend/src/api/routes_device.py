@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from core.redis_client import get_redis_client
-from core.security import sign_payload
+from core.security import sign_payload, kvenc_xor, KVENC_EXT_TYPE
 import msgpack
 from .dependencies import verify_device_request, check_acl
 import time
@@ -34,6 +34,26 @@ def signed_msgpack(context: dict, request: Request, obj,
                    status_code: int = 200) -> Response:
     return signed_response(context, request, msgpack.packb(obj),
                            status_code=status_code)
+
+
+def signed_encrypted_response(context: dict, request: Request,
+                              plaintext: bytes) -> Response:
+    """GET response for an encrypted KV record. Encrypts `plaintext` with the
+    HMAC-keystream cipher keyed by the caller's shared secret, using the
+    response timestamp as nonce, and wraps the ciphertext in msgpack ext
+    type 0x21. The signature still covers the full (ciphertext-bearing) body
+    so authenticity holds independently of confidentiality."""
+    ts = int(time.time())
+    ciphertext = kvenc_xor(context["secret_hex"], ts, plaintext)
+    body = msgpack.packb(msgpack.ExtType(KVENC_EXT_TYPE, ciphertext))
+    uri = str(request.url.path)
+    sig = sign_payload(context["secret_hex"], uri, body, ts)
+    headers = {
+        "X-Response-Timestamp": str(ts),
+        "X-Response-Signature": sig,
+    }
+    return Response(content=body, status_code=200,
+                    media_type=MSGPACK_MT, headers=headers)
 
 @router.post("/q/{topic}")
 async def publish_message(
@@ -173,6 +193,12 @@ async def write_kv(
 
     redis = get_redis_client()
     await redis.set(f"kv:{key}", body)
+    # Encrypted-flag sidecar (see docs/fr_encrypted_values.md). Bare set
+    # without the header demotes a previously-encrypted record to plaintext.
+    if request.headers.get("X-Encrypted") == "1":
+        await redis.set(f"kv:{key}:enc", b"1")
+    else:
+        await redis.delete(f"kv:{key}:enc")
 
     return signed_msgpack(context, request, {"status": "ok"})
 
@@ -189,6 +215,25 @@ async def read_kv(
     if val is None:
         return signed_msgpack(context, request, {"status": "not_found"})
 
+    if await redis.get(f"kv:{key}:enc"):
+        # Encrypted record: unwrap the inner str/bin payload, encrypt the
+        # raw bytes under the response timestamp, and ship as ext 0x21.
+        # The msgpack-shape (str vs bin and length-class) is dropped on the
+        # wire; the consumer recovers type from catalog/context.
+        try:
+            inner = msgpack.unpackb(val, raw=True)
+        except Exception:
+            raise HTTPException(status_code=500,
+                                detail="Encrypted record: stored value is not msgpack")
+        if isinstance(inner, (bytes, bytearray)):
+            plaintext = bytes(inner)
+        elif isinstance(inner, str):
+            plaintext = inner.encode("utf-8")
+        else:
+            raise HTTPException(status_code=500,
+                                detail="Encrypted record: stored value is not str/bin")
+        return signed_encrypted_response(context, request, plaintext)
+
     return signed_response(context, request, val)
 
 @router.delete("/kv/{key:path}")
@@ -203,5 +248,5 @@ async def delete_kv(
     without holding an admin credential."""
     await check_acl(context, f"kv/{key}", mode="write")
     redis = get_redis_client()
-    await redis.delete(f"kv:{key}")
+    await redis.delete(f"kv:{key}", f"kv:{key}:enc")
     return signed_msgpack(context, request, {"status": "ok"})

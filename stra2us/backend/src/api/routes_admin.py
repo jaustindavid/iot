@@ -26,6 +26,7 @@ class ClientCreate(BaseModel):
 
 class KVPayload(BaseModel):
     value: str
+    encrypted: bool = False
 
 class AclPermission(BaseModel):
     prefix: str
@@ -303,16 +304,17 @@ async def peek_kv(request: Request, key: str, _: dict = Depends(require_admin_kv
     if not msg:
         return {"status": "empty", "message": None}
 
+    encrypted = bool(await redis.get(f"kv:{key}:enc"))
     try:
         with phases.phase("msgpack_unpack"):
             decoded = msgpack.unpackb(msg)
         with phases.phase("hex_encode"):
             hexed = msg.hex()
-        return {"status": "ok", "message": decoded, "hex": hexed}
+        return {"status": "ok", "message": decoded, "hex": hexed, "encrypted": encrypted}
     except Exception:
         with phases.phase("hex_encode"):
             hexed = msg.hex()
-        return {"status": "ok", "message": "unparseable_msgpack", "hex": hexed}
+        return {"status": "ok", "message": "unparseable_msgpack", "hex": hexed, "encrypted": encrypted}
 
 @router.post("/kv/{key:path}")
 async def set_kv(key: str, payload: KVPayload, _: dict = Depends(require_admin_kv("write"))):
@@ -323,12 +325,16 @@ async def set_kv(key: str, payload: KVPayload, _: dict = Depends(require_admin_k
         data = payload.value
     packed = msgpack.packb(data)
     await redis.set(f"kv:{key}", packed)
+    if payload.encrypted:
+        await redis.set(f"kv:{key}:enc", b"1")
+    else:
+        await redis.delete(f"kv:{key}:enc")
     return {"status": "ok"}
 
 @router.delete("/kv/{key:path}")
 async def delete_kv(key: str, _: dict = Depends(require_admin_kv("write"))):
     redis = get_redis_client()
-    await redis.delete(f"kv:{key}")
+    await redis.delete(f"kv:{key}", f"kv:{key}:enc")
     return {"status": "ok"}
 
 @router.delete("/q/{topic}")

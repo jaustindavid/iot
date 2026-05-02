@@ -320,14 +320,15 @@ def cmd_put(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        client.put(args.key, value)
+        client.put(args.key, value, encrypted=args.encrypted)
     except Stra2usError as e:
         print(f"error: {e}", file=sys.stderr)
         return 4
 
     size = len(value) if isinstance(value, (bytes, str)) else "?"
     kind = "bytes" if isinstance(value, bytes) else "string"
-    print(f"put: {client.base_url}/kv/{args.key} ({size} {kind})")
+    enc = " [encrypted]" if args.encrypted else ""
+    print(f"put: {client.base_url}/kv/{args.key} ({size} {kind}){enc}")
     return 0
 
 
@@ -431,12 +432,13 @@ def cmd_set(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        client.put(full_key, value)
+        client.put(full_key, value, encrypted=args.encrypted)
     except Stra2usError as e:
         print(f"error: {e}", file=sys.stderr)
         return 4
 
-    print(f"set: {client.base_url}/kv/{full_key} → {value!r}")
+    enc = " [encrypted]" if args.encrypted else ""
+    print(f"set: {client.base_url}/kv/{full_key} → {value!r}{enc}")
     return 0
 
 
@@ -503,6 +505,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--value",
         help="inline string value; written as msgpack str",
     )
+    sp_put.add_argument(
+        "--encrypted",
+        action="store_true",
+        help="mark this record encrypted on the server; subsequent GETs ship as ciphertext (see docs/fr_encrypted_values.md)",
+    )
 
     # ----- get -----
     sp_get = sub.add_parser(
@@ -533,6 +540,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--unset",
         action="store_true",
         help="write empty string (server has no DELETE verb)",
+    )
+    sp_set.add_argument(
+        "--encrypted",
+        action="store_true",
+        help="mark this record encrypted on the server; subsequent GETs ship as ciphertext (see docs/fr_encrypted_values.md)",
     )
     return p
 
