@@ -127,31 +127,15 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   surface degradation events on the heartbeat error channel for
   fleet-wide alerting. Not v1.
 
-- **`brightness_schedule` segment format extension — specify min too.**
-  Current segment shape is `HH:MM-HH:MM:max_bri`, which clamps the
-  schedule's max but leaves min_brightness untouched. Add an alternate
-  form `HH:MM-HH:MM:min_bri-max_bri` so a segment can pin both ends —
-  useful for "force panel to 1-1 at bedtime" (full clamp, no
-  sensor-driven smoothing within the segment) vs the current "ceiling
-  only, sensor still drives the floor."
-
-  Both forms coexist; parser distinguishes by whether the colon-tail
-  contains a dash. Single-value form keeps existing semantics
-  (max-only, min unchanged). Two-value form replaces both bounds for
-  segments that match. Example:
-
-      "23:00-07:00:1-1, 07:00-09:00:16, 09:00-23:00:64"
-       ^^^^^^^^^^^^^^^^  hard-pinned to 1                 (new form)
-                         ^^^^^^^^^^^^^^^^                 max=16, min unchanged (existing)
-
-  Implementation surface: parser in the brightness_schedule consumer
-  (Particle: `critterchron_particle.cpp`; ESP32:
-  `critterchron_esp32.ino`). When this lands, fold the parser into a
-  shared utility — third consumer (procyon's wifi_ssid/wifi_password
-  doesn't share this format, but a future schedule-shaped key well
-  might). Catalog `brightness_schedule` help text updated to document
-  both forms. Heartbeat surfacing unchanged (`bri=(...sched)` still
-  reports the active values).
+- ~~**`brightness_schedule` segment format extension — specify min too.**~~
+  Landed 2026-05-02. Both `HH:MM-HH:MM:max` (existing, max-only) and
+  `HH:MM-HH:MM:min-max` (new, pins both bounds) shapes coexist; parser
+  tries the two-value form first and falls back. `ScheduleSeg` carries
+  a `min_bri` field, 0 = "no min override" sentinel. Catalog help text
+  documents both forms with a bedtime-hard-pin example. Both Particle
+  and ESP32 paths updated. Parser-extraction-into-shared-utility was
+  considered but skipped — no concrete second consumer for the format
+  exists today; revisit if/when one materializes.
 
 - **(low priority) Suppress wifi-creds chaser overlay during OTA "rain"
   animation.** During the OTA-loading window (g_ota_loading == true on
@@ -842,55 +826,33 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
     procyon (e.g. every 10), so the alert can't roll off the operator's
     attention even after the initial entry is acked.
 
-  *Target visibility while on procyon — required for remote installs.*
-  Cloud-visible diagnostic so an operator can debug "why is this
-  remote device on procyon?" without driving over with a cable. Marked
-  required 2026-05-02 because the fleet will include genuinely-remote
-  devices (someone else's home, distant install) where physical
-  intervention is non-trivial.
+  *Target visibility while on procyon.* **WONTFIX 2026-05-02.**
+  Originally scoped (and briefly marked required for remote installs)
+  as a cloud-visible diagnostic surfacing `target=visible`/`missing`
+  in the heartbeat while on procyon. Closed because the design's
+  premise is wrong: **being on procyon is not equivalent to being in
+  rescue mode.** It is legitimate for a household to run a guest
+  network named `procyon` with passphrase `horology` (the rescue
+  parameters are fleet-shared and not secret), in which case the
+  device's joining procyon is a normal long-term operating state, not
+  a recovery scenario. Surfacing `target=missing` in that case would
+  be a false-alarm diagnostic that misleads the operator into
+  investigating a non-problem. Better to have no field than a
+  misleading one.
 
-  Originally scoped as "auth_fail vs no_ap" but **simplified after
-  realizing we can't actually distinguish auth-fail from RSSI-prefer**
-  without forcing a connection attempt (which we're explicitly NOT
-  doing per the design). What `WiFi.scan()` can answer is binary:
-  is the target AP physically visible from this device's location.
+  Implication: the rescue flow remains operator-driven (operator
+  knows when they fired up the rescue hotspot). For genuinely-broken
+  remote devices that fell to procyon when no rescue was being
+  attempted, the diagnostic surface is the existing `net=<ssid>`
+  field (operator sees `net=procyon` and can decide whether that's
+  expected for that device). Investigation beyond that requires
+  cable + serial.
 
-  Refined design:
-  - File-scope state: `target_state ∈ {unknown, visible, missing}`
-    plus a next-scan deadline.
-  - While on procyon: run `WiFi.scan()` once every 5 min (after the
-    heartbeat publish, so the ~2–3s blocking scan doesn't push out
-    cadence). Look for the target SSID from `g_cfg.wifi_ssid()` in
-    scan results. Update state.
-  - Off procyon: reset state to `unknown`, no scans.
-  - Heartbeat field, present only when state != unknown:
-    `target=visible` / `target=missing` / `target=unknown`.
-
-  Operator interpretation:
-  - `target=missing` — home AP is genuinely down / out of range / SSID
-    changed. Concrete signal; remote operator can reach out to the
-    install site about the network.
-  - `target=visible` — AP is up and in range, yet device is on procyon.
-    Plausible causes: password wrong, RSSI-prefer of nearby procyon,
-    or DeviceOS hand-off lag. Remote operator's first move: try
-    correcting `wifi_password` in stra2us; if no change, the cause is
-    likely RSSI dominance and operator-side intervention is needed.
-
-  Implementation surface: tel thread (after telemetry_cycle), Particle
-  Stra2usClient already exposes `wifi_ssid()`. Heartbeat snprintf gets
-  a conditional `target=` field. ~50 lines total in
-  critterchron_particle.cpp.
-
-  *(Original auth_fail/no_ap-error-channel design retained below for
-  context, but superseded by the heartbeat-field approach above —
-  fields are louder than errlog ring drains for an
-  always-while-on-procyon signal.)*
-
-  - Target SSID present in scan results AND device fell to procyon →
-    auth failed (password is the prime suspect): record
-    `err=net:auth_fail ssid=<name>`.
-  - Target SSID absent → AP not reachable (router off, out of range):
-    record `err=net:no_ap ssid=<name>`.
+  Will-not-do as a fleet feature. If a future use case actually needs
+  to distinguish "on procyon for rescue" from "on procyon as primary,"
+  the right answer is making procyon's name device-configurable
+  rather than baking in a scan/visibility check — that puts the
+  semantics decision where it belongs, on the operator.
 
   *Failure modes captured.*
   - KV pull succeeds but `setCredentials` fails (slot management bug,

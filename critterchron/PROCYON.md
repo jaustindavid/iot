@@ -141,9 +141,17 @@ via the Arduino `Preferences` library.
 | Blue-chaser visual on rescue+apply   | ✓        | ✓     |
 | DCT-full handling                    | ✓        | n/a   |
 
-Open follow-ups (see TODO entry "Procyon rescue WiFi"): target
-visibility scan (`target=visible`/`missing` for remote diagnostics),
-encryption of `wifi_password` in transit.
+Open follow-ups (see TODO entry "Procyon rescue WiFi"): encryption of
+`wifi_password` in transit.
+
+Explicitly **will-not-do**: target visibility scan
+(`target=visible`/`missing` heartbeat field). Premise was that "on
+procyon" implied "in rescue mode," but a household running a guest
+network legitimately named `procyon` (rescue parameters are not
+secret and could match a household choice) makes "on procyon" a
+valid long-term state. Surfacing target visibility would generate
+false-alarm diagnostics in that case. Operator-driven rescue flow
+relies on `net=<ssid>` alone.
 
 ## Wire format — Stra2us KV keys
 

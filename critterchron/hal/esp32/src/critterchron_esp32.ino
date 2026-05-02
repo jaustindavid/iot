@@ -637,6 +637,9 @@ struct ScheduleSeg {
     uint16_t start_min;
     uint16_t end_min;
     uint8_t  max_bri;
+    uint8_t  min_bri;     // 0 = "no min override" (single-value form);
+                          // 1..255 = pin segment's min_brightness too
+                          // (two-value form `HH:MM-HH:MM:min-max`).
 };
 static constexpr int  SCHEDULE_MAX_SEGS = 8;
 static ScheduleSeg    s_sched_segs[SCHEDULE_MAX_SEGS];
@@ -644,6 +647,9 @@ static uint8_t        s_sched_count = 0;
 static char           s_sched_last[160] = {0};
 static bool           s_sched_parse_ok = false;
 
+// Two segment shapes accepted (mirror of Particle):
+//   `HH:MM-HH:MM:max`         → override max only
+//   `HH:MM-HH:MM:min-max`     → override BOTH ends (hard-pin segment)
 static bool parse_brightness_schedule(const char* s) {
     s_sched_count = 0;
     if (!s || !*s) return true;
@@ -652,16 +658,25 @@ static bool parse_brightness_schedule(const char* s) {
     while (*p && seg_idx < SCHEDULE_MAX_SEGS) {
         while (*p == ' ' || *p == ',' || *p == '\t') ++p;
         if (!*p) break;
-        int sh, sm, eh, em, mb, n = 0;
-        if (sscanf(p, "%d:%d-%d:%d:%d%n", &sh, &sm, &eh, &em, &mb, &n) != 5) {
-            const char* end = p;
-            while (*end && *end != ',') ++end;
-            int len = (int)(end - p);
-            if (len > 28) len = 28;
-            critterchron::g_errlog.record(critterchron::ErrCat::Other,
-                "sched: bad seg %d: %.*s", seg_idx, len, p);
-            s_sched_count = 0;
-            return false;
+        int sh, sm, eh, em, low, high, n = 0;
+        bool two_value = false;
+        if (sscanf(p, "%d:%d-%d:%d:%d-%d%n",
+                   &sh, &sm, &eh, &em, &low, &high, &n) == 6) {
+            two_value = true;
+        } else {
+            n = 0;
+            if (sscanf(p, "%d:%d-%d:%d:%d%n",
+                       &sh, &sm, &eh, &em, &high, &n) != 5) {
+                const char* end = p;
+                while (*end && *end != ',') ++end;
+                int len = (int)(end - p);
+                if (len > 28) len = 28;
+                critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                    "sched: bad seg %d: %.*s", seg_idx, len, p);
+                s_sched_count = 0;
+                return false;
+            }
+            low = 0;  // sentinel: no min override
         }
         if (sh < 0 || sh > 23 || sm < 0 || sm > 59 ||
             eh < 0 || eh > 23 || em < 0 || em > 59) {
@@ -670,15 +685,24 @@ static bool parse_brightness_schedule(const char* s) {
             s_sched_count = 0;
             return false;
         }
-        if (mb < 0 || mb > 255) {
+        if (high < 0 || high > 255) {
             critterchron::g_errlog.record(critterchron::ErrCat::Other,
-                "sched: max_bri %d out of range seg %d", mb, seg_idx);
+                "sched: max_bri %d out of range seg %d", high, seg_idx);
             s_sched_count = 0;
             return false;
         }
+        if (two_value) {
+            if (low < 1 || low > 255 || low > high) {
+                critterchron::g_errlog.record(critterchron::ErrCat::Other,
+                    "sched: min_bri %d out of range seg %d", low, seg_idx);
+                s_sched_count = 0;
+                return false;
+            }
+        }
         s_sched_segs[seg_idx].start_min = (uint16_t)(sh * 60 + sm);
         s_sched_segs[seg_idx].end_min   = (uint16_t)(eh * 60 + em);
-        s_sched_segs[seg_idx].max_bri   = (uint8_t)mb;
+        s_sched_segs[seg_idx].max_bri   = (uint8_t)high;
+        s_sched_segs[seg_idx].min_bri   = (uint8_t)low;
         ++seg_idx;
         p += n;
     }
@@ -687,7 +711,9 @@ static bool parse_brightness_schedule(const char* s) {
 }
 
 // -1 = no segment matches; caller falls through to device default max_b.
-static int schedule_match_max_bri(uint16_t now_min) {
+// `out_min_bri` (optional) receives the segment's min override: 0 if
+// single-value form, 1..255 if two-value.
+static int schedule_match_max_bri(uint16_t now_min, int* out_min_bri = nullptr) {
     for (uint8_t i = 0; i < s_sched_count; ++i) {
         const auto& seg = s_sched_segs[i];
         bool in_seg;
@@ -696,7 +722,10 @@ static int schedule_match_max_bri(uint16_t now_min) {
         } else {
             in_seg = (now_min >= seg.start_min || now_min < seg.end_min);
         }
-        if (in_seg) return (int)seg.max_bri;
+        if (in_seg) {
+            if (out_min_bri) *out_min_bri = (int)seg.min_bri;
+            return (int)seg.max_bri;
+        }
     }
     return -1;
 }
@@ -1435,9 +1464,15 @@ void loop() {
                 struct tm tm;
                 gmtime_r(&local, &tm);
                 uint16_t now_min = (uint16_t)(tm.tm_hour * 60 + tm.tm_min);
-                int sched_max = schedule_match_max_bri(now_min);
+                int sched_min = 0;
+                int sched_max = schedule_match_max_bri(now_min, &sched_min);
                 if (sched_max >= 0) {
                     max_b = sched_max;
+                    // Two-value form (`HH:MM-HH:MM:min-max`) also pins
+                    // min. sched_min == 0 means single-value form —
+                    // keep the device's `min_brightness` as already
+                    // pulled above.
+                    if (sched_min > 0) min_b = sched_min;
                     sched_in_use = true;
                 }
             }

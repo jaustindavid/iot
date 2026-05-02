@@ -50,15 +50,17 @@ aphid:
   diagonal: allowed
   diagonal_cost: 3
   penalty lit cell: 5
+  drunkenness: 0.2
 
 ladybug:
   max nodes: 256
   plan horizon: 2
-  step rate: 2
+  step rate: 1
   diagonal: allowed
   diagonal_cost: 1.414
   penalty lit cell: 1.5        # prefer dark lanes — less disruptive
   penalty occupied cell: 3
+  drunkenness: 0.5
 
 --- behavior ---
 aphid:
@@ -88,7 +90,7 @@ ladybug:
   # `starting` is used once at boot to hold off for 30s, giving aphids a
   # head-start so the clock paints before the predator arrives.
   if state == starting:
-    pause 480  # 60 secs
+    pause 240  # 30 secs
     set state = running
 
   # Priority 1: aphid on a wrong cell — fully destructive, erase the tile
