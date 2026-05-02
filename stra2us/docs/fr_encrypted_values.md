@@ -3,6 +3,54 @@
 *Filed 2026-05-02 while scoping confidentiality for critterchron's
 procyon rescue WiFi flow.*
 
+## Status (as of 2026-05-02)
+
+**Shipped — safe to deploy:**
+- Server: HMAC-keystream cipher in [`core/security.py`](../backend/src/core/security.py),
+  GET/POST/DELETE handlers in [`api/routes_device.py`](../backend/src/api/routes_device.py)
+  honor a `kv:{key}:enc` sidecar, admin POST gained `encrypted: bool`
+  on `KVPayload`, `peek_kv` surfaces the flag.
+- CLI: `stra2us set ... --encrypted` and `stra2us put ... --encrypted`
+  on the writer side; `client.get()` transparently decrypts ext type
+  0x21 on the reader side. See [`tools/stra2us_cli/client.py`](../tools/stra2us_cli/client.py).
+- Admin UI: 🔒 badge on encrypted rows in the dashboard list, an
+  Encrypted checkbox on the KV editor modal (pre-fills from current
+  state to avoid silent demote-on-save), and an "Encrypted: yes/no"
+  line in the peek modal.
+- Test coverage: 7 unit tests pin the cipher wire format including a
+  cross-impl agreement check (server's `kvenc_xor` byte-for-byte equal
+  to CLI's `_kvenc_xor`); 5 live-server integration tests cover
+  encrypted roundtrip, multi-block keystream, per-key isolation,
+  demote-on-bare-set, and the ext-0x21 wire-form contract. All pass
+  against a real uvicorn instance.
+
+**Pending — do not use the feature until this lands:**
+- C++ device decrypt path. Devices currently have no code to recognize
+  msgpack ext type 0x21 or run the HMAC-keystream. Marking a key
+  `--encrypted` that any deployed device reads will break that device's
+  read silently. **In particular: do not set `--encrypted` on
+  `wifi_password` until the C++ FR ships and rolls out.** Server, CLI,
+  and admin UI deploys are dormant until the flag is set on a real key.
+
+**Not yet covered (small, non-blocking):**
+- Pytest coverage of the admin `/api/admin/kv/{key}` POST with
+  `{value, encrypted: true/false}` — exercised end-to-end through the
+  UI but not by an automated regression test.
+- Catalog YAML `encrypted: true` declaration + drift-test lints — that's
+  a consumer-side change, tracked in `critterchron/STRA2US_CATALOG_FR.md`.
+
+**Operational gotchas worth knowing:**
+- *Rotation.* Encrypted KVs are keyed off the per-client shared secret.
+  Rotating a client's secret renders that client's prior encrypted
+  values unreadable on the wire — re-write any encrypted KVs for that
+  client after rotation. (Same threat-model as request/response
+  signing, called out below under "Forward secrecy.")
+- *Two-step write.* Setting an encrypted record is `SET kv:{key}` then
+  `SET kv:{key}:enc` — non-atomic. A server crash between the two ops
+  can leave the flag out of sync with the value. Bounded blast radius;
+  a re-set fixes it. Worth a Redis pipeline if anyone wants the
+  atomicity guarantee.
+
 ## Problem
 
 Stra2us authenticates traffic in both directions (HMAC-SHA256 over
