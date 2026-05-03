@@ -76,21 +76,17 @@
   Worth doing before any *fourth* client implementation. Not urgent
   while just the existing three are in play.
 
-- **Catalog edit UI: prefill input with current value.** When the
-  operator clicks to edit a key in the catalog UI, the input box opens
-  empty regardless of whether the key already has a value set. Should
-  prefill with the existing value (per-scope: device-scope value if
-  present, else app-scope, else blank) so an operator tweaking — e.g.
-  bumping `heartbeep` from 300 to 600, or appending a new segment to
-  `brightness_schedule` — doesn't have to re-type from scratch or
-  paste from a separate `stra2us get` invocation.
+- ~~**Catalog edit UI: prefill input with current value.**~~ Landed
+  2026-05-03. Each scope's input now prefills from `_fetchScopeValue`
+  (which already drove the "Current:" display); string-typed vars
+  render as `<textarea rows="2">` so long values
+  (`brightness_schedule`, `wifi_password`) aren't truncated;
+  `peek_kv`'s plaintext view of encrypted records is what the operator
+  sees, since the admin holds the keys.
 
-  Edge case: long string values (`brightness_schedule`,
-  `wifi_password`) need an input wide enough to show the full value
-  without truncation, or a textarea-style editor for the multi-segment
-  schedules.
-
-  Edge case: secrets (`wifi_password`) — the current value should
-  prefill but the field should also support "show/hide" toggling so an
-  operator doing a quick edit doesn't have the password sitting on
-  screen.
+  *Still open from the original scoping:* show/hide toggling on
+  encrypted records so the password isn't sitting visible while the
+  operator does a quick edit. Catalog now surfaces the encrypted flag
+  from `_fetchScopeValue` (added in the same change), so the signal
+  is available; just need to wire a reveal/hide button. File
+  separately when there's a real complaint.

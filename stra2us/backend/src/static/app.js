@@ -869,7 +869,11 @@ function _editControlHtml(scope, varDesc) {
         }
         return `<input id="${id}" ${attrs} placeholder="new value">`;
     }
-    return `<input id="${id}" type="text" placeholder="new value">`;
+    // String — use textarea so long values (brightness_schedule's multi-segment
+    // schedules, wifi_password) aren't truncated by single-line input width.
+    // rows=2 keeps the modal compact; the textarea grows naturally as the
+    // operator types or pastes more.
+    return `<textarea id="${id}" rows="2" placeholder="new value"></textarea>`;
 }
 
 function _renderCurrent(state, value) {
@@ -885,7 +889,24 @@ async function _fetchScopeValue(app, keyName, device) {
     if (data.status === 'empty' || data.message === null || data.message === '') {
         return { state: 'unset', value: null };
     }
-    return { state: 'set', value: data.message };
+    return { state: 'set', value: data.message, encrypted: !!data.encrypted };
+}
+
+// Stuff the resolved scope value back into the scope's edit input so an
+// operator tweaking — e.g. bumping `heartbeep` from 300 to 600, or
+// appending a new segment to `brightness_schedule` — doesn't have to
+// re-type from scratch or paste from a separate `stra2us get`.
+// Coerces structured values (rare, e.g. nested arrays) to JSON so the
+// wire form is what's shown.
+function _populateScopeInput(scope, value) {
+    const el = document.getElementById(`editInput_${scope}`);
+    if (!el) return;
+    let s;
+    if (value === null || value === undefined) s = '';
+    else if (typeof value === 'string') s = value;
+    else if (typeof value === 'number' || typeof value === 'boolean') s = String(value);
+    else s = JSON.stringify(value);
+    el.value = s;
 }
 
 function openKeyEditor(keyName, opts = {}) {
@@ -928,6 +949,7 @@ function openKeyEditor(keyName, opts = {}) {
         appPane.classList.remove('hidden');
         _fetchScopeValue(_editorContext.app, keyName, null).then(res => {
             document.getElementById('currentApp').innerHTML = _renderCurrent(res.state, res.value);
+            if (res.state === 'set') _populateScopeInput('app', res.value);
         });
     } else if (lockedDevice && hasApp) {
         appPane.innerHTML = `
@@ -975,6 +997,7 @@ function openKeyEditor(keyName, opts = {}) {
         if (lockedDevice) {
             _fetchScopeValue(_editorContext.app, keyName, lockedDevice).then(res => {
                 document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
+                if (res.state === 'set') _populateScopeInput('device', res.value);
             });
         }
     } else {
@@ -1005,6 +1028,7 @@ async function loadDeviceScope() {
     const res = await _fetchScopeValue(_editorContext.app, _editorContext.keyName, devId);
     document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
     document.getElementById('deviceEditRow').classList.remove('hidden');
+    if (res.state === 'set') _populateScopeInput('device', res.value);
 }
 
 function _scopeDevice(scope) {
