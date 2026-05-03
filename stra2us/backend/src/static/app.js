@@ -887,12 +887,21 @@ function _editControlHtml(scope, varDesc) {
     // String — use textarea so long values (brightness_schedule's multi-segment
     // schedules, wifi_password) aren't truncated by single-line input width.
     // rows=2 keeps the modal compact; the textarea grows naturally as the
-    // operator types or pastes more. The hidden Reveal button gets surfaced
-    // by `_populateScopeInput` if the fetched value is encrypted.
+    // operator types or pastes more. Reveal button gets surfaced by
+    // `_populateScopeInput` if the fetched value is encrypted; the
+    // Encrypted checkbox is pre-filled the same way and POSTed via
+    // `saveScope` so the operator can flip the flag without leaving the UI.
+    // String-only on purpose: the server's read path only knows how to
+    // decrypt str/bin payloads, so allowing the checkbox on int/bool/enum
+    // would be a write-time footgun (the device read would 500 later).
     return `<textarea id="${id}" rows="2" placeholder="new value"></textarea>` +
            `<button class="btn-sm" type="button" id="reveal_${scope}" ` +
            `style="display:none;margin-top:4px;" ` +
-           `onclick="_toggleReveal('${id}', this)">Reveal</button>`;
+           `onclick="_toggleReveal('${id}', this)">Reveal</button>` +
+           `<label style="display:block;margin-top:6px;font-size:0.85rem;cursor:pointer;">` +
+           `<input type="checkbox" id="encrypted_${scope}" style="width:auto;margin-right:6px;">` +
+           `Encrypted &mdash; device GETs return ciphertext (msgpack ext 0x21)` +
+           `</label>`;
 }
 
 // Format a resolved value as a <code> cell for any read-only display
@@ -958,6 +967,14 @@ function _populateScopeInput(scope, value, encrypted) {
             revealBtn.style.display = 'none';
         }
     }
+    // Pre-fill the Encrypted checkbox from current sidecar state. Without
+    // this, the FR's "demote to plaintext on bare set" semantic would
+    // silently downgrade an encrypted record any time someone opened the
+    // catalog editor and clicked Save without re-checking the box —
+    // exactly the trap the dashboard editor's prefill already guards
+    // against.
+    const encryptedCheckbox = document.getElementById(`encrypted_${scope}`);
+    if (encryptedCheckbox) encryptedCheckbox.checked = !!encrypted;
 }
 
 // Toggle the visual mask on an editable input (used by Reveal buttons next
@@ -1134,6 +1151,12 @@ async function saveScope(scope) {
         }
         const path = _kvPath(_editorContext.app, _editorContext.keyName, device);
         const body = { value: _encodeForAdmin(_editorContext.var, input.value) };
+        // Forward the Encrypted flag if the editor surfaced the checkbox
+        // (string-only). Sending it explicitly — true or false — ensures
+        // the server's `KVPayload.encrypted` Pydantic default doesn't
+        // silently demote an encrypted record on a bare re-save.
+        const encryptedCheckbox = document.getElementById(`encrypted_${scope}`);
+        if (encryptedCheckbox) body.encrypted = encryptedCheckbox.checked;
         const res = await fetchAPI(`/kv/${path}`, 'POST', body);
         if (!res.ok) {
             errEl.innerText = `write failed: HTTP ${res.status}`;
