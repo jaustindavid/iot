@@ -227,13 +227,27 @@ private:
     // 2xx responses without signature headers are treated as failures;
     // non-2xx responses skip verification (error bodies are not signed by
     // the server, and the caller already treats them as fetch failure).
+    // `out_ts` (optional) receives the parsed `X-Response-Timestamp`
+    // value as a uint32 — used by encrypted-value decrypt as the
+    // keystream nonce. Set only for verified 2xx responses; unset
+    // (left as caller's pre-state) on non-200 or missing-header.
     int  read_response_(const char* uri,
-                        char* body_out, size_t body_out_len);
+                        char* body_out, size_t body_out_len,
+                        uint32_t* out_ts = nullptr);
     void sign_(const char* uri, const char* body, size_t body_len,
                uint32_t ts, char* out_hex);
     static void hex_to_bytes_(const char* hex, uint8_t* out, size_t n);
     // Constant-time compare of two 64-char hex strings (HMAC-SHA256 digest).
     static bool hex_equal_(const char* a, const char* b);
+
+    // HMAC-keystream stream cipher matching Stra2us server-side
+    // `kvenc_xor` (../stra2us/backend/src/core/security.py): mutates
+    // `data[0..len)` in place, XOR'ing against keystream =
+    // `HMAC-SHA256(secret, "stra2us-kvenc-v1" || nonce_BE || counter)`
+    // expanded one 32-byte block per counter increment. Symmetric —
+    // same call encrypts or decrypts. Domain-separation label keeps
+    // this keystream from colliding with HMAC use elsewhere.
+    void kvenc_xor_(uint32_t nonce, uint8_t* data, size_t len) const;
 
     const char* host_;
     int         port_;

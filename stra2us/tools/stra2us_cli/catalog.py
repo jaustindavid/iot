@@ -50,6 +50,14 @@ class Var(BaseModel):
     ops_only: bool = False
     read_cadence: str | None = None
     enforce: bool = False
+    # Consumer-side hint that this key carries sensitive material and
+    # must be stored + served encrypted (Stra2us per-record encrypted
+    # flag, ext type 0x21 wire format). Stra2us itself does not act on
+    # this field — it's a declarative pairing for consumer drift tests
+    # ("every catalog `encrypted: true` is actually stored encrypted")
+    # and name-pattern lints. See docs/fr_encrypted_values.md
+    # ("Catalog hint" section) for the full rationale.
+    encrypted: bool = False
 
     @field_validator("scope")
     @classmethod

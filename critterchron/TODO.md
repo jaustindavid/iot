@@ -869,26 +869,28 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
     drops back to its old credentials and waits for the next time
     procyon comes up. No corruption, no stuck state.
 
-  *Encryption of `wifi_password` over the wire.* v1 ships plaintext
-  (HTTP-with-HMAC-signed-responses; eavesdropper on procyon can sniff).
-  Documented as accepted risk:
-  - Anyone running a procyon hotspot is already in the device's
-    physical proximity, and procyon-mode use is rare and operator-
-    supervised.
-  - Particle Cloud (when used as transport) uses TLS already; Stra2us
-    on private LAN is the exposed surface.
-  Sub-followup: investigate confidentiality. Constraints: no bare-XOR
-  with the device secret (predictable plaintext like ASCII passphrases
-  and length prefixes makes known-plaintext recovery of the secret
-  trivial). Real options:
-  - **HMAC-derived stream cipher** — `keystream = HMAC(secret, nonce)`,
-    XOR plaintext with keystream, send `(nonce, ciphertext)` to client.
-    No secret leakage from known plaintext as long as nonces don't
-    repeat. Cheap (we already have HMAC).
-  - **AES-128-CTR** if mbedTLS is available cheaply on both platforms.
-    Heavier dep; reach for it only if HMAC-stream isn't enough.
-  - **Status quo** — keep plaintext, document the exposure surface,
-    rely on operational discipline.
+  ~~*Encryption of sensitive KV values over the wire.*~~ Landed
+  2026-05-03. Per-key opt-in via `encrypted: true` catalog flag +
+  Stra2us per-record encrypted bit; wire format is msgpack ext type
+  0x21 wrapping HMAC-keystream-XOR ciphertext (cipher details in
+  `../stra2us/docs/fr_encrypted_values.md`). Both Particle and
+  ESP32 Stra2usClient extended: `kv_fetch_str_` recognizes the ext
+  family, `kvenc_xor_` mirrors the server cipher byte-for-byte,
+  `read_response_` surfaces the verified X-Response-Timestamp as the
+  keystream nonce. Catalog `wifi_password` marked `encrypted: true`;
+  drift-test lint forces any `password|secret|key` key to be marked.
+  End-to-end verified on rachel (Photon 2) 2026-05-02: encrypted
+  `wifi_password` → ext 0x21 fetch → on-device decrypt → setCredentials
+  → device joined target network after procyon hotspot dropped. ESP32
+  cipher is byte-for-byte identical and builds clean on timmy; the
+  procyon-rescue replay there hasn't been re-executed but should Just
+  Work.
+
+  Why per-key, not encrypt-everything: encrypting all ~20 catalog
+  values per `poll_all` cycle would add ~30-50ms on OG Photon, and we'd
+  lose `curl | less` debuggability of the dozens of non-sensitive
+  knobs (genuinely useful during procyon testing and ongoing
+  diagnostics).
 
   *Cross-platform split.*
   - **Particle first** — DCT does the persistence, listening mode

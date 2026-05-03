@@ -322,16 +322,19 @@ vars:
   wifi_password:
     type: string
     scope: [app, device]
+    encrypted: true   # MUST be set with `stra2us set ... --encrypted`
     help: |
       Target WiFi password for the procyon rescue-recovery flow. Paired
       with `wifi_ssid`. WPA2-PSK assumed (covers ~all home/office
       networks). Empty / unset = no override active.
 
-      v1 ships plaintext over the Stra2us HTTP layer — anyone who can
-      sniff the procyon-network traffic during the install pull can
-      see this value. Accepted risk for v1: physical proximity to the
-      procyon hotspot is already required, and this password is the
-      operator's choice to expose by setting up the rescue flow.
-      Confidentiality investigation (HMAC-stream-cipher / AES-128) is
-      a separate sub-task in the procyon TODO entry.
+      Encrypted on the wire via Stra2us's HMAC-keystream cipher (see
+      `../stra2us/docs/fr_encrypted_values.md` for the design and
+      `kvenc_xor_` in Stra2usClient.cpp for the device-side decrypt).
+      MUST be written with `stra2us set <device> wifi_password <pw>
+      --encrypted`. Setting without `--encrypted` demotes the record
+      to plaintext, which the drift-test name-pattern lint flags as
+      a CI failure (any key whose name matches /password|secret|key/i
+      is required to be marked encrypted in this catalog AND stored
+      encrypted in Stra2us).
     ops_only: true    # device reads via Stra2usClient::wifi_password()

@@ -182,12 +182,25 @@ private:
 
     bool ensure_connected_();
     bool send_all_(const char* data, int len);
+    // `out_ts` (optional) receives the parsed `X-Response-Timestamp`
+    // value as a uint32 — used by encrypted-value decrypt as the
+    // keystream nonce. Set only on verified 2xx responses; left as
+    // caller's pre-state otherwise. Mirror of the Particle path.
     int  read_response_(const char* uri,
-                        char* body_out, size_t body_out_len);
+                        char* body_out, size_t body_out_len,
+                        uint32_t* out_ts = nullptr);
     void sign_(const char* uri, const char* body, size_t body_len,
                uint32_t ts, char* out_hex);
     static void hex_to_bytes_(const char* hex, uint8_t* out, size_t n);
     static bool hex_equal_(const char* a, const char* b);
+
+    // HMAC-keystream stream cipher matching Stra2us server-side
+    // `kvenc_xor` byte-for-byte. Mirror of
+    // hal/particle/src/Stra2usClient.h. Mutates `data[0..len)` in
+    // place. Symmetric — same call encrypts or decrypts. Domain-
+    // separation label `"stra2us-kvenc-v1"` keeps this keystream
+    // isolated from other HMAC use of the same secret.
+    void kvenc_xor_(uint32_t nonce, uint8_t* data, size_t len) const;
 
     const char* host_;
     int         port_;

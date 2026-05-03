@@ -3,7 +3,7 @@
 *Filed 2026-05-02 while scoping confidentiality for critterchron's
 procyon rescue WiFi flow.*
 
-## Status (as of 2026-05-02)
+## Status (as of 2026-05-03)
 
 **Shipped — safe to deploy:**
 - Server: HMAC-keystream cipher in [`core/security.py`](../backend/src/core/security.py),
@@ -13,10 +13,23 @@ procyon rescue WiFi flow.*
 - CLI: `stra2us set ... --encrypted` and `stra2us put ... --encrypted`
   on the writer side; `client.get()` transparently decrypts ext type
   0x21 on the reader side. See [`tools/stra2us_cli/client.py`](../tools/stra2us_cli/client.py).
+  CLI catalog validator (`tools/stra2us_cli/catalog.py`) accepts the
+  consumer-side `encrypted: bool` field on Var entries.
 - Admin UI: 🔒 badge on encrypted rows in the dashboard list, an
   Encrypted checkbox on the KV editor modal (pre-fills from current
   state to avoid silent demote-on-save), and an "Encrypted: yes/no"
   line in the peek modal.
+- C++ device decrypt path (Particle Photon/Photon 2/Argon + ESP32-C3).
+  `kv_fetch_str_` recognizes the msgpack ext family (fixext1..16,
+  ext8/16/32) with type byte 0x21; `kvenc_xor_` mirrors the server's
+  cipher byte-for-byte; `read_response_` exposes the verified
+  X-Response-Timestamp via an out-param so the decrypt can use it as
+  the keystream nonce. Sources:
+  [`hal/particle/src/Stra2usClient.cpp`](https://github.com/austin/critterchron/blob/main/hal/particle/src/Stra2usClient.cpp),
+  [`hal/esp32/src/Stra2usClient.cpp`](https://github.com/austin/critterchron/blob/main/hal/esp32/src/Stra2usClient.cpp).
+  Validated end-to-end on rachel (Photon 2) on 2026-05-02:
+  encrypted `wifi_password` → ext 0x21 wire fetch → device decrypt →
+  WiFi.setCredentials → device joined target network.
 - Test coverage: 7 unit tests pin the cipher wire format including a
   cross-impl agreement check (server's `kvenc_xor` byte-for-byte equal
   to CLI's `_kvenc_xor`); 5 live-server integration tests cover
@@ -24,20 +37,14 @@ procyon rescue WiFi flow.*
   demote-on-bare-set, and the ext-0x21 wire-form contract. All pass
   against a real uvicorn instance.
 
-**Pending — do not use the feature until this lands:**
-- C++ device decrypt path. Devices currently have no code to recognize
-  msgpack ext type 0x21 or run the HMAC-keystream. Marking a key
-  `--encrypted` that any deployed device reads will break that device's
-  read silently. **In particular: do not set `--encrypted` on
-  `wifi_password` until the C++ FR ships and rolls out.** Server, CLI,
-  and admin UI deploys are dormant until the flag is set on a real key.
-
 **Not yet covered (small, non-blocking):**
 - Pytest coverage of the admin `/api/admin/kv/{key}` POST with
   `{value, encrypted: true/false}` — exercised end-to-end through the
   UI but not by an automated regression test.
-- Catalog YAML `encrypted: true` declaration + drift-test lints — that's
-  a consumer-side change, tracked in `critterchron/STRA2US_CATALOG_FR.md`.
+- ESP32 device-side end-to-end verification (cipher is mirrored from
+  Particle byte-for-byte and built clean on timmy/ESP32-C3, but the
+  full procyon-rescue cycle hasn't been replayed there yet — it
+  should Just Work).
 
 **Operational gotchas worth knowing:**
 - *Rotation.* Encrypted KVs are keyed off the per-client shared secret.

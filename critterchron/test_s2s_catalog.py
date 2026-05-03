@@ -239,6 +239,24 @@ def main(argv: list[str]) -> int:
                 f"true` if intentional."
             )
 
+    # Check 4: name-pattern lint for confidentiality. Any catalog key
+    # whose name suggests sensitive material MUST be marked
+    # `encrypted: true` (which in turn means the consumer code path
+    # routes it through the Stra2us ext-0x21 wire format and the
+    # device-side HMAC-keystream decrypt). Catches the "operator added
+    # a future `secret_api_key` knob and forgot to mark it encrypted"
+    # silent-leak risk. See `stra2us/docs/fr_encrypted_values.md` and
+    # the procyon TODO for the broader rationale.
+    SENSITIVE_NAME_RE = re.compile(r"password|secret|key", re.IGNORECASE)
+    for key, entry in vars_.items():
+        if SENSITIVE_NAME_RE.search(key) and not entry.get("encrypted"):
+            findings.append(
+                f"{CATALOG.name}: `{key}` looks sensitive (name matches "
+                f"/password|secret|key/i) but is not marked "
+                f"`encrypted: true`. Add the flag, OR rename if the key "
+                f"truly carries no secret material."
+            )
+
     if findings:
         print(f"catalog drift — {len(findings)} finding(s):", file=sys.stderr)
         for f in findings:

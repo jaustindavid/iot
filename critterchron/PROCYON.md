@@ -141,8 +141,16 @@ via the Arduino `Preferences` library.
 | Blue-chaser visual on rescue+apply   | ✓        | ✓     |
 | DCT-full handling                    | ✓        | n/a   |
 
-Open follow-ups (see TODO entry "Procyon rescue WiFi"): encryption of
-`wifi_password` in transit.
+All follow-ups landed as of 2026-05-03: encryption of `wifi_password`
+in transit shipped via Stra2us per-key encrypted KV values
+(see [`../stra2us/docs/fr_encrypted_values.md`](../stra2us/docs/fr_encrypted_values.md)).
+Wire format is msgpack ext type 0x21 wrapping HMAC-keystream-XOR
+ciphertext, keyed by the per-client shared secret with the
+X-Response-Timestamp as nonce. Plaintext-mode is still the default
+for non-sensitive knobs; the catalog's `encrypted: true` flag opts a
+key into the ciphered path. A drift-test lint in
+`test_s2s_catalog.py` flags any key whose name matches
+`/password|secret|key/i` that isn't marked encrypted.
 
 Explicitly **will-not-do**: target visibility scan
 (`target=visible`/`missing` heartbeat field). Premise was that "on
@@ -194,19 +202,27 @@ populated by `poll_all()`'s string-fallback block, not the cache-based
 
 ## Threat model & limitations
 
-`wifi_password` ships **plaintext** over the Stra2us HTTP layer. Anyone
-with passive sniff capability on the procyon network during the install
-pull can read it. Accepted v1 tradeoff:
+`wifi_password` is **encrypted on the wire** via Stra2us per-key
+encrypted KV values: msgpack ext type 0x21 wrapping HMAC-keystream-XOR
+ciphertext keyed by the device's shared secret, with the response
+timestamp as nonce. See
+[`../stra2us/docs/fr_encrypted_values.md`](../stra2us/docs/fr_encrypted_values.md)
+for the cipher details and `kvenc_xor_` in
+`hal/{particle,esp32}/src/Stra2usClient.cpp` for the device-side
+decrypt. A passive sniffer on the procyon network sees only
+ciphertext.
 
-- Physical proximity to the procyon hotspot is already required
-  (someone runs that hotspot intentionally).
-- Procyon-mode use is rare and operator-supervised.
-- Stra2us responses are HMAC-signed (authenticity protected; only
-  confidentiality is at risk).
+Authenticity (response signing) and confidentiality (per-key
+encryption) both rely on the same per-client 32-byte shared secret —
+compromise of that secret is a full client compromise. Forward
+secrecy is not a goal: an attacker who later obtains the secret can
+decrypt any previously-captured encrypted KV traffic for that
+client. Same threat model as the existing request/response signing.
 
-A confidentiality investigation (HMAC-derived stream cipher or
-AES-128-CTR) is filed as a separate sub-task in the procyon TODO
-entry. Not v1 work.
+To use the encrypted path, the operator MUST write the value with
+`stra2us set <device> wifi_password <pw> --encrypted`. A bare set
+without the flag demotes the record back to plaintext, which the
+drift-test lint flags as a CI failure.
 
 ## Testing
 

@@ -111,6 +111,41 @@ void Stra2usClient::hex_to_bytes_(const char* hex, uint8_t* out, size_t n) {
     }
 }
 
+void Stra2usClient::kvenc_xor_(uint32_t nonce, uint8_t* data, size_t len) const {
+    // Must match server-side `kvenc_xor` in
+    // stra2us/backend/src/core/security.py byte-for-byte; cross-impl
+    // agreement is unit-tested on the server side. Don't change the
+    // label string, the nonce-encoding (uint32 BE), or the counter
+    // width (1 byte) without coordinating with the server.
+    static constexpr char     LABEL[]   = "stra2us-kvenc-v1";  // 16 bytes, no NUL
+    static constexpr size_t   LABEL_LEN = 16;
+    uint8_t secret[32];
+    hex_to_bytes_(secret_hex_, secret, 32);
+
+    // HMAC input: LABEL(16) + NONCE_BE(4) + COUNTER(1) = 21 bytes
+    uint8_t input[LABEL_LEN + 4 + 1];
+    memcpy(input, LABEL, LABEL_LEN);
+    input[LABEL_LEN + 0] = (uint8_t)((nonce >> 24) & 0xff);
+    input[LABEL_LEN + 1] = (uint8_t)((nonce >> 16) & 0xff);
+    input[LABEL_LEN + 2] = (uint8_t)((nonce >>  8) & 0xff);
+    input[LABEL_LEN + 3] = (uint8_t)( nonce        & 0xff);
+
+    uint8_t block[32];
+    size_t  produced = 0;
+    uint8_t counter  = 0;
+    while (produced < len) {
+        input[LABEL_LEN + 4] = counter;
+        hmac_sha256(secret, 32, input, sizeof(input), block);
+        size_t take = (len - produced) < 32 ? (len - produced) : 32;
+        for (size_t i = 0; i < take; ++i) {
+            data[produced + i] ^= block[i];
+        }
+        produced += take;
+        if (counter == 255) break;  // safety: 256*32 = 8KiB ceiling
+        counter++;
+    }
+}
+
 void Stra2usClient::sign_(const char* uri, const char* body, size_t body_len,
                           uint32_t ts, char* out_hex) {
     uint8_t secret[32];
@@ -160,7 +195,8 @@ bool Stra2usClient::hex_equal_(const char* a, const char* b) {
 }
 
 int Stra2usClient::read_response_(const char* uri,
-                                  char* body_out, size_t body_out_len) {
+                                  char* body_out, size_t body_out_len,
+                                  uint32_t* out_ts) {
     unsigned long start = millis();
     char buf[1024];
     int total = 0;
@@ -362,6 +398,14 @@ int Stra2usClient::read_response_(const char* uri,
                             content_length, body_filled);
             close(); return -1;
         }
+
+        // Surface the verified timestamp for callers that need it as a
+        // nonce — currently the encrypted-value decrypt path in
+        // `kv_fetch_str_` (see `fr_encrypted_values.md`). Only set on
+        // verified 2xx responses so a caller using this can rely on
+        // having a trustworthy nonce; non-2xx and missing-header paths
+        // leave the caller's `out_ts` untouched.
+        if (out_ts) *out_ts = (uint32_t)ts_val;
     }
 
     // Server told us it's closing — drop our end too so the next request
@@ -625,7 +669,9 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
     // read_response_ fills buf with raw body bytes (and null-terminates at
     // the byte after the last filled byte). For msgpack str we then strip
     // the header in place.
-    int status = read_response_(uri, buf, buf_cap);
+    uint32_t resp_ts = 0;     // populated by read_response_ on 2xx; used
+                              // as keystream nonce for ext-0x21 values.
+    int status = read_response_(uri, buf, buf_cap, &resp_ts);
     if (status != 200) {
         Log.warn("kv_fetch_str_: status=%d", status);
         g_errlog.record(ErrCat::OtaFetch, "kvs status=%d", status);
@@ -635,6 +681,8 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
     uint8_t* b = (uint8_t*)buf;
     size_t hdr_len = 0;
     size_t payload_len = 0;
+    bool   is_encrypted = false;
+    uint8_t ext_type = 0;
 
     // Accept both str and bin msgpack types — wire layout is identical
     // (length prefix + raw bytes), only the type byte differs. Stra2us
@@ -642,6 +690,11 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
     // build (observed 2026-04-28 / timmy/fraggle); smaller / older values
     // come back as str. The IR blob is ASCII text either way, so accepting
     // both keeps the device tolerant of either serializer choice.
+    //
+    // Ext family (0xd4-0xd8 fixext, 0xc7-0xc9 ext8/16/32) is reserved
+    // for encrypted values per `stra2us/docs/fr_encrypted_values.md`.
+    // Type byte 0x21 is the cipher marker; any other ext type is a
+    // protocol error.
     if ((b[0] & 0xe0) == 0xa0) {                 // fixstr
         payload_len = b[0] & 0x1f;
         hdr_len = 1;
@@ -655,9 +708,55 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
         payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
                       ((size_t)b[3] << 8)  |  b[4];
         hdr_len = 5;
+    } else if (b[0] >= 0xd4 && b[0] <= 0xd8) {
+        // fixext1/2/4/8/16: marker, type, then exactly 2^(n-0xd4) bytes
+        // of payload. Layout = `<marker><type><data:fixed_len>`.
+        static const size_t fixext_lens[] = {1, 2, 4, 8, 16};
+        payload_len = fixext_lens[b[0] - 0xd4];
+        ext_type    = b[1];
+        hdr_len     = 2;
+        is_encrypted = true;
+    } else if (b[0] == 0xc7) {                   // ext8
+        // Layout = `<0xc7><len:1><type><data:len>`.
+        payload_len = b[1];
+        ext_type    = b[2];
+        hdr_len     = 3;
+        is_encrypted = true;
+    } else if (b[0] == 0xc8) {                   // ext16
+        // Layout = `<0xc8><len:2 BE><type><data:len>`.
+        payload_len = ((size_t)b[1] << 8) | b[2];
+        ext_type    = b[3];
+        hdr_len     = 4;
+        is_encrypted = true;
+    } else if (b[0] == 0xc9) {                   // ext32
+        // Layout = `<0xc9><len:4 BE><type><data:len>`. Way larger than
+        // any plausible string KV value, but accept for completeness.
+        payload_len = ((size_t)b[1] << 24) | ((size_t)b[2] << 16) |
+                      ((size_t)b[3] << 8)  |  b[4];
+        ext_type    = b[5];
+        hdr_len     = 6;
+        is_encrypted = true;
+    } else if (b[0] == 0xc0 || (b[0] & 0xf0) == 0x80) {
+        // nil (0xc0) or fixmap error envelope (0x8X) = key not found.
+        // Silent miss — caller decides whether absence is an error
+        // (wifi_ssid/wifi_password and brightness_schedule all treat
+        // unset as normal). Mirror of the ESP32-side fix landed
+        // 2026-04-30; without this on Particle, rico's heartbeats
+        // log `err=ota_fetch:kvs msgpack hdr=0x81` for every absent
+        // string key fetch.
+        return false;
     } else {
         Log.warn("kv_fetch_str_: msgpack hdr=0x%02x", b[0]);
         g_errlog.record(ErrCat::OtaFetch, "kvs msgpack hdr=0x%02x", b[0]);
+        return false;
+    }
+
+    if (is_encrypted && ext_type != 0x21) {
+        // Unknown ext type — not the kvenc marker we know about. Fail
+        // closed; future ext types added by Stra2us will need explicit
+        // client support.
+        Log.warn("kv_fetch_str_: unknown ext type=0x%02x", ext_type);
+        g_errlog.record(ErrCat::OtaFetch, "kvs ext type=0x%02x", ext_type);
         return false;
     }
 
@@ -672,6 +771,12 @@ bool Stra2usClient::kv_fetch_str_(const char* full_key,
 
     // Shift payload to the start of the buffer, null-terminate.
     if (hdr_len > 0) memmove(buf, buf + hdr_len, payload_len);
+    if (is_encrypted) {
+        // Decrypt in-place. resp_ts populated by read_response_ above.
+        // Symmetric XOR with HMAC-keystream — see kvenc_xor_ for the
+        // cipher details and the server-side reference impl.
+        kvenc_xor_(resp_ts, (uint8_t*)buf, payload_len);
+    }
     buf[payload_len] = '\0';
     out_len = payload_len;
     return true;
