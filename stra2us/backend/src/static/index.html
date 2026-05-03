@@ -73,7 +73,12 @@
                         </div>
                         <div class="input-group" style="margin-top: 12px;">
                             <label class="form-label">Value (Number, Float, or String)</label>
-                            <input type="text" id="kvValueInput" placeholder="e.g. 0.1">
+                            <div style="display:flex;gap:8px;align-items:flex-start;">
+                                <input type="text" id="kvValueInput" placeholder="e.g. 0.1" style="flex:1;">
+                                <button class="btn-sm" type="button" id="kvRevealBtn"
+                                        style="display:none;"
+                                        onclick="_toggleReveal('kvValueInput', this)">Reveal</button>
+                            </div>
                         </div>
                         <div class="input-group" style="margin-top: 12px;">
                             <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">

@@ -626,3 +626,10 @@ tr.catalog-var-row:hover td { background: rgba(0, 240, 255, 0.06); }
    if the table still doesn't fit (e.g. very long device ids). */
 #catalogRawTabPane .card.card-flush,
 #catalogDevicesTabPane .card.card-flush { overflow-x: auto; }
+
+/* Mask characters in inputs holding encrypted values so an operator
+   editing an unrelated field doesn't have e.g. wifi_password sitting
+   visible on screen. -webkit-text-security is non-standard but works
+   in Chrome/Safari/Edge; text-security is the future-spec name. The
+   value itself is still in .value — this is purely visual. */
+.value-masked { -webkit-text-security: disc; text-security: disc; }

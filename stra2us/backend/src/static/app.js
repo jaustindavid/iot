@@ -167,8 +167,21 @@ document.querySelectorAll('.close-btn').forEach(btn => {
 // KV Management
 function openKvModal(key = '', val = '', encrypted = false) {
     document.getElementById('kvKeyInput').value = key;
-    document.getElementById('kvValueInput').value = val;
+    const valEl = document.getElementById('kvValueInput');
+    valEl.value = val;
     document.getElementById('kvEncryptedInput').checked = !!encrypted;
+    // Mask the value field when editing an encrypted record so the plaintext
+    // doesn't sit visible while the operator is here for an unrelated tweak.
+    // The Reveal button toggles the visual mask without touching the value.
+    const revealBtn = document.getElementById('kvRevealBtn');
+    if (encrypted) {
+        valEl.classList.add('value-masked');
+        revealBtn.style.display = '';
+        revealBtn.innerText = 'Reveal';
+    } else {
+        valEl.classList.remove('value-masked');
+        revealBtn.style.display = 'none';
+    }
     document.getElementById('kvModalTitle').innerText = key ? 'Edit KV Pair' : 'Add KV Pair';
     document.getElementById('kvKeyInput').disabled = !!key; // Disable modifying the key if editing
     document.getElementById('kvKeyInput').style.opacity = key ? '0.6' : '1';
@@ -872,14 +885,29 @@ function _editControlHtml(scope, varDesc) {
     // String — use textarea so long values (brightness_schedule's multi-segment
     // schedules, wifi_password) aren't truncated by single-line input width.
     // rows=2 keeps the modal compact; the textarea grows naturally as the
-    // operator types or pastes more.
-    return `<textarea id="${id}" rows="2" placeholder="new value"></textarea>`;
+    // operator types or pastes more. The hidden Reveal button gets surfaced
+    // by `_populateScopeInput` if the fetched value is encrypted.
+    return `<textarea id="${id}" rows="2" placeholder="new value"></textarea>` +
+           `<button class="btn-sm" type="button" id="reveal_${scope}" ` +
+           `style="display:none;margin-top:4px;" ` +
+           `onclick="_toggleReveal('${id}', this)">Reveal</button>`;
 }
 
-function _renderCurrent(state, value) {
+function _renderCurrent(state, value, encrypted) {
     if (state === 'unset') return `<span class="text-muted">(unset)</span>`;
     if (state === 'error') return `<span class="text-muted">(error: ${escapeHtml(String(value))})</span>`;
-    return `<code>${escapeHtml(JSON.stringify(value))}</code>`;
+    const json = JSON.stringify(value);
+    if (encrypted) {
+        // Mask by default with a Reveal button so an operator clicking around
+        // the catalog UI doesn't have an encrypted value flash up unprompted.
+        // Cap dot run at 12 so a long password doesn't make a visually huge
+        // placeholder. Real value is in data-real, swapped in by
+        // `_toggleRevealReadonly`.
+        const dots = '•'.repeat(Math.min(json.length, 12));
+        return `<code class="reveal-target" data-real="${escapeHtml(json)}">${dots}</code>` +
+               ` <button class="btn-sm" type="button" onclick="_toggleRevealReadonly(this)">Reveal</button>`;
+    }
+    return `<code>${escapeHtml(json)}</code>`;
 }
 
 async function _fetchScopeValue(app, keyName, device) {
@@ -897,8 +925,10 @@ async function _fetchScopeValue(app, keyName, device) {
 // appending a new segment to `brightness_schedule` — doesn't have to
 // re-type from scratch or paste from a separate `stra2us get`.
 // Coerces structured values (rare, e.g. nested arrays) to JSON so the
-// wire form is what's shown.
-function _populateScopeInput(scope, value) {
+// wire form is what's shown. When `encrypted` is true, applies the
+// visual mask + reveals the per-scope Reveal button (rendered hidden
+// by `_editControlHtml` for string-typed vars).
+function _populateScopeInput(scope, value, encrypted) {
     const el = document.getElementById(`editInput_${scope}`);
     if (!el) return;
     let s;
@@ -907,6 +937,48 @@ function _populateScopeInput(scope, value) {
     else if (typeof value === 'number' || typeof value === 'boolean') s = String(value);
     else s = JSON.stringify(value);
     el.value = s;
+
+    const revealBtn = document.getElementById(`reveal_${scope}`);
+    if (revealBtn) {
+        if (encrypted) {
+            el.classList.add('value-masked');
+            revealBtn.style.display = '';
+            revealBtn.innerText = 'Reveal';
+        } else {
+            el.classList.remove('value-masked');
+            revealBtn.style.display = 'none';
+        }
+    }
+}
+
+// Toggle the visual mask on an editable input (used by Reveal buttons next
+// to encrypted-record textareas). The text content is unchanged — only the
+// CSS-driven mask flips.
+function _toggleReveal(inputId, btn) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    const masked = el.classList.toggle('value-masked');
+    btn.innerText = masked ? 'Reveal' : 'Hide';
+}
+
+// Toggle the read-only resolution display (the "Current: ..." line) between
+// the dot-mask and the actual value. Read-only views can't use CSS text-
+// security, so we swap textContent in/out instead. The Reveal button must
+// be the next sibling of the <code class="reveal-target" data-real="...">.
+function _toggleRevealReadonly(btn) {
+    const target = btn.previousElementSibling;
+    if (!target) return;
+    const realVal = target.getAttribute('data-real') || '';
+    if (target.dataset.shown === '1') {
+        const dots = '•'.repeat(Math.min(realVal.length, 12));
+        target.textContent = dots;
+        target.dataset.shown = '0';
+        btn.textContent = 'Reveal';
+    } else {
+        target.textContent = realVal;
+        target.dataset.shown = '1';
+        btn.textContent = 'Hide';
+    }
 }
 
 function openKeyEditor(keyName, opts = {}) {
@@ -948,8 +1020,8 @@ function openKeyEditor(keyName, opts = {}) {
         `;
         appPane.classList.remove('hidden');
         _fetchScopeValue(_editorContext.app, keyName, null).then(res => {
-            document.getElementById('currentApp').innerHTML = _renderCurrent(res.state, res.value);
-            if (res.state === 'set') _populateScopeInput('app', res.value);
+            document.getElementById('currentApp').innerHTML = _renderCurrent(res.state, res.value, res.encrypted);
+            if (res.state === 'set') _populateScopeInput('app', res.value, res.encrypted);
         });
     } else if (lockedDevice && hasApp) {
         appPane.innerHTML = `
@@ -996,8 +1068,8 @@ function openKeyEditor(keyName, opts = {}) {
         devPane.classList.remove('hidden');
         if (lockedDevice) {
             _fetchScopeValue(_editorContext.app, keyName, lockedDevice).then(res => {
-                document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
-                if (res.state === 'set') _populateScopeInput('device', res.value);
+                document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value, res.encrypted);
+                if (res.state === 'set') _populateScopeInput('device', res.value, res.encrypted);
             });
         }
     } else {
@@ -1026,9 +1098,9 @@ async function loadDeviceScope() {
     if (!devId) return;
     document.getElementById('currentDevice').innerHTML = '&hellip;';
     const res = await _fetchScopeValue(_editorContext.app, _editorContext.keyName, devId);
-    document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value);
+    document.getElementById('currentDevice').innerHTML = _renderCurrent(res.state, res.value, res.encrypted);
     document.getElementById('deviceEditRow').classList.remove('hidden');
-    if (res.state === 'set') _populateScopeInput('device', res.value);
+    if (res.state === 'set') _populateScopeInput('device', res.value, res.encrypted);
 }
 
 function _scopeDevice(scope) {
@@ -1062,7 +1134,7 @@ async function saveScope(scope) {
         // Re-fetch to show the stored (post-msgpack-round-trip) value.
         const fresh = await _fetchScopeValue(_editorContext.app, _editorContext.keyName, device);
         document.getElementById(scope === 'app' ? 'currentApp' : 'currentDevice').innerHTML =
-            _renderCurrent(fresh.state, fresh.value);
+            _renderCurrent(fresh.state, fresh.value, fresh.encrypted);
         input.value = '';
     } catch (e) {
         errEl.innerText = e.message;

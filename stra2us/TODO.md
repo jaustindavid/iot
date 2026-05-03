@@ -84,9 +84,8 @@
   `peek_kv`'s plaintext view of encrypted records is what the operator
   sees, since the admin holds the keys.
 
-  *Still open from the original scoping:* show/hide toggling on
-  encrypted records so the password isn't sitting visible while the
-  operator does a quick edit. Catalog now surfaces the encrypted flag
-  from `_fetchScopeValue` (added in the same change), so the signal
-  is available; just need to wire a reveal/hide button. File
-  separately when there's a real complaint.
+  *Show/hide for encrypted records also landed* (same day): three
+  surfaces masked by default with Reveal toggles — dashboard KV
+  editor, catalog per-scope editor, and the catalog "Current:" line.
+  The Peek modal stays unmasked since it's an explicit "show me what's
+  there" action.
