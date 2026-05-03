@@ -34,7 +34,7 @@ void init_memory_buffer(struct memory_buffer* mb, uint8_t* mem, size_t capacity)
 }
 
 IoTClient::IoTClient(Client& client, const char* host, uint16_t port, const char* clientId, const char* secretHex)
-    : _client(client), _host(host), _port(port), _clientId(clientId), _secretHex(secretHex), _timeFunc(nullptr) {
+    : _client(client), _host(host), _port(port), _clientId(clientId), _secretHex(secretHex), _timeFunc(nullptr), _lastResponseTs(0) {
 }
 
 void IoTClient::setTimeFunction(uint32_t (*timeFunc)()) {
@@ -172,6 +172,14 @@ int IoTClient::sendSignedRequest(const char* method, const char* uri, const uint
                     if (lowerLine.startsWith("content-length:")) {
                         contentLength = lowerLine.substring(15).toInt();
                     }
+                    // Capture X-Response-Timestamp so encrypted-KV reads can
+                    // use it as the keystream nonce (see decryptKVResponseIfEncrypted).
+                    // Stored regardless of HTTP status — the timestamp is
+                    // signed in tandem with the body so it's safe to use
+                    // even on 204/4xx responses.
+                    if (lowerLine.startsWith("x-response-timestamp:")) {
+                        _lastResponseTs = (uint32_t)lowerLine.substring(21).toInt();
+                    }
                     if (currentLine == "\r\n" || currentLine == "\n") {
                         isBody = true;
                         if (contentLength == 0) {
@@ -250,4 +258,132 @@ int IoTClient::consumeQueue(const char* topic, uint8_t* responseBuffer, size_t m
     }
 
     return status;
+}
+
+// ---- Per-key encrypted KV values (see docs/fr_encrypted_values.md) ----
+
+void IoTClient::kvencXor(uint32_t nonce, uint8_t* data, size_t len) {
+#if defined(ESP32) || defined(PARTICLE)
+    // Decode 32-byte secret from hex (mirrors calculateSignature).
+    uint8_t secretBytes[32];
+    for (int i = 0; i < 32; i++) {
+        char hexByte[3] = { _secretHex[i * 2], _secretHex[i * 2 + 1], '\0' };
+        secretBytes[i] = (uint8_t)strtol(hexByte, nullptr, 16);
+    }
+
+    // Domain-separation label — must match server's KVENC_LABEL exactly.
+    static const char kLabel[] = "stra2us-kvenc-v1";
+    static const size_t kLabelLen = sizeof(kLabel) - 1;  // 16, no NUL
+
+    // nonce as uint32 BE.
+    uint8_t nonceBytes[4] = {
+        (uint8_t)((nonce >> 24) & 0xFF),
+        (uint8_t)((nonce >> 16) & 0xFF),
+        (uint8_t)((nonce >> 8)  & 0xFF),
+        (uint8_t)(nonce & 0xFF),
+    };
+
+    const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!md_info) return;  // Defensive — mbedtls misconfig
+
+    uint8_t counter = 0;
+    size_t pos = 0;
+    while (pos < len) {
+        // keystream block = HMAC-SHA256(secret, label || nonce_be32 || counter)
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        mbedtls_md_setup(&ctx, md_info, 1);
+        mbedtls_md_hmac_starts(&ctx, secretBytes, 32);
+        mbedtls_md_hmac_update(&ctx, (const unsigned char*)kLabel, kLabelLen);
+        mbedtls_md_hmac_update(&ctx, nonceBytes, 4);
+        mbedtls_md_hmac_update(&ctx, &counter, 1);
+        uint8_t block[32];
+        mbedtls_md_hmac_finish(&ctx, block);
+        mbedtls_md_free(&ctx);
+
+        size_t blockEnd = pos + 32;
+        if (blockEnd > len) blockEnd = len;
+        for (size_t i = pos; i < blockEnd; i++) {
+            data[i] ^= block[i - pos];
+        }
+        pos = blockEnd;
+        counter++;
+        // 256 * 32 = 8192 bytes is the practical ceiling for one nonce.
+        // No KV value will ever approach that — the server enforces a similar
+        // cap. Defensive break in case of bug:
+        if (counter == 0 && pos < len) return;  // wrapped past 255
+    }
+#else
+    // No mbedtls fallback — caller is responsible for not enabling
+    // encrypted KVs on platforms without HMAC-SHA256.
+    (void)nonce; (void)data; (void)len;
+#endif
+}
+
+bool IoTClient::decryptKVResponseIfEncrypted(uint8_t* data, size_t* len) {
+    if (data == nullptr || len == nullptr || *len < 2) return false;
+
+    // Manual msgpack ext-family parse. Avoids dragging in cmp's reader
+    // infrastructure for one tiny header check. See msgpack spec §ext.
+    //
+    // Layouts (header bytes followed by `payloadLen` bytes of ciphertext):
+    //   0xd4 type [1 byte ]   fixext1
+    //   0xd5 type [2 bytes]   fixext2
+    //   0xd6 type [4 bytes]   fixext4
+    //   0xd7 type [8 bytes]   fixext8
+    //   0xd8 type [16 bytes]  fixext16
+    //   0xc7 size(u8)  type [size bytes]   ext8
+    //   0xc8 size(u16) type [size bytes]   ext16  (size big-endian)
+    //   0xc9 size(u32) type [size bytes]   ext32  (size big-endian)
+    //
+    // We only treat type == 0x21 (KVENC_EXT_TYPE) as encrypted. Anything
+    // else falls through unchanged so callers can still get e.g. plaintext
+    // msgpack maps for `{"status": "not_found"}` responses.
+
+    uint8_t marker = data[0];
+    size_t payloadLen = 0;
+    size_t headerLen = 0;
+    int8_t extType = 0;
+
+    switch (marker) {
+        case 0xd4: payloadLen = 1;  headerLen = 2; extType = (int8_t)data[1]; break;
+        case 0xd5: payloadLen = 2;  headerLen = 2; extType = (int8_t)data[1]; break;
+        case 0xd6: payloadLen = 4;  headerLen = 2; extType = (int8_t)data[1]; break;
+        case 0xd7: payloadLen = 8;  headerLen = 2; extType = (int8_t)data[1]; break;
+        case 0xd8: payloadLen = 16; headerLen = 2; extType = (int8_t)data[1]; break;
+        case 0xc7:
+            if (*len < 3) return false;
+            payloadLen = data[1];
+            extType = (int8_t)data[2];
+            headerLen = 3;
+            break;
+        case 0xc8:
+            if (*len < 4) return false;
+            payloadLen = ((size_t)data[1] << 8) | (size_t)data[2];
+            extType = (int8_t)data[3];
+            headerLen = 4;
+            break;
+        case 0xc9:
+            if (*len < 6) return false;
+            payloadLen = ((size_t)data[1] << 24) | ((size_t)data[2] << 16) |
+                         ((size_t)data[3] << 8)  | (size_t)data[4];
+            extType = (int8_t)data[5];
+            headerLen = 6;
+            break;
+        default:
+            return false;  // Not an ext type — leave caller's buffer alone.
+    }
+
+    if (extType != 0x21) return false;
+    if (headerLen + payloadLen > *len) return false;  // Truncated — refuse.
+
+    // Decrypt in place, then collapse the msgpack ext header out so the
+    // caller's buffer holds just the plaintext bytes (matches what the
+    // CLI's get() returns post-decrypt).
+    kvencXor(_lastResponseTs, data + headerLen, payloadLen);
+    if (headerLen > 0) {
+        memmove(data, data + headerLen, payloadLen);
+    }
+    *len = payloadLen;
+    return true;
 }

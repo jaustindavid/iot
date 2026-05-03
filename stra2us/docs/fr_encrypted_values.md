@@ -30,21 +30,55 @@ procyon rescue WiFi flow.*
   Validated end-to-end on rachel (Photon 2) on 2026-05-02:
   encrypted `wifi_password` → ext 0x21 wire fetch → device decrypt →
   WiFi.setCredentials → device joined target network.
+- Reference C++ SDK (`client/src/IoTClient.{h,cpp}`): `kvencXor`
+  primitive, `lastResponseTimestamp()` accessor, and a
+  `decryptKVResponseIfEncrypted` convenience helper that detects the
+  full ext family (fixext1..16, ext8/16/32) with type 0x21, decrypts
+  in place, and updates the caller's length. Future device ports start
+  here instead of copying from critterchron's HAL. **Not yet
+  compile-validated against Particle/ESP32 toolchains** — code
+  mirrors the working critterchron HAL line-for-line but a real build
+  on either platform is still a follow-up.
 - Test coverage: 7 unit tests pin the cipher wire format including a
   cross-impl agreement check (server's `kvenc_xor` byte-for-byte equal
   to CLI's `_kvenc_xor`); 5 live-server integration tests cover
   encrypted roundtrip, multi-block keystream, per-key isolation,
-  demote-on-bare-set, and the ext-0x21 wire-form contract. All pass
-  against a real uvicorn instance.
+  demote-on-bare-set, and the ext-0x21 wire-form contract; 5 admin-API
+  live tests cover the `KVPayload.encrypted` flag (set/clear/demote/
+  Pydantic-default/delete-clears-sidecar). All 53 pass against a real
+  uvicorn instance.
 
 **Not yet covered (small, non-blocking):**
-- Pytest coverage of the admin `/api/admin/kv/{key}` POST with
-  `{value, encrypted: true/false}` — exercised end-to-end through the
-  UI but not by an automated regression test.
-- ESP32 device-side end-to-end verification (cipher is mirrored from
-  Particle byte-for-byte and built clean on timmy/ESP32-C3, but the
-  full procyon-rescue cycle hasn't been replayed there yet — it
-  should Just Work).
+- Reference SDK compile-check on Particle and ESP32 toolchains.
+- ESP32 device-side end-to-end verification of the *critterchron* HAL
+  (cipher is mirrored from Particle byte-for-byte and built clean on
+  timmy/ESP32-C3, but the full procyon-rescue cycle hasn't been
+  replayed there yet — it should Just Work).
+- Cross-language test vectors in this doc — fixed `(secret, nonce,
+  plaintext) → ciphertext` triples generated from the Python impl,
+  for any future port to drop into a unit test before going live.
+
+**Cross-language test vectors:**
+
+Generated from the Python reference implementation
+([`tools/stra2us_cli/client.py:_kvenc_xor`](../tools/stra2us_cli/client.py))
+on 2026-05-03. Any conforming port must reproduce these byte-for-byte
+before going live. The 33-byte case is the keystream-counter-rolls
+guard; the 63-byte case is the realistic WPA2 max-length input.
+
+| name | secret_hex (32B) | nonce | plaintext (hex) | ciphertext (hex) |
+|---|---|---|---|---|
+| 1B  | `00…00` | `0`          | `00`                                                                                                                                 | `06` |
+| 32B | `00…00` | `1`          | `00…` (×32)                                                                                                                          | `b9a9ca963328b9c3b2740905b1c9e48b4d86b6a339de2ee9ef5e5a087b7a7bde` |
+| 33B (counter rolls) | `00…00` | `1` | `00…` (×33)                                                                                                                  | `b9a9ca963328b9c3b2740905b1c9e48b4d86b6a339de2ee9ef5e5a087b7a7bde8a` |
+| typical wifi pw | `ab…ab` | `1714608000` (`0x6632d780`) | `68756e746572322d776966692d70617373776f72642d68657265`                                                       | `93cc04aa952f30619fd6d78bd971388ea02cd95df78ec966bfec` |
+| 63B WPA2 max | `cd…cd` | `3735928559` (`0xdeadbeef`) | `78` × 63                                                                                                       | `9c4fa502aab925e99e55cf5632623efdf9d4b9bdfb3236205b10c4f0c4427e26f21fa6d0b2934b6af09a515e1fdbbc743d8f4a59223516374f344198c2796d` |
+
+(`00…00` = 32 bytes of `0x00`; `ab…ab` = 32 bytes of `0xab`; etc.
+The 33-byte ciphertext extends the 32-byte one by exactly one byte
+because that's the first byte of the counter=1 block — a useful sanity
+check that any port computes both `counter=0` and `counter=1` blocks
+correctly.)
 
 **Operational gotchas worth knowing:**
 - *Rotation.* Encrypted KVs are keyed off the per-client shared secret.
