@@ -704,12 +704,14 @@ async function openDeviceDetail(deviceId) {
         // Resolve effective + source.
         let effHtml, sourceHtml;
         if (devRes.state === 'set') {
-            effHtml = `<code>${escapeHtml(JSON.stringify(devRes.value))}</code>`;
+            effHtml = _formatValueCell(devRes.value, devRes.encrypted, true);
             sourceHtml = `<span class="badge source-device">device</span>`;
         } else if (appRes.state === 'set') {
-            effHtml = `<code>${escapeHtml(JSON.stringify(appRes.value))}</code>`;
+            effHtml = _formatValueCell(appRes.value, appRes.encrypted, true);
             sourceHtml = `<span class="badge source-app">app</span>`;
         } else if (v.default !== undefined && v.default !== null && !v.default_per_device) {
+            // Catalog defaults can't be encrypted — they live in the YAML
+            // declaration, never go through the sidecar — so render plain.
             effHtml = `<code>${escapeHtml(JSON.stringify(v.default))}</code>`;
             sourceHtml = `<span class="badge source-default">default</span>`;
         } else {
@@ -734,7 +736,7 @@ function _effectiveCell(res) {
     if (res.state === 'na') return `<span class="text-muted">&mdash;</span>`;
     if (res.state === 'unset') return `<span class="text-muted">(unset)</span>`;
     if (res.state === 'error') return `<span class="text-muted">(err)</span>`;
-    return `<code>${escapeHtml(JSON.stringify(res.value))}</code>`;
+    return _formatValueCell(res.value, res.encrypted, true);
 }
 
 // Open the M3b key editor from a device-effective row, locked to that
@@ -893,21 +895,28 @@ function _editControlHtml(scope, varDesc) {
            `onclick="_toggleReveal('${id}', this)">Reveal</button>`;
 }
 
+// Format a resolved value as a <code> cell for any read-only display
+// (current-value line in the editor, per-scope and effective columns in
+// the device-effectives table). When `encrypted` is true, masks by default
+// with a Reveal button — the same pattern any operator-facing value
+// surface needs so a wifi_password doesn't flash up unprompted while
+// they're clicking around. The `inClickableRow` flag stops button-click
+// propagation so the Reveal doesn't also trigger the row's onclick.
+function _formatValueCell(value, encrypted, inClickableRow) {
+    const json = JSON.stringify(value);
+    if (encrypted) {
+        const dots = '•'.repeat(Math.min(json.length, 12));
+        const stop = inClickableRow ? 'event.stopPropagation();' : '';
+        return `<code class="reveal-target" data-real="${escapeHtml(json)}">${dots}</code>` +
+               ` <button class="btn-sm" type="button" onclick="${stop}_toggleRevealReadonly(this)">Reveal</button>`;
+    }
+    return `<code>${escapeHtml(json)}</code>`;
+}
+
 function _renderCurrent(state, value, encrypted) {
     if (state === 'unset') return `<span class="text-muted">(unset)</span>`;
     if (state === 'error') return `<span class="text-muted">(error: ${escapeHtml(String(value))})</span>`;
-    const json = JSON.stringify(value);
-    if (encrypted) {
-        // Mask by default with a Reveal button so an operator clicking around
-        // the catalog UI doesn't have an encrypted value flash up unprompted.
-        // Cap dot run at 12 so a long password doesn't make a visually huge
-        // placeholder. Real value is in data-real, swapped in by
-        // `_toggleRevealReadonly`.
-        const dots = '•'.repeat(Math.min(json.length, 12));
-        return `<code class="reveal-target" data-real="${escapeHtml(json)}">${dots}</code>` +
-               ` <button class="btn-sm" type="button" onclick="_toggleRevealReadonly(this)">Reveal</button>`;
-    }
-    return `<code>${escapeHtml(json)}</code>`;
+    return _formatValueCell(value, encrypted, false);
 }
 
 async function _fetchScopeValue(app, keyName, device) {
