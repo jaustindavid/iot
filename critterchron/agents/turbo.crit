@@ -1,0 +1,55 @@
+# turbo.crit: Methodical maintenance
+#
+# Simplest painter script: one agent walks the grid, turning unintended-lit
+# cells off (`extra`) and intended-unlit cells on (`missing`). Slow tick
+# rate (500ms) makes the motion legible; the default `draw green` is the
+# only color the agent ever uses.
+
+--- colors ---
+turbo: (128, 64, 0) # body color
+green: (0, 255, 0)  # painted-tile color used by `draw green`
+
+night:
+  turbo: (0, 0, 0)
+  green: (0, 1, 0)
+
+--- agents ---
+# No `up to N` or `state {}` — the agent type is auto-registered by its
+# `starts at`. No explicit color block entry needed here either; the
+# `colors` table already names `turbo`.
+turbo starts at (0,0)
+
+--- simulation ---
+tick rate: 50ms
+
+--- pathfinding ---
+# `all:` is the fallback block applied to every agent type unless overridden.
+# For a single-agent script you could equally write `turbo:`; using
+# `all:` is just idiomatic when the settings are type-agnostic.
+all:
+  max nodes: 256
+  step rate: 1
+  diagonal: allowed
+  diagonal_cost: 1.414
+
+--- behavior ---
+turbo:
+  # Priority 1: erase any wrongly-lit cell.
+  seek nearest extra timeout 50
+  if standing on extra:
+    erase
+    done
+
+  # Priority 2: paint any unlit intended cell.
+  seek nearest missing timeout 50
+  if standing on missing:
+    draw green fade 1200 # 1 minute
+    done
+
+  # Idle: slow drift so convergence failures are visible as motion.
+  # `wander avoiding current` keeps the turbo off cells that are
+  # already correct, so it's more likely to bump into work.
+  pause 3-5
+  if random 25%:
+    wander avoiding current
+  done

@@ -264,39 +264,19 @@ vars:
     type: string
     scope: [app, device]
     help: |
-      Time-of-day override on the brightness curve's bounds. Comma-
-      separated segments. Two segment shapes accepted:
-
-        HH:MM-HH:MM:max          — override max_brightness only
-                                   (min unchanged at device default)
-        HH:MM-HH:MM:min-max      — pin BOTH ends of the curve
-                                   (use to hard-clamp a segment, e.g.
-                                   bedtime "1-1" forces brightness=1)
-
-      First match wins; wraparound handled by start > end (e.g.
-      `23:00-07:00:1` crosses midnight). Up to 8 segments per schedule.
-      Examples:
-          "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
-          "23:00-07:00:1-1, 07:00-23:00:64"      # bedtime hard-pinned
-
-      When set and a segment matches the current local wall-clock time,
-      the segment's max replaces `max_brightness` for the brightness-
-      loop calculation; in two-value form, min replaces `min_brightness`
-      too. Sensor-driven smoothing still drives the final on-panel
-      brightness, so transitions across segment boundaries fade over
-      ~10s rather than snapping.
-      Empty string = no schedule active. All-or-nothing parse:
-      malformed segments reject the whole schedule (heartbeat
-      surfaces `bri=(...sched-err)` plus `err=other:sched: <reason>`).
-      Active schedule visible in heartbeat as `bri=(...sched)`.
-
-      Side effect — forced night palette: clamping max_bri below
-      `night_enter_brightness` will engage night-palette mode via
-      the existing Schmitt trigger once the smoothed brightness
-      settles. So `"23:00-07:00:1"` works as a "force night palette
-      at bedtime" override on any device whose `night_enter_brightness`
-      is ≥1. No separate `night_force_schedule` knob needed.
-    ops_only: true    # device reads via Stra2usClient::brightness_schedule(), not get_int/get_float
+      Time-of-day brightness override. Comma-separated segments, up to
+      8, first match wins, wraparound handled (start > end crosses
+      midnight). Two segment shapes:
+        HH:MM-HH:MM:max         override max only (min unchanged)
+        HH:MM-HH:MM:min-max     pin both ends (hard-clamp; bedtime "1-1")
+      Examples: "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
+                "23:00-07:00:1-1, 07:00-23:00:64"
+      Sensor smoothing still applies; segment transitions fade ~10s.
+      Empty = off. Malformed segment rejects whole schedule (heartbeat
+      shows `bri=(...sched-err)` + errlog). Active = `bri=(...sched)`.
+      Side effect: clamping max below `night_enter_brightness` engages
+      night palette via the existing Schmitt — no separate knob needed.
+    ops_only: true
 
   # ---------- Procyon rescue WiFi: KV-driven cred install ----------
 
