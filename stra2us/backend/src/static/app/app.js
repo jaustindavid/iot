@@ -410,132 +410,44 @@ function renderDeviceError(htmlMsg) {
 // Drop in a real YAML lib if this gets fragile. Phase 3 (which lifts
 // the catalog editor primitives into a shared module) is a natural
 // time to revisit.
-// Returns the catalog as `{ telemetry_topic, heartbeat_interval_seconds,
-// vars: {...} }`. Top-level scalars (`telemetry_topic`,
-// `heartbeat_interval_seconds`) drive the app view's telemetry tail
-// and status-badge thresholds; vars drive the settings cards.
+// Parse the catalog YAML into the shape this page needs:
+//   { telemetryTopic, heartbeatIntervalSeconds, vars }
+//
+// Uses js-yaml (loaded via the CDN script in device.html) — same lib
+// + version pinning the admin UI uses. Replaces an earlier hand-rolled
+// line-scanning parser that mishandled `|` block scalars (the bare
+// `|` showed up as the rendered help text instead of the multi-line
+// content beneath it). YAML has too many edge cases — anchors, tags,
+// flow style, multi-line strings — for a hand-roll to stay correct as
+// the catalog spec grows.
 //
 // `telemetry_topic`: catalog-declared topic to tail. Supports `{app}`
 // and `{device}` placeholders. Default: `{app}/public/heartbeep`.
 //
 // `heartbeat_interval_seconds`: app's expected cadence for the
-// telemetry stream. Used to derive the status-badge thresholds and
-// the activity-tail freshness cutoff — so a device that heartbeeps
-// every 5 minutes isn't called "Offline" at 4 minutes since last
-// message. Default: 60s (a sane catch-all if the catalog hasn't
-// declared an explicit cadence).
+// telemetry stream. Used to derive the status-badge thresholds — so a
+// device that heartbeeps every 5 minutes isn't called "Offline" at
+// 4 minutes since last message. Default: 60s.
 function parseCatalog(yamlText) {
-    const vars = parseCatalogVars(yamlText);
-    let telemetryTopic = null;
+    let doc;
+    try {
+        doc = jsyaml.load(yamlText);
+    } catch (e) {
+        throw new Error(`catalog YAML parse error: ${e.message}`);
+    }
+    if (!doc || typeof doc !== 'object') {
+        throw new Error('catalog YAML did not parse as a mapping');
+    }
+    const vars = (doc.vars && typeof doc.vars === 'object') ? doc.vars : {};
     let heartbeatIntervalSeconds = null;
-    for (const rawLine of yamlText.split('\n')) {
-        const line = rawLine.replace(/#.*$/, '').replace(/\s+$/, '');
-        let m;
-        if ((m = line.match(/^telemetry_topic\s*:\s*(.*)$/))) {
-            telemetryTopic = parseScalar(m[1]);
-        } else if ((m = line.match(/^heartbeat_interval_seconds\s*:\s*(.*)$/))) {
-            const v = parseScalar(m[1]);
-            if (typeof v === 'number' && v > 0) heartbeatIntervalSeconds = v;
-        }
+    if (typeof doc.heartbeat_interval_seconds === 'number'
+        && doc.heartbeat_interval_seconds > 0) {
+        heartbeatIntervalSeconds = doc.heartbeat_interval_seconds;
     }
+    const telemetryTopic = (typeof doc.telemetry_topic === 'string')
+        ? doc.telemetry_topic
+        : null;
     return { telemetryTopic, heartbeatIntervalSeconds, vars };
-}
-
-function parseCatalogVars(yamlText) {
-    const out = {};
-    const lines = yamlText.split('\n');
-    let inVars = false;
-    let currentName = null;
-    let baseIndent = -1;
-
-    for (const rawLine of lines) {
-        // Strip trailing comments (cheap; not strictly correct for
-        // strings containing '#' but adequate for our schema).
-        const line = rawLine.replace(/#.*$/, '').replace(/\s+$/, '');
-        if (!line.length) continue;
-
-        if (/^vars\s*:\s*$/.test(line)) {
-            inVars = true;
-            continue;
-        }
-        if (!inVars) continue;
-
-        // Top-level var name: indented one level (assume 2 spaces or tab),
-        // ends in `:` with nothing else.
-        const varMatch = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$/);
-        if (varMatch) {
-            const indent = varMatch[1].length;
-            if (baseIndent < 0) baseIndent = indent;
-            if (indent === baseIndent) {
-                currentName = varMatch[2];
-                out[currentName] = {};
-                continue;
-            }
-        }
-
-        // Inline-format var: `name: {type: int, ...}`. Catch the common
-        // case so apps that use the compact form don't break.
-        const inlineMatch = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\{(.+)\}\s*$/);
-        if (inlineMatch) {
-            const indent = inlineMatch[1].length;
-            if (baseIndent < 0) baseIndent = indent;
-            if (indent === baseIndent) {
-                const name = inlineMatch[2];
-                out[name] = parseInlineFields(inlineMatch[3]);
-                currentName = null;
-                continue;
-            }
-        }
-
-        // Field of the current var: more-indented `key: value`.
-        if (currentName !== null) {
-            const fieldMatch = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
-            if (fieldMatch && fieldMatch[1].length > baseIndent) {
-                const key = fieldMatch[2];
-                const val = parseScalar(fieldMatch[3]);
-                out[currentName][key] = val;
-            }
-        }
-    }
-    return out;
-}
-
-function parseInlineFields(body) {
-    // body = "type: int, scope: [app, device], help: foo"
-    // Naive split on top-level commas — fine for our small set of fields.
-    const obj = {};
-    let depth = 0;
-    let cur = '';
-    const parts = [];
-    for (const c of body) {
-        if (c === '[' || c === '{') depth++;
-        else if (c === ']' || c === '}') depth--;
-        else if (c === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
-        cur += c;
-    }
-    if (cur.trim()) parts.push(cur);
-    for (const p of parts) {
-        const m = p.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
-        if (m) obj[m[1]] = parseScalar(m[2].trim());
-    }
-    return obj;
-}
-
-function parseScalar(s) {
-    s = s.trim();
-    if (s === '') return null;
-    if (s === 'true') return true;
-    if (s === 'false') return false;
-    if (s === 'null' || s === '~') return null;
-    // Quoted string
-    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-        return s.slice(1, -1);
-    }
-    // Number?
-    if (/^-?\d+$/.test(s)) return parseInt(s, 10);
-    if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
-    // Bare string
-    return s;
 }
 
 // =====================================================================
