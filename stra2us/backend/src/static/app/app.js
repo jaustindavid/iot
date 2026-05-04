@@ -319,6 +319,35 @@ function _formatDefaultAnnotation(v) {
     return ` <span class="setting-default-hint">[default: ${escapeHtml(s)}]</span>`;
 }
 
+// Clip help text for narrow surfaces (the edit modal especially).
+// Catalog convention encouraged in catalog_spec.md: first paragraph =
+// short blurb, rest = long-form details. Implementation honours that
+// by clipping at the first newline; falls back to a word-count cap
+// for legacy / un-paragraphed help. Picks whichever produces less
+// content so wordy single-paragraph descriptions still get truncated.
+// Trailing ellipsis signals "there's more."
+const _CLIP_HELP_MAX_WORDS = 20;
+function _clipHelp(help) {
+    if (!help) return '';
+    const trimmed = String(help).trim();
+    const beforeNewline = trimmed.split(/\r?\n/)[0].trim();
+    const newlineClipped = beforeNewline !== trimmed;
+
+    const words = trimmed.split(/\s+/);
+    const firstNWords = words.slice(0, _CLIP_HELP_MAX_WORDS).join(' ');
+    const wordsClipped = words.length > _CLIP_HELP_MAX_WORDS;
+
+    let chosen, chosenClipped;
+    if (beforeNewline.length <= firstNWords.length) {
+        chosen = beforeNewline;
+        chosenClipped = newlineClipped;
+    } else {
+        chosen = firstNWords;
+        chosenClipped = wordsClipped;
+    }
+    return chosenClipped ? chosen + '…' : chosen;
+}
+
 function populateSettingValue(varName, res, varDesc, appName, deviceId) {
     const valEl = document.getElementById(`val-${varName}`);
     const revealBtn = document.getElementById(`reveal-${varName}`);
@@ -608,7 +637,7 @@ function openEditModal(varName) {
     $('#editModalTitle').innerText = v.label || varName;
     const helpEl = $('#editModalHelp');
     if (v.help) {
-        helpEl.innerText = v.help;
+        helpEl.innerText = _clipHelp(v.help);
         helpEl.classList.remove('hidden');
     } else {
         helpEl.innerText = '';

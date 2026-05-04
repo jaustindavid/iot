@@ -44,8 +44,11 @@ vars:
     label: Heartbeat interval                # customer-facing title; presence
                                              # is the app-view visibility gate
     help: |
-      Stra2us heartbeat cadence in seconds. Device reads this once per
-      loop iteration and adjusts in-place.
+      Stra2us heartbeat cadence in seconds.
+
+      Device reads this once per loop iteration and adjusts in-place.
+      Lower values give snappier UI feedback at the cost of bandwidth;
+      300s is a reasonable default for always-online devices.
 
   wifi_password:
     type: string
@@ -98,7 +101,7 @@ Each entry under `vars:` is a map with the following fields.
 | `range`              | no       | `[lo, hi]`       | Numeric types only. **Recommended** bounds — advisory to tooling, not enforced on-device. See invariant 2 in §4. |
 | `values`             | cond.    | list             | Required for `type: enum`. List of allowed string values. |
 | `format`             | no       | string           | UI hint for how to render the control. See §2.2. Does not change validation. |
-| `help`               | no       | string           | Free-form prose. Surfaced in CLI listings, tooltips in the UI. Use multi-line `help: \|` for anything longer than a phrase. |
+| `help`               | no       | string           | Free-form prose. Surfaced in CLI listings, tooltips in the UI. Use multi-line `help: \|` for anything longer than a phrase. **Convention for narrow surfaces (the customer-facing app view's edit modal):** put a short blurb on the first line, then a blank line, then long-form details. Narrow renderers clip at the first newline (or a ~20-word fallback if no newline) and append an ellipsis. See example below. |
 | `ops_only`           | no       | bool             | Opt out of the "must have a firmware reader" drift-lint check. Used for keys consumed by Stra2us client libraries themselves (e.g. the OTA script pointer) rather than by `get_*` calls in app code. Defaults to `false`. |
 | `read_cadence`       | no       | string           | Hint to the UI about how quickly a write takes effect on-device. One of `loop`, `poll`, `boot`, or a free-form string. Default: unspecified / unknown. |
 | `enforce`            | no       | bool             | When `true`, the stra2us server (M2+) advisory-rejects writes that fall outside `range` with a 409. Defaults to `false`: server remains permissive, CLI/UI validate. |
