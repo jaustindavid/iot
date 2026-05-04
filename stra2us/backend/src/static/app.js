@@ -230,13 +230,20 @@ function formatAclSummary(acl) {
     const perms = acl.permissions || [];
     if (perms.length === 0)
         return '<span class="badge" style="background:var(--accent-danger);color:#fff;">No Access</span>';
+    // `display:inline-block` makes each badge atomic (the wrap engine
+    // can't split the prefix from the `: rw` mid-badge); `.join(' ')`
+    // gives the wrap engine actual whitespace to break on between
+    // badges. `white-space:nowrap` belt-and-suspenders the no-mid-
+    // badge-split inside the inline-block. Replaces an earlier
+    // `.join('')` + `&thinsp;` shape that wrapped poorly when a user
+    // had several device-scope grants.
     return perms.map(p =>
-        `<span class="badge" style="background:${p.access==='rw' ? 'rgba(0,240,255,0.15)' : 'rgba(138,43,226,0.15)'};
+        `<span class="badge" style="display:inline-block; white-space:nowrap; margin:2px 4px 2px 0;
+               background:${p.access==='rw' ? 'rgba(0,240,255,0.15)' : 'rgba(138,43,226,0.15)'};
                color:${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
                border:1px solid ${p.access==='rw' ? 'var(--accent-blue)' : 'var(--accent-purple)'};
-               font-size:0.75rem; margin-right:4px;">
-            ${escapeHtml(p.prefix)}&thinsp;:&thinsp;${escapeHtml(p.access)}</span>`
-    ).join('');
+               font-size:0.75rem;">${escapeHtml(p.prefix)} : ${escapeHtml(p.access)}</span>`
+    ).join(' ');
 }
 
 async function fetchKeys() {

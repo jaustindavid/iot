@@ -5,6 +5,25 @@ live in [catalog_todo.md](catalog_todo.md) instead.
 
 ## Active
 
+- **Differentiate KV hit vs miss in activity log status.** Today both
+  show `Success (200)` because the device-side `GET /kv/{key}` returns
+  HTTP 200 with a `{"status": "not_found"}` msgpack body for misses
+  (so devices can fall back to defaults without 404 handling). The
+  activity log middleware can't tell them apart from the wire status
+  alone. `/firmware/` already does this distinction nicely
+  (`Hit (200)` / `Not Modified (304)` / `Miss (404)`); KV could too.
+
+  Cleanest implementation: in `routes_device.py:read_kv`, set
+  `request.state.kv_hit = (val is not None)` before returning; the
+  activity-log middleware reads it and emits
+  `Success (200, hit)` / `Success (200, miss)` (or whatever shape).
+  ~5 LOC handler + ~3 LOC middleware. Lets operators grep activity
+  logs for "which devices are polling for keys nobody's set."
+
+  Surfaced 2026-05-04 from "I'd expect to see everyone polling
+  critterchron/&lt;device&gt;/ir but not everyone is" — answer turned
+  out to be "they probably are, but hits and misses look identical."
+
 - **Activity Logs UI control / pagination.** The fetch limit is now a
   hardcoded 2000 entries (bumped from 200 on 2026-05-04 — was "kinda
   shallow"). Server-side stream retention is `MAXLEN ~ 150000` so

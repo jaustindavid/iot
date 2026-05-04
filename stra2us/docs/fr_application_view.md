@@ -286,11 +286,16 @@ Mostly nothing! The app view consumes existing endpoints:
 - New thin route `GET /app/` — **new**. Serves the bare-URL landing
   form (static page).
 - New endpoint `POST /api/admin/provision_device` — **new** (landed
-  2026-05-04). One-shot create-client + grant device-on-app ACL,
-  superuser-gated. Body `{client_id, app}`. Returns `{client_id,
-  secret, acl}` — secret shown once. Refuses to overwrite existing
-  clients (409, with hint to use DELETE+re-provision or update_acl
-  instead). Reserved-name guard (`RESERVED_CLIENT_IDS`) applies.
+  2026-05-04). Idempotent one-shot device provisioning,
+  superuser-gated. Body `{client_id, app}`. Two response shapes
+  depending on whether the client already existed:
+  `{client_id, secret: "<hex>", acl, created: true}` for new clients
+  (secret shown once, save now); `{client_id, secret: null, acl,
+  created: false}` for existing clients (secret left untouched —
+  don't re-leak via provision; ACL replaced with the device-on-app
+  shape). Idempotent re-runs are safe; useful for retrofitting the
+  device-on-app ACL onto clients minted before this endpoint existed.
+  Reserved-name guard (`RESERVED_CLIENT_IDS`) applies.
   Replaces the manual sequence of POST /keys → PUT /keys/{id}/acl
   with the formulaic ACL `[<app>/<device>:rw, <app>/public:rw]` per
   the namespace convention. Surfaced in the admin UI's Key Management
