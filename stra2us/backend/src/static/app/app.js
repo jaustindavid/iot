@@ -295,7 +295,7 @@ async function fetchPerDeviceValue(appName, deviceId, varName) {
 function renderSettingCardSkeleton(name, v) {
     return `
         <div class="setting-card" data-var="${escapeHtml(name)}">
-            <div class="setting-label">${escapeHtml(v.label || name)}</div>
+            <div class="setting-label">${escapeHtml(v.label || name)}${_formatDefaultAnnotation(v)}</div>
             ${v.help ? `<div class="setting-help">${escapeHtml(v.help)}</div>` : ''}
             <div class="setting-value-row">
                 <span class="setting-value" id="val-${escapeHtml(name)}">Loading&hellip;</span>
@@ -304,6 +304,19 @@ function renderSettingCardSkeleton(name, v) {
             <button class="edit-btn" type="button" data-var="${escapeHtml(name)}">Edit</button>
         </div>
     `;
+}
+
+// Catalog-declared default surfaced inline with the var label, in
+// muted italic. Skipped when no `default:` is in the catalog or the
+// declared default is empty (no useful info to convey). Helps the
+// customer see the operator's intent ("your device's heartbeep is 45;
+// the catalog default is 30 — yes, you've overridden it") and
+// communicates the unset case without needing a separate placeholder
+// line in the value area.
+function _formatDefaultAnnotation(v) {
+    if (v.default === undefined || v.default === null || v.default === '') return '';
+    const s = (typeof v.default === 'string') ? v.default : String(v.default);
+    return ` <span class="setting-default-hint">[default: ${escapeHtml(s)}]</span>`;
 }
 
 function populateSettingValue(varName, res, varDesc, appName, deviceId) {
@@ -335,10 +348,12 @@ function populateSettingValue(varName, res, varDesc, appName, deviceId) {
         valEl.classList.add('unset');
         revealBtn.classList.add('hidden');
     } else if (res.state === 'unset') {
-        // Phase 2 just shows "(not set)" — Phase 5 will flesh this out
-        // to "your device is using the catalog default: <value>" once
-        // the catalog default is parsed out of the YAML on the client.
-        valEl.innerText = '(not set for this device)';
+        // Don't render the "(not set)" placeholder — the
+        // `[default: X]` annotation next to the label (added by
+        // _formatDefaultAnnotation) communicates the same thing
+        // more usefully ("here's what's effective right now"). Just
+        // collapse the value area silently.
+        valEl.innerText = '';
         valEl.classList.add('unset');
         revealBtn.classList.add('hidden');
     } else if (res.encrypted) {

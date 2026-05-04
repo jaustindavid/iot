@@ -243,6 +243,13 @@ body.app-page {
     font-weight: 600;
     margin-bottom: 4px;
 }
+.app-device .setting-card .setting-default-hint {
+    font-style: italic;
+    font-weight: 400;
+    color: var(--muted);
+    font-size: 0.85em;
+    margin-left: 6px;
+}
 .app-device .setting-card .setting-help {
     color: var(--muted);
     font-size: 0.85rem;
