@@ -98,6 +98,16 @@
 
 #define APP_VERSION __DATE__ " " __TIME__
 
+// Telemetry publish topic. Derived from STRA2US_APP at preprocessor
+// time so per-device headers don't have to duplicate it. The
+// `<app>/public/heartbeep` shape is the post-public-namespace-
+// migration topic that the customer-facing /app view tails — see
+// PUBLIC_NAMESPACE.md and stra2us/docs/fr_application_view.md.
+// Mirror of hal/particle/src/critterchron_particle.cpp.
+#ifndef STRA2US_TELEMETRY_TOPIC
+#define STRA2US_TELEMETRY_TOPIC STRA2US_APP "/public/heartbeep"
+#endif
+
 static inline uint32_t physics_tick_ms() { return critter_ir::RUNTIME_TICK_MS; }
 
 #ifndef RENDER_TICK_MS
@@ -924,7 +934,7 @@ static int telemetry_cycle() {
     }
 
     g_cfg.connect();
-    int pub_status = g_cfg.publish(STRA2US_APP, report);
+    int pub_status = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, report);
     Serial.printf("[tel] publish=%d %s\n", pub_status, report);
     if (have_err && pub_status == 200) {
         critterchron::g_errlog.mark_sent(pending_err.seq);
@@ -1140,7 +1150,7 @@ static void telemetry_task(void*) {
                      (unsigned)g_cfg.ir_detected_size(),
                      (unsigned long)(millis() / 1000));
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Serial.printf("[tel] ota_detected publish=%d %s\n", s, msg);
             g_cfg.ir_clear_detected();
@@ -1152,7 +1162,7 @@ static void telemetry_task(void*) {
                      g_ota_matrix_name, g_ota_matrix_sha,
                      (unsigned long)(millis() / 1000));
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Serial.printf("[tel] ota_matrix publish=%d %s\n", s, msg);
             g_ota_pub_matrix = false;
@@ -1164,7 +1174,7 @@ static void telemetry_task(void*) {
                      g_ota_loaded_name, g_ota_loaded_sha,
                      (unsigned long)(millis() / 1000));
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Serial.printf("[tel] ota_loaded publish=%d %s\n", s, msg);
             g_ota_pub_loaded = false;

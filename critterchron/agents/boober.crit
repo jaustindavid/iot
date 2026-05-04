@@ -65,6 +65,7 @@ boober:
   diagonal_cost: 1.414
   penalty lit cell:      30     # don't walk through the clock face
   penalty occupied cell: 50
+  drunkenness: 0.1
 
 --- behavior ---
 boober:

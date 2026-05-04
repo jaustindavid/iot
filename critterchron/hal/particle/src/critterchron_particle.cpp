@@ -37,6 +37,17 @@ SYSTEM_THREAD(ENABLED);
 
 #define APP_VERSION __DATE__ " " __TIME__
 
+// Telemetry publish topic. Derived from STRA2US_APP at preprocessor
+// time so per-device headers don't have to duplicate it. The
+// `<app>/public/heartbeep` shape is the post-public-namespace-
+// migration topic that the customer-facing /app view tails — see
+// PUBLIC_NAMESPACE.md and stra2us/docs/fr_application_view.md.
+// Devices that want a different topic can `#define STRA2US_TELEMETRY_TOPIC`
+// in their per-device header before this file is included.
+#ifndef STRA2US_TELEMETRY_TOPIC
+#define STRA2US_TELEMETRY_TOPIC STRA2US_APP "/public/heartbeep"
+#endif
+
 #if !defined(GRID_WIDTH) || !defined(GRID_HEIGHT)
 #error "creds.h must define GRID_WIDTH and GRID_HEIGHT"
 #endif
@@ -652,7 +663,7 @@ static int telemetry_cycle() {
     }
 
     g_cfg.connect();
-    int pub_status = g_cfg.publish(STRA2US_APP, report);
+    int pub_status = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, report);
     Log.info("telemetry: publish=%d %s", pub_status, report);
     if (have_err && pub_status == 200) {
         critterchron::g_errlog.mark_sent(pending_err.seq);
@@ -914,7 +925,7 @@ static void telemetry_worker() {
                      (unsigned)g_cfg.ir_detected_size(),
                      (unsigned long)System.uptime());
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Log.info("ota_detected publish=%d %s", s, msg);
             g_cfg.ir_clear_detected();
@@ -926,7 +937,7 @@ static void telemetry_worker() {
                      g_ota_matrix_name, g_ota_matrix_sha,
                      (unsigned long)System.uptime());
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Log.info("ota_matrix publish=%d %s", s, msg);
             g_ota_pub_matrix = false;
@@ -938,7 +949,7 @@ static void telemetry_worker() {
                      g_ota_loaded_name, g_ota_loaded_sha,
                      (unsigned long)System.uptime());
             g_cfg.connect();
-            int s = g_cfg.publish(STRA2US_APP, msg);
+            int s = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Log.info("ota_loaded publish=%d %s", s, msg);
             g_ota_pub_loaded = false;
@@ -989,7 +1000,7 @@ static void telemetry_worker() {
             }
             msg[sizeof(msg) - 1] = '\0';
             g_cfg.connect();
-            int bs = g_cfg.publish(STRA2US_APP, msg);
+            int bs = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
             g_cfg.close();
             Log.info("boot_light publish=%d %s", bs, msg);
             g_boot_light_sent = true;

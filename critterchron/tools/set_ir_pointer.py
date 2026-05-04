@@ -10,8 +10,10 @@ Auth comes from `stra2us_cli.client_from_env`, which reads either the
 `--secret` flags here; configure via that path instead.
 
 Key written: `critterchron/<device>/ir = <script-name>` (stored as a
-string). The device polls this on its heartbeat cycle; on change it
-fetches `critterchron/scripts/<script-name>` and hot-swaps the engine.
+string; per-device, unchanged by the public-namespace migration). The
+device polls this on its heartbeat cycle; on change it fetches
+`critterchron/public/scripts/<script-name>` (post-migration shared
+blob path; see PUBLIC_NAMESPACE.md) and hot-swaps the engine.
 A pointer flip is the smallest atomic operation the KV API exposes
 (one key → one put), so torn-state risk is concentrated entirely in
 the publish step (blob/sidecar pair) — covered by the `_script_exists`
@@ -91,8 +93,8 @@ def _script_exists(client, name: str) -> tuple[bool, str]:
     Legacy sidecars (pre-2026-04-22, bare 64-hex sha with no size suffix)
     are accepted — the size check is skipped when sidecar size is absent,
     but the content_sha cross-check still runs."""
-    sha_key = f"critterchron/scripts/{name}/sha"
-    blob_key = f"critterchron/scripts/{name}"
+    sha_key = f"critterchron/public/scripts/{name}/sha"
+    blob_key = f"critterchron/public/scripts/{name}"
 
     # 1. Fetch sidecar. Broad except: the new client surface doesn't
     # expose a single error type, and any failure (network, missing

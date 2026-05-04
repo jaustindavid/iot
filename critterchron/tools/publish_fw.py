@@ -7,12 +7,14 @@
 Auth comes from `stra2us_cli.client_from_env`, same resolution path the
 `stra2us` CLI uses interactively (env vars or a `~/.stra2us` profile).
 
-Key layout: `critterchron/fw/<target>` holds the binary blob;
-`critterchron/fw/<target>/sha` holds the sidecar string
-`<sha256>:<size>`. Phase 2 (device-side pull-OTA) will add pointer keys
-`critterchron/<device>/fw_target` (with `critterchron/fw_target` as the
-fleet-wide fallback) to direct each device at a target name; for
-Phase 1 this tool just stages the binary at the target slot.
+Key layout: `critterchron/public/fw/<target>` holds the binary blob;
+`critterchron/public/fw/<target>/sha` holds the sidecar string
+`<sha256>:<size>`. The `/public/` segment is part of the public-namespace
+migration (see PUBLIC_NAMESPACE.md and stra2us/docs/fr_application_view.md):
+shared blobs live under `<app>/public/` so customer-facing ACLs can grant
+read on `<app>/public:r` without leaking other devices' data. Pointer
+keys at `critterchron/<device>/fw_target` (with `critterchron/public/fw_target`
+as the fleet-wide fallback) direct each device at a target name.
 
 Idempotency: probes the remote sidecar and skips upload when it matches.
 Same logic as publish_ir.py.
@@ -70,7 +72,7 @@ def main() -> int:
     ap.add_argument("binary", help="Path to a built firmware .bin")
     ap.add_argument("--target", required=True,
                     help="Target platform identifier (e.g. esp32c3, esp32s3). "
-                         "Becomes the KV key suffix: critterchron/fw/<target>.")
+                         "Becomes the KV key suffix: critterchron/public/fw/<target>.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="Upload even if the remote sidecar already matches")
@@ -89,8 +91,8 @@ def main() -> int:
     size       = len(blob_bytes)
     sha        = hashlib.sha256(blob_bytes).hexdigest()
     sidecar    = f"{sha}:{size}"
-    key        = f"critterchron/fw/{args.target}"
-    sha_key    = f"critterchron/fw/{args.target}/sha"
+    key        = f"critterchron/public/fw/{args.target}"
+    sha_key    = f"critterchron/public/fw/{args.target}/sha"
 
     print(f"binary:  {args.binary}")
     print(f"target:  {args.target}")

@@ -17,10 +17,15 @@ Auth comes from `stra2us_cli.client_from_env`, which reads either the
 `stra2us` CLI uses interactively. No `--server` / `--client-id` /
 `--secret` flags here; configure via that path instead.
 
-Key layout: `critterchron/scripts/<name>` holds the blob bytes;
-`critterchron/scripts/<name>/sha` holds the sidecar string
-`<content_sha>:<size>`. A separate tool (`set_ir_pointer.py`) sets
-`critterchron/<device>/ir = <name>` to point a device at a script.
+Key layout: `critterchron/public/scripts/<name>` holds the blob bytes;
+`critterchron/public/scripts/<name>/sha` holds the sidecar string
+`<content_sha>:<size>`. The `/public/` segment is part of the public-
+namespace migration (see PUBLIC_NAMESPACE.md and
+stra2us/docs/fr_application_view.md): shared blobs live under
+`<app>/public/` so customer-facing ACLs can grant read on
+`<app>/public:r` without leaking other devices' data. A separate tool
+(`set_ir_pointer.py`) sets `critterchron/<device>/ir = <name>` to point
+a device at a script — that pointer stays per-device, unchanged.
 
 Idempotency: probes the remote sidecar and skips the upload when it
 matches what we'd write. Sidecar comparison is enough — it IS the
@@ -160,8 +165,8 @@ def main() -> int:
     args = ap.parse_args()
 
     name    = args.name or os.path.splitext(os.path.basename(args.script))[0]
-    key     = f"critterchron/scripts/{name}"
-    sha_key = f"critterchron/scripts/{name}/sha"
+    key     = f"critterchron/public/scripts/{name}"
+    sha_key = f"critterchron/public/scripts/{name}/sha"
 
     try:
         blob, src_sha, ir_ver = _build_blob(args.script, name,

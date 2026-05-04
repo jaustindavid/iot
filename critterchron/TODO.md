@@ -154,6 +154,38 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   whenever someone polishes the rescue-flow visuals; the requirement
   ("visual indicator that new creds got applied") is met today.
 
+- **Public-namespace migration: move cross-device-visible data under
+  `<app>/public/...`.** Companion to Stra2us's `fr_application_view.md`,
+  full scope captured in [`PUBLIC_NAMESPACE.md`](PUBLIC_NAMESPACE.md).
+
+  Code-side scope: 6 path-construction sites in Particle Stra2usClient,
+  9 in ESP32 Stra2usClient, 4 in publish_fw.py + publish_ir.py, 5-6
+  publish-topic call sites (heartbeat + OTA events on both shims),
+  plus catalog YAML additions (`telemetry_topic`,
+  `heartbeat_interval_seconds`, `label:` on customer-facing vars).
+  Cleanest implementation introduces a new `STRA2US_TELEMETRY_TOPIC`
+  constant alongside `STRA2US_APP` so the two concerns (catalog app
+  name vs publish topic) get distinct names.
+
+  Coordinated server-side data migration (Redis RENAME) and per-device
+  ACL update sequence in PUBLIC_NAMESPACE.md. Worst-case-during-roll
+  is "telemetry not captured for a few minutes per device" or "shared
+  fetch returns 404 briefly" — both transient, neither breaks anything
+  permanently.
+
+  Drift-test follow-ups (post-cutover): lint that no KV path lives
+  under `<app>/public/<known_device_id>/...` (footgun for operators);
+  lint that no firmware site publishes to bare `<app>` topic
+  (regression catcher).
+
+- ~~**Suppress `err=ota_fetch:kvs msgpack hdr=0x81` when it's just a
+  blank-key fetch.**~~ Closed 2026-05-03 — false alarm. The silencing
+  branch was already correct; ricky was on pre-silencing firmware and
+  surfacing stale-but-still-valid behavior. Reflash made it go away.
+  Note for future triage of this exact symptom: check `fw=` heartbeat
+  date against when the silencing branch landed in Stra2usClient.cpp
+  before assuming the fix is incomplete.
+
 - **Remove the diagnostic `wall=<unix>` field from the heartbeat.** Added
   2026-04-28 to compare `System.uptime()` against `Time.now()` while
   diagnosing rico's apparent uptime drift; the comparison confirmed
@@ -736,11 +768,34 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   value). Not worth chasing while devices are behaving; revisit if
   another device shows the symptom or during a quiet period.
 
-- **Procyon rescue WiFi + KV-driven cred install.** A fleet-uniform
-  recovery story for "device can't reach its target network" that
-  doesn't require Particle's mobile app, a Particle-account-claimed
-  device, a captive portal, or USB cable. Subsumes the original
-  ESP32-only hotspot-fallback design (kept below, marked superseded).
+- ~~**Procyon rescue WiFi + KV-driven cred install.**~~ Shipped end
+  to end 2026-05-03. Particle (Photon, Photon 2, Argon) and ESP32-C3
+  both run the full flow: hardcoded `procyon`/`horology` rescue cred
+  at boot, KV-driven target install with dedup hash, `net=<ssid>`
+  heartbeat field, blue-chaser visual on apply-while-on-procyon,
+  DCT-full nuke-and-restore, encrypted `wifi_password` over the wire
+  (msgpack ext 0x21 + HMAC-keystream cipher). Validated end-to-end on
+  rachel 2026-05-02. Operator-side workflow doc: `PROCYON.md`.
+
+  Sub-points discussed-and-deferred (NOT done, but consciously not
+  pursued): periodic `err=net:rescue` re-records while on procyon
+  (deferred — `net=<ssid>` field is loud enough on its own); formal
+  verification of Particle's `setCredentials` append-vs-prepend
+  ordering (implicitly resolved — DeviceOS RSSI-prefers procyon by
+  signal strength, which is the intended behavior).
+
+  Sub-point WONTFIX: target visibility scan
+  (`target=visible`/`missing` heartbeat field) — premise was wrong
+  ("on procyon" doesn't equal "in rescue mode" since households can
+  legitimately use the rescue parameters as a primary network name).
+
+  *Original entry kept for context:*
+
+  A fleet-uniform recovery story for "device can't reach its target
+  network" that doesn't require Particle's mobile app, a Particle-
+  account-claimed device, a captive portal, or USB cable. Subsumes
+  the original ESP32-only hotspot-fallback design (kept below, marked
+  superseded).
 
   *Operator workflow.*
   1. Set `<app>/<device>/wifi_ssid` and `<app>/<device>/wifi_password`

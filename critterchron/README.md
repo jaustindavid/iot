@@ -9,6 +9,7 @@ Runs in two places: the Python sim (gold master, pygame-visualized) and on hardw
 - `HAL_SPEC.md` — hardware abstraction layer, per-device headers, sink + clock interfaces
 - `OTA_IR.md` — IR script over-the-air pull from Stra2us KV
 - `PROCYON.md` — rescue-WiFi flow for installed devices that can't reach their target network
+- `PUBLIC_NAMESPACE.md` — migration plan for moving cross-device-visible data under `<app>/public/...` (companion to Stra2us's `fr_application_view.md`)
 - `STRA2US_CATALOG_FR.md` — KV-tunable knobs catalog format
 - `MARKERS_SPEC.md` — landmark/marker render semantics
 - `TODO.md` — live punch list (open issues + recently-landed entries)

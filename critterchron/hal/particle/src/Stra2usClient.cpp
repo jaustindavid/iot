@@ -533,7 +533,7 @@ void Stra2usClient::poll_key(size_t idx) {
     if (kv_fetch_(full, got_float, got_i, got_f)) {
         fetched = true;
     } else {
-        snprintf(full, sizeof(full), "%s/%s", app_, e.key);
+        snprintf(full, sizeof(full), "%s/public/%s", app_, e.key);
         if (kv_fetch_(full, got_float, got_i, got_f)) fetched = true;
     }
     if (!fetched) return;
@@ -567,7 +567,7 @@ void Stra2usClient::poll_all() {
     snprintf(full, sizeof(full), "%s/%s/brightness_schedule", app_, device_);
     bool fetched = kv_fetch_str_(full, buf, sizeof(buf), out_len);
     if (!fetched) {
-        snprintf(full, sizeof(full), "%s/brightness_schedule", app_);
+        snprintf(full, sizeof(full), "%s/public/brightness_schedule", app_);
         fetched = kv_fetch_str_(full, buf, sizeof(buf), out_len);
     }
     if (fetched) {
@@ -590,7 +590,7 @@ void Stra2usClient::poll_all() {
         snprintf(full, sizeof(full), "%s/%s/wifi_ssid", app_, device_);
         bool ssid_ok = kv_fetch_str_(full, ssid_buf, sizeof(ssid_buf), ssid_len);
         if (!ssid_ok) {
-            snprintf(full, sizeof(full), "%s/wifi_ssid", app_);
+            snprintf(full, sizeof(full), "%s/public/wifi_ssid", app_);
             ssid_ok = kv_fetch_str_(full, ssid_buf, sizeof(ssid_buf), ssid_len);
         }
         if (ssid_ok) {
@@ -606,7 +606,7 @@ void Stra2usClient::poll_all() {
         snprintf(full, sizeof(full), "%s/%s/wifi_password", app_, device_);
         bool pw_ok = kv_fetch_str_(full, pw_buf, sizeof(pw_buf), pw_len);
         if (!pw_ok) {
-            snprintf(full, sizeof(full), "%s/wifi_password", app_);
+            snprintf(full, sizeof(full), "%s/public/wifi_password", app_);
             pw_ok = kv_fetch_str_(full, pw_buf, sizeof(pw_buf), pw_len);
         }
         if (pw_ok) {
@@ -909,7 +909,7 @@ void Stra2usClient::ir_poll() {
     // case (sidecar says new, blob is still old) by recomputing content_sha
     // on the blob we fetched and checking it against the sidecar.
     char sha_key[96 + IR_SCRIPT_NAME_MAX + 8];
-    snprintf(sha_key, sizeof(sha_key), "%s/scripts/%s/sha", app_, new_ptr);
+    snprintf(sha_key, sizeof(sha_key), "%s/public/scripts/%s/sha", app_, new_ptr);
     // Sidecar format:
     //   <64-char hex content_sha>                         (legacy, pre-2026-04-22)
     //   <64-char hex content_sha>:<decimal size_bytes>    (current)
@@ -1029,7 +1029,7 @@ void Stra2usClient::ir_poll() {
     }
 
     char script_key[96 + IR_SCRIPT_NAME_MAX];
-    snprintf(script_key, sizeof(script_key), "%s/scripts/%s", app_, new_ptr);
+    snprintf(script_key, sizeof(script_key), "%s/public/scripts/%s", app_, new_ptr);
     Log.info("ir_poll: fetching blob %s", script_key);
     size_t blob_len = 0;
     if (!kv_fetch_str_(script_key, ir_ota_buf_, sizeof(ir_ota_buf_), blob_len)) {
