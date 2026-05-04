@@ -276,7 +276,7 @@ async def get_stats(admin_ctx: dict = Depends(get_admin_context)):
         "kvs": kvs
     }
 
-@router.get("/peek/q/{topic}")
+@router.get("/peek/q/{topic:path}")
 async def peek_queue(topic: str, _: dict = Depends(require_admin_queue("read"))):
     redis = get_redis_client()
     # Peek at oldest message using xrange
@@ -441,7 +441,7 @@ async def delete_kv(key: str, _: dict = Depends(require_admin_kv("write"))):
     await redis.delete(f"kv:{key}", f"kv:{key}:enc")
     return {"status": "ok"}
 
-@router.delete("/q/{topic}")
+@router.delete("/q/{topic:path}")
 async def delete_queue(topic: str, _: dict = Depends(require_admin_queue("write"))):
     redis = get_redis_client()
     await redis.delete(f"q:{topic}")

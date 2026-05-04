@@ -58,6 +58,25 @@ class Var(BaseModel):
     # and name-pattern lints. See docs/fr_encrypted_values.md
     # ("Catalog hint" section) for the full rationale.
     encrypted: bool = False
+    # Customer-facing title for the `/app/<app>/<device>` UI (see
+    # docs/fr_application_view.md). **Presence is the visibility gate**:
+    # a var with `label` shows up in the customer's settings list, a
+    # var without one is hidden. Distinct from `help` — `label` is a
+    # few words for the title, `help` is a sentence for the description.
+    # Operator-jargon vars (`debug_flag_experimental`, perf knobs) just
+    # don't get a label and stay admin-only. Stra2us itself does not
+    # act on this field; it's consumed by the app-view JS.
+    label: str | None = None
+
+    @field_validator("label")
+    @classmethod
+    def _label_nonempty(cls, v: str | None) -> str | None:
+        # Empty-string labels would render as a blank card title in the
+        # customer UI — almost certainly a mistake. Reject so operators
+        # either commit to a real title or omit the field entirely.
+        if v is not None and not v.strip():
+            raise ValueError("`label` must be non-empty if provided (omit it to hide the var from /app)")
+        return v
 
     @field_validator("scope")
     @classmethod
@@ -142,6 +161,24 @@ class Catalog(BaseModel):
     vars: dict[str, Var]
     version: int = 1
 
+    # App-level fields driving the `/app/<app>/<device>` customer view
+    # (see docs/fr_application_view.md). Both optional — apps that
+    # don't customize get sensible defaults from the app view's JS.
+    #
+    # `telemetry_topic`: which queue to tail for status / activity.
+    # Supports `{app}` and `{device}` placeholders. Default applied at
+    # the consumer side: `{app}/public/heartbeep`.
+    #
+    # `heartbeat_interval_seconds`: app's expected telemetry cadence.
+    # Drives the customer view's status-badge thresholds (Online if
+    # `< 2× interval` since last message, Recently active if
+    # `< 20× interval`, otherwise Offline). Default applied at the
+    # consumer side: 60s. Set explicitly to match your firmware's
+    # actual cadence so a 5-min-cadence device isn't called Offline at
+    # 4 minutes since last message.
+    telemetry_topic: str | None = None
+    heartbeat_interval_seconds: int | None = None
+
     @field_validator("app")
     @classmethod
     def _app_shape(cls, v: str) -> str:
@@ -161,6 +198,40 @@ class Catalog(BaseModel):
                 raise ValueError(
                     f"variable name {name!r} must match {VAR_NAME_RE.pattern}"
                 )
+        return v
+
+    @field_validator("telemetry_topic")
+    @classmethod
+    def _telemetry_topic_shape(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("`telemetry_topic` must be non-empty if provided")
+        # No `q:` prefix allowed — that's a stra2us-internal Redis-key
+        # detail. The catalog declares the topic name as devices use it
+        # (`<app>/public/heartbeep`), not as Redis stores it.
+        if v.startswith("q:") or v.startswith("kv:"):
+            raise ValueError(
+                f"`telemetry_topic` is a topic name, not a Redis key — "
+                f"drop the {v.split(':', 1)[0]!r} prefix"
+            )
+        # Leading/trailing slashes almost always indicate a paste mistake.
+        if v.startswith("/") or v.endswith("/"):
+            raise ValueError(
+                "`telemetry_topic` should not start or end with `/`"
+            )
+        return v
+
+    @field_validator("heartbeat_interval_seconds")
+    @classmethod
+    def _heartbeat_positive(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v <= 0:
+            raise ValueError(
+                "`heartbeat_interval_seconds` must be positive (got "
+                f"{v!r})"
+            )
         return v
 
 

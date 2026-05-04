@@ -55,7 +55,7 @@ def signed_encrypted_response(context: dict, request: Request,
     return Response(content=body, status_code=200,
                     media_type=MSGPACK_MT, headers=headers)
 
-@router.post("/q/{topic}")
+@router.post("/q/{topic:path}")
 async def publish_message(
     topic: str,
     request: Request,
@@ -98,7 +98,7 @@ async def publish_message(
 
     return signed_msgpack(context, request, {"status": "ok"})
 
-@router.get("/q/{topic}")
+@router.get("/q/{topic:path}")
 async def consume_message(
     topic: str,
     request: Request,

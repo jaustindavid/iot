@@ -236,6 +236,153 @@ def test_vars_cannot_be_empty(tmp_path):
         load_catalog(p)
 
 
+# ----- app-view fields (telemetry_topic, heartbeat_interval_seconds, label) -----
+
+def test_telemetry_topic_accepted(tmp_path):
+    """The customer-facing app view tails this topic for status +
+    activity. Per docs/fr_application_view.md."""
+    p = _write(tmp_path, """
+        app: testapp
+        telemetry_topic: "{app}/public/heartbeep"
+        vars:
+          foo:
+            type: int
+            scope: [app]
+            default: 1
+    """)
+    cat = load_catalog(p)
+    assert cat.telemetry_topic == "{app}/public/heartbeep"
+
+
+def test_telemetry_topic_rejects_redis_key_prefix(tmp_path):
+    """`q:foo` is the Redis key, not the topic name. Catch the
+    paste-mistake at validate time."""
+    p = _write(tmp_path, """
+        app: testapp
+        telemetry_topic: "q:testapp/public/heartbeep"
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="topic name, not a Redis key"):
+        load_catalog(p)
+
+
+def test_telemetry_topic_rejects_leading_slash(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        telemetry_topic: "/testapp/public/heartbeep"
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="should not start or end with"):
+        load_catalog(p)
+
+
+def test_telemetry_topic_rejects_empty(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        telemetry_topic: "   "
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="non-empty"):
+        load_catalog(p)
+
+
+def test_heartbeat_interval_accepted(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        heartbeat_interval_seconds: 300
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    cat = load_catalog(p)
+    assert cat.heartbeat_interval_seconds == 300
+
+
+def test_heartbeat_interval_rejects_zero(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        heartbeat_interval_seconds: 0
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="must be positive"):
+        load_catalog(p)
+
+
+def test_heartbeat_interval_rejects_negative(tmp_path):
+    p = _write(tmp_path, """
+        app: testapp
+        heartbeat_interval_seconds: -10
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="must be positive"):
+        load_catalog(p)
+
+
+def test_label_accepted_on_var(tmp_path):
+    """Customer-facing title; presence is the visibility gate for
+    the /app/<app>/<device> view."""
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          wifi_password:
+            type: string
+            scope: [app, device]
+            label: WiFi password
+            help: WPA2 PSK
+    """)
+    cat = load_catalog(p)
+    assert cat.vars["wifi_password"].label == "WiFi password"
+
+
+def test_label_rejects_blank(tmp_path):
+    """Empty-string labels would render as blank card titles —
+    almost certainly a mistake. Operator should either commit to
+    a real title or omit the field to hide the var from /app."""
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          foo:
+            type: int
+            scope: [app]
+            default: 1
+            label: "   "
+    """)
+    with pytest.raises(CatalogError, match="non-empty"):
+        load_catalog(p)
+
+
+def test_label_absent_var_loads_normally(tmp_path):
+    """No-label is the default; var is hidden from /app but still
+    works in /admin and on devices."""
+    p = _write(tmp_path, """
+        app: testapp
+        vars:
+          internal_thing:
+            type: int
+            scope: [app]
+            default: 1
+    """)
+    cat = load_catalog(p)
+    assert cat.vars["internal_thing"].label is None
+
+
+def test_top_level_unknown_field_still_rejected(tmp_path):
+    """The new fields are additive — typos at the top level still get
+    caught (Catalog is `extra=forbid`)."""
+    p = _write(tmp_path, """
+        app: testapp
+        telemetry_topick: foo
+        vars:
+          foo: {type: int, scope: [app], default: 1}
+    """)
+    with pytest.raises(CatalogError, match="telemetry_topick"):
+        load_catalog(p)
+
+
 # ----- coerce -----
 
 def _var(**kwargs) -> Var:
