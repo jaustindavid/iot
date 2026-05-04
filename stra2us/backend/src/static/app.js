@@ -1318,9 +1318,24 @@ async function fetchLogs() {
             <td style="color:var(--text-muted);">${formatTime(l.timestamp)}</td>
             <td style="color:var(--accent-blue);">${escapeHtml(l.client_id)}</td>
             <td>${escapeHtml(l.action)}</td>
-            <td style="color:${l.status.startsWith('Success') ? 'var(--accent-success)' : 'var(--accent-danger)'}">${escapeHtml(l.status)}</td>
+            <td style="color:${_logStatusColor(l.status)}">${escapeHtml(l.status)}</td>
         </tr>
     `).join('');
+}
+
+// Color logic for activity log status text. Was a `startsWith('Success')`
+// check; broke when the middleware grew Hit/Miss/Not Modified entries
+// for KV + firmware reads — those start with neither "Success" nor
+// "Error" but are still 200/304s. Now driven by the embedded HTTP
+// status code so any new prefix the middleware grows (e.g. "Cached"
+// for some future caching layer) gets coloured correctly without
+// touching this list.
+function _logStatusColor(s) {
+    const m = (s || '').match(/\((\d{3})\)/);
+    if (!m) return 'var(--text-muted)';      // shape we don't recognize
+    const code = parseInt(m[1], 10);
+    if (code >= 200 && code < 400) return 'var(--accent-success)';   // 2xx + 3xx
+    return 'var(--accent-danger)';                                    // 4xx + 5xx
 }
 
 // Polling for real-time updates (every 5 seconds)
