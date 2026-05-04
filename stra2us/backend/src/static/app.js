@@ -306,9 +306,22 @@ document.getElementById('provisionDeviceForm').addEventListener('submit', async 
     const aclLines = res.acl.permissions
         .map(p => `&nbsp;&nbsp;${escapeHtml(p.prefix)} <code>${escapeHtml(p.access)}</code>`)
         .join('<br>');
-    display.innerHTML = `<strong>Provisioned!</strong> <code>${escapeHtml(res.client_id)}</code> for app <code>${escapeHtml(app)}</code>.<br><br>
-                         <strong>Secret (hex):</strong> <code>${escapeHtml(res.secret)}</code><br>
-                         <small style="color:var(--accent-danger);">Save this now — it won't be shown again.</small><br><br>
+    // Two response shapes — `created: true` (new client, secret to display)
+    // and `created: false` (existing client, secret intentionally null
+    // since we don't re-leak existing secrets via provision). The UI
+    // copy distinguishes the two cases so the operator knows whether
+    // they need to copy the secret right now.
+    let header, secretBlock;
+    if (res.created) {
+        header = `<strong>Provisioned!</strong> <code>${escapeHtml(res.client_id)}</code> for app <code>${escapeHtml(app)}</code>.`;
+        secretBlock = `<strong>Secret (hex):</strong> <code>${escapeHtml(res.secret)}</code><br>
+                       <small style="color:var(--accent-danger);">Save this now — it won't be shown again.</small>`;
+    } else {
+        header = `<strong>ACL updated</strong> for existing client <code>${escapeHtml(res.client_id)}</code> on app <code>${escapeHtml(app)}</code>.`;
+        secretBlock = `<small style="color:var(--text-muted);">Existing secret left untouched — the device's authentication is unchanged.</small>`;
+    }
+    display.innerHTML = `${header}<br><br>
+                         ${secretBlock}<br><br>
                          <strong>ACL:</strong><br>${aclLines}`;
     display.classList.remove('hidden');
     document.getElementById('provisionClientId').value = '';
@@ -1231,6 +1244,12 @@ async function unsetScope(scope) {
         }
         document.getElementById(scope === 'app' ? 'currentApp' : 'currentDevice').innerHTML =
             _renderCurrent('unset', null);
+        // Reset the input + mask + Encrypted checkbox to "fresh / empty"
+        // state. Without this the input still holds the just-deleted
+        // value, and a subsequent Save silently re-creates the record
+        // (the operator's Unset clicked-and-confirmed appears to "undo
+        // itself" on Save) — confusing enough to merit being explicit.
+        _populateScopeInput(scope, '', false);
     } catch (e) {
         errEl.innerText = e.message;
         errEl.classList.remove('hidden');

@@ -113,8 +113,8 @@ async def create_client(client: ClientCreate, _: dict = Depends(require_admin_su
 
 @router.post("/provision_device")
 async def provision_device(payload: DeviceProvision, _: dict = Depends(require_admin_superuser)):
-    """One-shot device provisioning: mint an HMAC client and grant it
-    the customer-shaped ACL for `<app>` in a single atomic call.
+    """Idempotent one-shot device provisioning: ensure an HMAC client
+    exists with the customer-shaped ACL for `<app>`.
 
     Resulting ACL (per fr_application_view.md namespace convention):
       [
@@ -122,10 +122,23 @@ async def provision_device(payload: DeviceProvision, _: dict = Depends(require_a
         {"prefix": "<app>/public",      "access": "rw"},  # shared topic
       ]
 
-    Refuses to overwrite an existing client (caller must `revoke` first
-    if they want to recycle the id) — mass-provisioning scripts that
-    re-run shouldn't silently regenerate secrets and break already-
-    deployed devices.
+    Two behaviors depending on whether the client already exists:
+
+    - **New client.** Mint a secret, set the ACL, return both. Response
+      `created: true`, `secret: "<hex>"`. This is the standard "register
+      a new device" flow — operator must save the secret immediately.
+    - **Existing client.** *Leave the secret alone* (don't regenerate —
+      that'd break already-deployed devices using the existing secret),
+      replace the ACL with the device-on-app shape. Response
+      `created: false`, `secret: null`. Useful for retrofitting the
+      device-on-app ACL onto clients minted before this endpoint
+      existed, and for re-running provisioning scripts safely.
+
+    *ACL replacement is wholesale.* If the existing client had a
+    custom ACL (e.g. multi-app perms), that's clobbered. The common
+    case is a one-app device, so this is right; for the rare
+    multi-app device, use the lower-level `PUT /keys/{id}/acl`
+    instead.
 
     Reserved-name guard (`RESERVED_CLIENT_IDS`) applies; `app` is
     similarly validated so an empty/whitespace app doesn't produce a
@@ -145,31 +158,33 @@ async def provision_device(payload: DeviceProvision, _: dict = Depends(require_a
         )
 
     redis = get_redis_client()
-    existing = await redis.get(f"client:{payload.client_id}:secret")
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Client {payload.client_id!r} already exists. "
-                f"Use DELETE /keys/{payload.client_id} first if you want "
-                f"to recycle the id, or PUT /keys/{payload.client_id}/acl "
-                f"to update its ACL without changing the secret."
-            ),
-        )
+    existing_secret = await redis.get(f"client:{payload.client_id}:secret")
+    created = existing_secret is None
 
-    secret = generate_secret()
     acl = {
         "permissions": [
             {"prefix": f"{payload.app}/{payload.client_id}", "access": "rw"},
             {"prefix": f"{payload.app}/public",              "access": "rw"},
         ]
     }
-    await redis.set(f"client:{payload.client_id}:secret", secret)
+
+    if created:
+        secret = generate_secret()
+        await redis.set(f"client:{payload.client_id}:secret", secret)
+    else:
+        # Don't return the existing secret — we already promised "shown
+        # once at creation"; re-leaking via provision would undermine
+        # that. If the operator's lost the secret, they need to
+        # revoke + re-create.
+        secret = None
+
     await redis.set(f"client:{payload.client_id}:acl", json.dumps(acl))
+
     return {
         "client_id": payload.client_id,
-        "secret": secret,
+        "secret": secret,        # hex string if created, null if existing
         "acl": acl,
+        "created": created,
     }
 
 

@@ -73,14 +73,15 @@ def _unique_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_provision_happy_path():
-    """Provision a fresh device-on-app, verify response shape + ACL."""
+def test_provision_happy_path_creates_new_client():
+    """Fresh provisioning: returns the new secret + ACL + `created: true`."""
     cid = _unique_id()
     try:
         r = _provision({"client_id": cid, "app": "critterchron"})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["client_id"] == cid
+        assert body["created"] is True
         # 64-char hex secret per `generate_secret`
         assert len(body["secret"]) == 64
         assert all(c in "0123456789abcdef" for c in body["secret"])
@@ -92,30 +93,61 @@ def test_provision_happy_path():
         _revoke(cid)
 
 
-def test_provision_refuses_to_overwrite_existing_client():
-    """Re-running provision against an existing id must fail loudly,
-    not silently regenerate the secret (which would orphan a deployed
-    device's authentication)."""
+def test_provision_existing_client_updates_acl_keeps_secret():
+    """Re-provisioning an existing client must NOT regenerate the secret
+    (would break already-deployed devices using the old secret) but
+    SHOULD apply the device-on-app ACL idempotently. Response shape:
+    `created: false`, `secret: null`."""
+    cid = _unique_id()
+    try:
+        # First: create with a custom-shaped ACL via the lower-level
+        # endpoints. Simulates the "client minted before provision_device
+        # existed" case.
+        r1 = requests.post(
+            f"{_host()}/api/admin/keys",
+            auth=_admin_auth(),
+            json={"client_id": cid},
+            timeout=5,
+        )
+        assert r1.status_code == 200
+        # Set an obviously-wrong-for-app ACL so we can prove it gets
+        # replaced.
+        requests.put(
+            f"{_host()}/api/admin/keys/{cid}/acl",
+            auth=_admin_auth(),
+            json={"permissions": [{"prefix": "some/random/path", "access": "r"}]},
+            timeout=5,
+        ).raise_for_status()
+
+        # Now run provision_device against the existing client.
+        r2 = _provision({"client_id": cid, "app": "critterchron"})
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+        assert body["client_id"] == cid
+        assert body["created"] is False
+        assert body["secret"] is None, "must not re-leak the existing secret"
+        # ACL should now be the device-on-app shape, not the old custom one.
+        assert body["acl"]["permissions"] == [
+            {"prefix": f"critterchron/{cid}", "access": "rw"},
+            {"prefix": "critterchron/public", "access": "rw"},
+        ]
+    finally:
+        _revoke(cid)
+
+
+def test_provision_existing_client_is_idempotent():
+    """Running provision twice with the same args is safe — same ACL,
+    secret unchanged, both calls return `created: false` after the
+    first."""
     cid = _unique_id()
     try:
         r1 = _provision({"client_id": cid, "app": "critterchron"})
-        assert r1.status_code == 200
-        original_secret = r1.json()["secret"]
-
+        assert r1.json()["created"] is True
         r2 = _provision({"client_id": cid, "app": "critterchron"})
-        assert r2.status_code == 409
-        assert "already exists" in r2.json()["detail"]
-
-        # Confirm the original secret is intact (peek via the existing
-        # admin client list; provision must not have touched it).
-        keys = requests.get(
-            f"{_host()}/api/admin/keys", auth=_admin_auth(), timeout=5,
-        ).json()
-        match = next((c for c in keys if c["client_id"] == cid), None)
-        assert match is not None
-        # The /keys endpoint doesn't return secrets — but the fact that
-        # the entry still exists with its ACL is enough proof the second
-        # call didn't clobber.
+        assert r2.json()["created"] is False
+        assert r2.json()["secret"] is None
+        r3 = _provision({"client_id": cid, "app": "critterchron"})
+        assert r3.json()["created"] is False
     finally:
         _revoke(cid)
 
