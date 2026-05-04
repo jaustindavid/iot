@@ -1101,6 +1101,29 @@ they're bugs:
   "Add a Customer" UI flow is contemplated but not yet designed —
   the right CUJ is open and not blocking the rest of the FR.
 
+  **Easy footgun while it's manual:** the customer-shape ACL has
+  *three* perms, not two. Forgetting the third (`_catalog/<app>:r`)
+  produces a confusing failure: the device page loads, then 403s on
+  the catalog YAML fetch and shows "Couldn't load your device's
+  settings: catalog &lt;app&gt; returned 403". The `provision_device`
+  endpoint sets the device-shape ACL (two perms, no catalog grant)
+  for HMAC clients, which has primed people's intuition for
+  "two-perm device-on-app." The customer-shape is different. The
+  three perms required:
+
+  ```json
+  {"permissions": [
+    {"prefix": "<app>/<device>",   "access": "rw"},
+    {"prefix": "<app>/public",     "access": "r"},
+    {"prefix": "_catalog/<app>",   "access": "r"}
+  ]}
+  ```
+
+  When the user-provisioning UI lands, it should set this shape
+  automatically, mirroring how `provision_device` does for HMAC
+  clients. Until then, document it loudly anywhere a customer's
+  ACL gets manually edited.
+
 - **Post-migration cleanup pass.** After relocating
   `<app>/scripts/...`, `<app>/fw/...`, and the app-scope KVs into
   `<app>/public/...`, expect a sweep for any "public-shaped" data

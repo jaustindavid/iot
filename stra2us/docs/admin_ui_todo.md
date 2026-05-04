@@ -5,24 +5,17 @@ live in [catalog_todo.md](catalog_todo.md) instead.
 
 ## Active
 
-- **Differentiate KV hit vs miss in activity log status.** Today both
-  show `Success (200)` because the device-side `GET /kv/{key}` returns
-  HTTP 200 with a `{"status": "not_found"}` msgpack body for misses
-  (so devices can fall back to defaults without 404 handling). The
-  activity log middleware can't tell them apart from the wire status
-  alone. `/firmware/` already does this distinction nicely
-  (`Hit (200)` / `Not Modified (304)` / `Miss (404)`); KV could too.
-
-  Cleanest implementation: in `routes_device.py:read_kv`, set
-  `request.state.kv_hit = (val is not None)` before returning; the
-  activity-log middleware reads it and emits
-  `Success (200, hit)` / `Success (200, miss)` (or whatever shape).
-  ~5 LOC handler + ~3 LOC middleware. Lets operators grep activity
-  logs for "which devices are polling for keys nobody's set."
-
-  Surfaced 2026-05-04 from "I'd expect to see everyone polling
-  critterchron/&lt;device&gt;/ir but not everyone is" — answer turned
-  out to be "they probably are, but hits and misses look identical."
+- ~~**Differentiate KV hit vs miss in activity log status.**~~ Landed
+  2026-05-04. `routes_device.py:read_kv` stashes
+  `request.state.kv_hit` (true if the value existed, false if the
+  handler returned the `not_found` body). The activity-log
+  middleware in `main.py` reads it and emits `Hit (200)` /
+  `Miss (200)` for KV GETs — falls back to `Success (200)` for KV
+  writes and other endpoints. Surfaced from "I'd expect to see
+  everyone polling critterchron/&lt;device&gt;/ir but not everyone
+  is" — answer turned out to be "they probably are, but hits and
+  misses looked identical." Now `grep 'Miss (200)' activity-log`
+  finds devices polling for unset keys.
 
 - **Activity Logs UI control / pagination.** The fetch limit is now a
   hardcoded 2000 entries (bumped from 200 on 2026-05-04 — was "kinda

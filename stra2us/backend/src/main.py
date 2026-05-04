@@ -96,6 +96,19 @@ async def activity_log_middleware(request: Request, call_next):
                     "Not Modified (304)" if status == 304 else
                     f"Miss ({status})"
                 )
+            elif (
+                request.method == "GET"
+                and path.startswith("/kv/")
+                and 200 <= status < 300
+                and hasattr(request.state, "kv_hit")
+            ):
+                # KV reads return 200 even on miss (handler ships
+                # `{"status":"not_found"}` body — devices fall back to
+                # defaults without 404 handling). The handler stashes
+                # `kv_hit` on request.state to let us emit the right
+                # log status here. See routes_device.py:read_kv.
+                client_id = request.headers.get("X-Client-ID", "unknown")
+                log_status = "Hit (200)" if request.state.kv_hit else "Miss (200)"
             else:
                 client_id = request.headers.get("X-Client-ID", "unknown")
                 log_status = f"Success ({status})" if 200 <= status < 300 else f"Error ({status})"

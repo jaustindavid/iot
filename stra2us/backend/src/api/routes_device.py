@@ -212,6 +212,14 @@ async def read_kv(
     redis = get_redis_client()
     val = await redis.get(f"kv:{key}")
 
+    # Stash hit-vs-miss for the activity-log middleware. Wire response
+    # is 200 in either case (devices treat `{"status":"not_found"}` as
+    # "fall back to default" without 404 handling), so the middleware
+    # can't tell them apart from the status alone — this hint is what
+    # makes the activity-log "Miss (200)" vs "Hit (200)" entries
+    # distinguishable. See docs/admin_ui_todo.md.
+    request.state.kv_hit = val is not None
+
     if val is None:
         return signed_msgpack(context, request, {"status": "not_found"})
 
