@@ -285,6 +285,25 @@ Mostly nothing! The app view consumes existing endpoints:
   (per the flow above) then serves the static `app/index.html`.
 - New thin route `GET /app/` — **new**. Serves the bare-URL landing
   form (static page).
+- New endpoint `POST /api/admin/provision_device` — **new** (landed
+  2026-05-04). One-shot create-client + grant device-on-app ACL,
+  superuser-gated. Body `{client_id, app}`. Returns `{client_id,
+  secret, acl}` — secret shown once. Refuses to overwrite existing
+  clients (409, with hint to use DELETE+re-provision or update_acl
+  instead). Reserved-name guard (`RESERVED_CLIENT_IDS`) applies.
+  Replaces the manual sequence of POST /keys → PUT /keys/{id}/acl
+  with the formulaic ACL `[<app>/<device>:rw, <app>/public:rw]` per
+  the namespace convention. Surfaced in the admin UI's Key Management
+  tab as the primary "Provision Device for App" form; the legacy bare
+  "Register New Client" form stays for non-app cases (admin-management
+  clients, multi-app devices, custom ACL shapes). 8 live tests in
+  [`tools/tests/test_provision_device_live.py`](../tools/tests/test_provision_device_live.py)
+  cover success, refuse-overwrite, reserved-name, empty-field,
+  slash-in-id, and superuser-required. **CLI command deferred** — the
+  current `stra2us` CLI is HMAC-only and has no admin-auth path; the
+  admin UI is sufficient at current provisioning cadence, and bulk
+  cases can use a 15-line `requests`-based script if needed.
+
 - New endpoint `GET /api/app/lookup_device?name=<device>` — **new**.
   Scans `kv:*/<device>/*` and returns `{app: "critterchron"}` (or
   404). No auth required — pure name → app lookup, no data exposed

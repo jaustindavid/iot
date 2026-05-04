@@ -102,13 +102,35 @@
                 </header>
                 
                 <div class="card glass-panel form-card">
-                    <h3>Register New Client</h3>
-                    <p class="form-hint">New clients start with no permissions. Set up access rules after registration.</p>
+                    <h3>Provision Device for App</h3>
+                    <p class="form-hint">
+                        One-shot: mints a client and grants the
+                        device-on-app ACL
+                        (<code>&lt;app&gt;/&lt;device&gt;:rw</code> +
+                        <code>&lt;app&gt;/public:rw</code>).
+                        Per the namespace convention in
+                        <code>fr_application_view.md</code>.
+                    </p>
+                    <form id="provisionDeviceForm">
+                        <div class="input-group">
+                            <input type="text" id="provisionAppName" placeholder="App name (e.g. critterchron)" required>
+                        </div>
+                        <div class="input-group">
+                            <input type="text" id="provisionClientId" placeholder="Device / client ID (e.g. ricky_raccoon)" required>
+                        </div>
+                        <button type="submit" class="primary-btn pulse-glow">Provision</button>
+                    </form>
+                    <div id="provisionResultDisplay" class="hidden alert-success"></div>
+                </div>
+
+                <div class="card glass-panel form-card">
+                    <h3>Register New Client (advanced)</h3>
+                    <p class="form-hint">For non-app clients (admin-management, multi-app devices, custom ACL shapes). Starts with no permissions; set up rules manually after registration.</p>
                     <form id="keyForm">
                         <div class="input-group">
-                            <input type="text" id="newClientId" placeholder="Device or Client ID (e.g. bb32)" required>
+                            <input type="text" id="newClientId" placeholder="Client ID" required>
                         </div>
-                        <button type="submit" class="primary-btn pulse-glow">Generate Secret Key</button>
+                        <button type="submit" class="primary-btn">Generate Secret Key</button>
                     </form>
                     <!-- Shows immediately after generation -->
                     <div id="newSecretDisplay" class="hidden alert-success"></div>
@@ -393,6 +415,6 @@
     <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"
             integrity="sha256-Rdw90D3AegZwWiwpibjH9wkBPwS9U4bjJ51ORH8H69c="
             crossorigin="anonymous"></script>
-    <script src="app.js?v=12"></script>
+    <script src="app.js?v=14"></script>
 </body>
 </html>

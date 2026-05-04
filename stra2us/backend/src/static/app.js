@@ -281,6 +281,40 @@ document.getElementById('keyForm').addEventListener('submit', async (e) => {
     fetchKeys();
 });
 
+// Device provisioning: one-shot create-client + grant device-on-app ACL.
+// Calls /api/admin/provision_device. Display mirrors the bare /keys
+// success view above — same "key won't be shown again" warning, same
+// table refresh — but also surfaces the auto-applied ACL so the
+// operator can confirm it matches expectations before using the
+// secret.
+document.getElementById('provisionDeviceForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const app = document.getElementById('provisionAppName').value.trim();
+    const clientId = document.getElementById('provisionClientId').value.trim();
+    const display = document.getElementById('provisionResultDisplay');
+
+    const { ok, data: res } = await fetchAPI('/provision_device', 'POST', {
+        client_id: clientId,
+        app,
+    });
+
+    if (!ok) {
+        display.innerHTML = `<strong style="color:var(--accent-danger);">Error:</strong> ${escapeHtml(res.detail || 'Unknown error')}`;
+        display.classList.remove('hidden');
+        return;
+    }
+    const aclLines = res.acl.permissions
+        .map(p => `&nbsp;&nbsp;${escapeHtml(p.prefix)} <code>${escapeHtml(p.access)}</code>`)
+        .join('<br>');
+    display.innerHTML = `<strong>Provisioned!</strong> <code>${escapeHtml(res.client_id)}</code> for app <code>${escapeHtml(app)}</code>.<br><br>
+                         <strong>Secret (hex):</strong> <code>${escapeHtml(res.secret)}</code><br>
+                         <small style="color:var(--accent-danger);">Save this now — it won't be shown again.</small><br><br>
+                         <strong>ACL:</strong><br>${aclLines}`;
+    display.classList.remove('hidden');
+    document.getElementById('provisionClientId').value = '';
+    fetchKeys();
+});
+
 async function revokeClient(id) {
     if(!confirm(`Revoke client ${id}? This action cannot be undone.`)) return;
     await fetchAPI(`/keys/${id}`, 'DELETE');
@@ -1241,7 +1275,13 @@ function renderLogChips() {
 
 async function fetchLogs() {
     await loadLogClients();
-    let endpoint = '/logs?limit=200';
+    // Limit picked to surface ~24h of typical critterchron-fleet traffic
+    // in one view (~13 devices × heartbeep every 30s ≈ 1500/hr from
+    // devices alone, plus admin/UI calls). Stream itself is bounded by
+    // `MAXLEN ~ 150000` in main.py — caller can request more by hand.
+    // If we ever want a UI control or pagination, see the discussion in
+    // admin_ui_todo.md.
+    let endpoint = '/logs?limit=2000';
     for (const id of logFilterClients) {
         endpoint += `&client_id=${encodeURIComponent(id)}`;
     }

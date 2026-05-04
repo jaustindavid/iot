@@ -5,6 +5,15 @@ live in [catalog_todo.md](catalog_todo.md) instead.
 
 ## Active
 
+- **Activity Logs UI control / pagination.** The fetch limit is now a
+  hardcoded 2000 entries (bumped from 200 on 2026-05-04 — was "kinda
+  shallow"). Server-side stream retention is `MAXLEN ~ 150000` so
+  there's plenty more to show; the UI just doesn't expose it. Worth
+  adding either a dropdown (200/500/1000/2000/5000) or proper
+  pagination ("load older") with cursor management. Existing endpoint
+  already supports `min` filtering via Redis stream cursors. Lazy
+  effort: ~20 LOC for dropdown, ~80 LOC for pagination.
+
 - **Logout link in the admin UI nav.** No way to "switch users" today —
   basic-auth credentials are browser-cached, the `admin_session` cookie
   persists, and the only workaround is incognito-per-user or manually

@@ -50,6 +50,15 @@ def _reject_if_reserved(client_id: str) -> None:
 class ClientCreate(BaseModel):
     client_id: str
 
+
+class DeviceProvision(BaseModel):
+    """Combined create-client-and-grant-app-access payload. Mirrors the
+    customer-shaped device ACL from fr_application_view.md: rw on the
+    device's own per-device namespace + rw on the app's shared public/
+    namespace (so the device can publish telemetry there)."""
+    client_id: str
+    app: str
+
 class KVPayload(BaseModel):
     value: str
     encrypted: bool = False
@@ -101,6 +110,68 @@ async def create_client(client: ClientCreate, _: dict = Depends(require_admin_su
         "secret": secret,
         "acl": acl
     }
+
+@router.post("/provision_device")
+async def provision_device(payload: DeviceProvision, _: dict = Depends(require_admin_superuser)):
+    """One-shot device provisioning: mint an HMAC client and grant it
+    the customer-shaped ACL for `<app>` in a single atomic call.
+
+    Resulting ACL (per fr_application_view.md namespace convention):
+      [
+        {"prefix": "<app>/<client_id>", "access": "rw"},  # device's own ns
+        {"prefix": "<app>/public",      "access": "rw"},  # shared topic
+      ]
+
+    Refuses to overwrite an existing client (caller must `revoke` first
+    if they want to recycle the id) — mass-provisioning scripts that
+    re-run shouldn't silently regenerate secrets and break already-
+    deployed devices.
+
+    Reserved-name guard (`RESERVED_CLIENT_IDS`) applies; `app` is
+    similarly validated so an empty/whitespace app doesn't produce a
+    nonsense ACL.
+    """
+    _reject_if_reserved(payload.client_id)
+    if not payload.client_id.strip():
+        raise HTTPException(status_code=400, detail="client_id is required")
+    if not payload.app.strip():
+        raise HTTPException(status_code=400, detail="app is required")
+    if "/" in payload.app or "/" in payload.client_id:
+        # `/` would corrupt the prefix shape — caller likely passed a
+        # path instead of an identifier.
+        raise HTTPException(
+            status_code=400,
+            detail="app and client_id must not contain '/'",
+        )
+
+    redis = get_redis_client()
+    existing = await redis.get(f"client:{payload.client_id}:secret")
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Client {payload.client_id!r} already exists. "
+                f"Use DELETE /keys/{payload.client_id} first if you want "
+                f"to recycle the id, or PUT /keys/{payload.client_id}/acl "
+                f"to update its ACL without changing the secret."
+            ),
+        )
+
+    secret = generate_secret()
+    acl = {
+        "permissions": [
+            {"prefix": f"{payload.app}/{payload.client_id}", "access": "rw"},
+            {"prefix": f"{payload.app}/public",              "access": "rw"},
+        ]
+    }
+    await redis.set(f"client:{payload.client_id}:secret", secret)
+    await redis.set(f"client:{payload.client_id}:acl", json.dumps(acl))
+    return {
+        "client_id": payload.client_id,
+        "secret": secret,
+        "acl": acl,
+    }
+
 
 @router.put("/keys/{client_id}/acl")
 async def update_acl(client_id: str, acl_update: AclUpdate, _: dict = Depends(require_admin_superuser)):
