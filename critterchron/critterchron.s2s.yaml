@@ -49,9 +49,11 @@ vars:
     scope: [app, device]
     range: [10, 3600]
     help: |
-      Stra2us heartbeat cadence in seconds. Device reads this once per loop
-      iteration and adjusts in-place. Per-device headers may override the
-      compiled-in default (e.g. ricky_raccoon.h pegs it to 15 for dev).
+      How often the device reports status to the cloud, in seconds.
+
+      Lower values give faster status updates at the cost of more network
+      traffic. Device reads this each loop and adjusts live. Per-device
+      headers may override the compiled-in default (e.g. ricky=15 for dev).
 
   cloud_heartbeep:
     type: int
@@ -59,9 +61,11 @@ vars:
     scope: [app, device]
     range: [10, 3600]
     help: |
-      Particle cloud heartbeat cadence (independent of Stra2us). Separate so
-      broken Stra2us can't silence the observability path — answers "server
-      down or device misconfigured?" from the Particle event stream alone.
+      Particle cloud heartbeat cadence in seconds.
+
+      Independent of Stra2us. Separate so broken Stra2us can't silence the
+      observability path — answers "server down or device misconfigured?"
+      from the Particle event stream alone.
 
   # ---------- OTA IR ----------
 
@@ -70,11 +74,12 @@ vars:
     type: string
     scope: [device]
     help: |
-      Script name this device should run (e.g. "thyme"). Empty string
-      = "keep current, boot into compiled-in default on next reset." Not
-      app-scoped: pointing every device in the fleet at one script would
-      ignore per-device grid geometry (rachel 32x8 vs ricky 16x16 vs rico
-      8x8). Managed by tools/set_ir_pointer.py.
+      Script name this device should run (e.g. "thyme").
+
+      Empty string = "keep current, boot into compiled-in default on
+      next reset." Not app-scoped: pointing every device at one script
+      would ignore per-device grid geometry (rachel 32x8 vs ricky 16x16
+      vs rico 8x8). Managed by tools/set_ir_pointer.py.
     ops_only: true    # device never calls get_*; read by Stra2usClient directly
 
   ir_poll_interval:
@@ -83,10 +88,12 @@ vars:
     scope: [app, device]
     range: [30, 86400]
     help: |
-      Seconds between ir_poll cycles. Decoupled from heartbeep because
-      pointer changes propagate at human scale. Short values (< 60s) are
-      fine for dev; in production the traffic is "one sidecar GET per
-      device per interval" so 1200s is the sweet spot.
+      Seconds between IR-script pointer-poll cycles.
+
+      Decoupled from heartbeep because pointer changes propagate at human
+      scale. Short values (< 60s) are fine for dev; in production the
+      traffic is "one sidecar GET per device per interval" so 1200s is
+      the sweet spot.
 
       Secondary use (added 2026-04-28): also paces the WiFi reconnect
       kick — when the device's radio is offline, the tel thread/task
@@ -104,15 +111,14 @@ vars:
     type: string
     scope: [app, device]
     help: |
-      Target firmware identifier the device should pull on its next
-      `fw_poll_interval` cycle (and on cold boot). Matches the suffix
-      used by `tools/publish_fw.py --target <name>`; today the only
-      shipped value is `esp32c3` (timmy's platform). Empty / unset
-      means "no firmware OTA — keep running whatever's flashed."
-      Device-then-app fallback: per-device override wins, otherwise
-      fleet-wide. Set with `tools/publish_fw.py` (Phase 1) and
-      `stra2us put critterchron/<device>/fw_target <target>` (or
-      `critterchron/fw_target <target>` for fleet-wide).
+      Target firmware identifier the device should pull.
+
+      Matches the suffix used by `tools/publish_fw.py --target <name>`;
+      today the only shipped value is `esp32c3` (timmy's platform).
+      Empty / unset means "no firmware OTA — keep running whatever's
+      flashed." Device-then-app fallback: per-device override wins,
+      otherwise fleet-wide. Pulled on next `fw_poll_interval` cycle
+      and on cold boot.
     ops_only: true    # device reads via Stra2usClient::fw_poll(), not get_int/get_float
 
   fw_poll_interval:
@@ -121,14 +127,14 @@ vars:
     scope: [app, device]
     range: [60, 604800]
     help: |
-      Seconds between firmware OTA poll cycles. Decoupled from
-      `ir_poll_interval` because firmware updates are rare events
-      (typically weekly at most), much rarer than IR script changes —
-      borrowing `ir_poll_interval` here would generate hundreds of
-      needless sidecar GETs per device per day. 86400s = 1 day.
-      Floor 60s in the task loop for testing convenience. ESP32-only
-      today; Particle firmware OTA goes through Particle Cloud, not
-      this path.
+      Seconds between firmware OTA poll cycles.
+
+      Decoupled from `ir_poll_interval` because firmware updates are
+      rare (typically weekly at most). Borrowing the IR cadence here
+      would generate hundreds of needless sidecar GETs per device per
+      day. 86400s = 1 day. Floor 60s in the task loop for testing
+      convenience. ESP32-only today; Particle firmware OTA goes through
+      Particle Cloud, not this path.
 
   # ---------- WobblyTime ----------
 
@@ -138,8 +144,11 @@ vars:
     default: 120
     scope: [app, device]
     range: [10, 3600]
-    help: Lower bound (seconds) on each wobble phase. Phase duration is
-      uniform-random in [min, max] per roll.
+    help: |
+      Shortest possible duration of each clock-wobble phase, in seconds.
+
+      Each phase's actual length is randomly chosen from [min, max].
+      Larger values feel more meditative; smaller, more jittery.
 
   wobble_max_seconds:
     label: "Time wobble: max phase length"
@@ -147,8 +156,11 @@ vars:
     default: 300
     scope: [app, device]
     range: [10, 3600]
-    help: Upper bound (seconds) on each wobble phase. Must be >= min;
-      device does not range-check.
+    help: |
+      Longest possible duration of each clock-wobble phase, in seconds.
+
+      Each phase's actual length is randomly chosen from [min, max].
+      Must be ≥ min; device doesn't range-check.
 
   wobble_fast_rate:
     label: "Time wobble: fast multiplier"
@@ -175,6 +187,7 @@ vars:
     range: [0.1, 5.0]
     help: |
       Exponent on normalized light reading before mapping to brightness.
+
       Higher = darker mid-range (stronger perceived dimming in twilight).
       Semantics invert by sensor type, so the compiled-in default does too:
         - CDS (Particle): raw→n is inverted (lower raw = more light),
@@ -193,13 +206,13 @@ vars:
     scope: [app, device]
     range: [1.0, 65535.0]
     help: |
-      Lux reading at which BH1750-driven brightness saturates at
-      max_brightness. Mapping is
-          target = min_b + clamp((lux / lux_full)^light_exponent, 0, 1) * span
-      375 ≈ "bright room" per the ESPHome BH1750 recipe this port models.
-      Smaller → reaches full bright sooner; larger → needs more light to
-      saturate. ESP32/BH1750-only knob — the CDS path auto-calibrates its
-      own bright/dark range and has no equivalent tunable. See
+      Lux reading at which BH1750-driven brightness saturates at max.
+
+      Mapping is `target = min_b + clamp((lux/lux_full)^light_exponent,
+      0, 1) * span`. 375 ≈ "bright room" per the ESPHome BH1750 recipe
+      this port models. Smaller → reaches full bright sooner; larger →
+      needs more light to saturate. ESP32/BH1750-only knob — the CDS
+      path auto-calibrates and has no equivalent tunable. See
       hal/esp32/src/LightSensorBH1750.h.
 
   min_brightness:
@@ -209,13 +222,12 @@ vars:
     scope: [app, device]
     range: [1, 255]
     help: |
-      Floor on the 0-255 sink brightness. Compiled-in default is set per
-      device header (rachel=1, ricky=3, rico=32). Lint skips the
-      cross-check for keys whose default is marked per-device. Range
-      lower bound is 1, not 0: zero would turn the panel off entirely
-      and is reserved as a sentinel elsewhere (see `night_enter_brightness`).
-      The HAL still clamps `min_b < 0 → 0` today; see TODO for the
-      belt-and-suspenders floor.
+      Lowest the panel can dim to (0-255 scale).
+
+      Smoothed sensor input maps the bright/dark range onto [min, max].
+      Compiled-in default is per-device (rachel=1, ricky=3, rico=32).
+      Floor is 1; 0 is a sentinel reserved elsewhere
+      (see `night_enter_brightness`).
 
   max_brightness:
     label: "Maximum brightness"
@@ -224,8 +236,10 @@ vars:
     scope: [app, device]
     range: [1, 255]
     help: |
-      Ceiling on the 0-255 sink brightness. Per-device default (rachel=64,
-      ricky=128, rico=128, elk=128).
+      Highest the panel can brighten to (0-255 scale).
+
+      Smoothed sensor input maps the bright/dark range onto [min, max].
+      Per-device default (rachel=64, ricky=128, rico=128, elk=128).
 
   night_enter_brightness:
     label: "Night mode threshold (turn on)"
@@ -234,14 +248,13 @@ vars:
     scope: [app, device]
     range: [0, 255]
     help: |
-      Smoothed-brightness threshold at which the night palette engages.
-      Schmitt hysteresis against `night_exit_brightness`. Defaults to
-      MIN_BRIGHTNESS (per-device), i.e. the floor-clamp regime itself.
-      Sentinel: 0 disables night mode entirely (force day palette). The
-      smoothed brightness can't reach 0 because min_brightness is
-      floored at 1, so 0 had no legitimate "enter" meaning — reclaimed
-      as the disable signal. Live flip from positive → 0 exits night
-      mode immediately without waiting for bri to climb above exit.
+      When ambient gets this dim, switch to the night-mode palette.
+
+      Schmitt hysteresis against `night_exit_brightness` (which must be
+      higher) prevents flicker. 0 disables night mode entirely (force
+      day palette regardless of ambient). Defaults to MIN_BRIGHTNESS
+      per device. Live-flipping from any positive value to 0 exits
+      night mode immediately.
 
   night_exit_brightness:
     label: "Night mode threshold (turn off)"
@@ -250,9 +263,11 @@ vars:
     scope: [app, device]
     range: [0, 255]
     help: |
-      Smoothed-brightness threshold at which the night palette disengages.
-      Device clamps to enter + 1 on read so a misconfigured pair can't
-      deadlock the trigger.
+      When ambient gets this bright, switch back to the day-mode palette.
+
+      Must be higher than `night_enter_brightness` to give the Schmitt
+      trigger working hysteresis. Device clamps to enter+1 on read if
+      misconfigured.
 
   # ---------- Network latency display ----------
 
@@ -263,24 +278,20 @@ vars:
     scope: [app, device]
     range: [0, 1]
     help: |
-      Toggle the rolling network-latency sparkline along the bottom row
-      of the panel. 0 = off (engine renders normally edge-to-edge); 1 =
-      on (each heartbeat, the bottom row shifts left and a new pixel is
-      drawn at (max_x, max_y) colored by this cycle's mean network
-      latency).
+      Show a rolling network-latency graph on the bottom row of the panel.
 
-      Color mapping: ≤20ms = bright green, 20-200ms = green channel
-      linearly dimming to 1, >200ms = red. Hardcoded for now — the
-      operator regulates the visible time-window via heartbeep cadence
-      (longer cadence = wider history per pixel).
+      0 = off; 1 = on. Each heartbeat draws one pixel at the right edge
+      and scrolls the row left, colored by this cycle's mean latency:
+      ≤20ms bright green, fading dim through 200ms, then red beyond.
+      Renders behind agents — they occlude the graph rather than the
+      reverse. Useful for spotting "the network is acting up" at a
+      glance.
 
-      Source samples: every publish() and small kv_fetch_ / kv_fetch_str_
-      contributes one elapsed-ms sample. Streaming OTA fetches are
-      excluded so a 1MB firmware pull doesn't dominate the metric.
-
-      Destructive overlay — agents that wander into the bottom row are
-      visually clipped while the display is on; the engine doesn't see
-      the overlay so pathfinding/physics are unaffected. ESP32-only.
+      Source samples: every publish() and small kv_fetch_* contributes
+      one elapsed-ms sample. Streaming OTA fetches are excluded so a
+      1MB firmware pull doesn't dominate the metric. Operator regulates
+      the visible time-window via heartbeep cadence (longer cadence =
+      wider history per pixel). Available on both Particle and ESP32.
 
   # ---------- Brightness schedule ----------
 
@@ -289,9 +300,10 @@ vars:
     type: string
     scope: [app, device]
     help: |
-      Time-of-day brightness override. Comma-separated segments, up to
-      8, first match wins, wraparound handled (start > end crosses
-      midnight). Two segment shapes:
+      Time-of-day brightness override.
+
+      Comma-separated segments, up to 8, first match wins, wraparound
+      handled (start > end crosses midnight). Two segment shapes:
         HH:MM-HH:MM:max         override max only (min unchanged)
         HH:MM-HH:MM:min-max     pin both ends (hard-clamp; bedtime "1-1")
       Examples: "23:00-07:00:1, 07:00-09:00:16, 09:00-23:00:64"
@@ -310,19 +322,14 @@ vars:
     type: string
     scope: [app, device]
     help: |
-      Target WiFi SSID for the procyon rescue-recovery flow. Set on a
-      device before it ships; once the device joins procyon (the fleet-
-      shared rescue hotspot — see TODO entry "Procyon rescue WiFi"), it
-      pulls this key + `wifi_password` and calls WiFi.setCredentials to
-      install them into DCT. After the operator stops the procyon
-      hotspot, the device joins the network specified here.
+      The WiFi network this device should join.
 
-      Empty / unset = no override active; device's existing creds
-      remain unchanged. Device-side dedup hashes the (ssid, password)
-      pair and skips re-applying when unchanged, so leaving these set
-      after install is harmless — operator does NOT need to clear
-      after recovery succeeds. Particle-only today; ESP32 mirror is
-      separate work.
+      Used by the procyon rescue-recovery flow: set this (with
+      `wifi_password`) before shipping the device, and during install
+      the device will self-configure via the `procyon`/`horology`
+      emergency hotspot. Empty = no override active; existing creds
+      remain. Device-side dedup means leaving this set after install
+      is harmless. See PROCYON.md.
     ops_only: true    # device reads via Stra2usClient::wifi_ssid()
 
   wifi_password:
@@ -331,17 +338,12 @@ vars:
     scope: [app, device]
     encrypted: true   # MUST be set with `stra2us set ... --encrypted`
     help: |
-      Target WiFi password for the procyon rescue-recovery flow. Paired
-      with `wifi_ssid`. WPA2-PSK assumed (covers ~all home/office
-      networks). Empty / unset = no override active.
+      Password for the WiFi network named in `wifi_ssid`.
 
-      Encrypted on the wire via Stra2us's HMAC-keystream cipher (see
-      `../stra2us/docs/fr_encrypted_values.md` for the design and
-      `kvenc_xor_` in Stra2usClient.cpp for the device-side decrypt).
-      MUST be written with `stra2us set <device> wifi_password <pw>
-      --encrypted`. Setting without `--encrypted` demotes the record
-      to plaintext, which the drift-test name-pattern lint flags as
-      a CI failure (any key whose name matches /password|secret|key/i
-      is required to be marked encrypted in this catalog AND stored
-      encrypted in Stra2us).
+      WPA2-PSK assumed (covers ~all home/office networks). Encrypted
+      on the wire to the device. Empty = no override active. See
+      PROCYON.md for the rescue-recovery flow that uses this.
+      Operators must set with `--encrypted`; bare `set` demotes to
+      plaintext, which the catalog drift test rejects (any
+      /password|secret|key/i key must be marked encrypted).
     ops_only: true    # device reads via Stra2usClient::wifi_password()
