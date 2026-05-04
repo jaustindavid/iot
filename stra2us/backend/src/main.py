@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from api.routes_device import router as device_router
 from api.routes_admin import router as admin_router
+from api.routes_app import router as app_router
 
 app = FastAPI(title="IoT Telemetry Service")
 
@@ -18,10 +19,33 @@ from core.admin_auth import verify_password, generate_session_token, verify_sess
 from core.perf_log import DEFAULT_THRESHOLD_MS, write_perf_entry
 
 
+def _path_needs_admin_auth(path: str) -> bool:
+    """True for paths that should be gated by the admin htpasswd / cookie
+    auth flow. Includes the canonical `/admin*` and `/api/admin*` paths
+    plus the customer-facing `/app/<app>/<device>/...` paths
+    (fr_application_view.md). The bare `/app/` landing form, static
+    assets under `/app/_static/`, and the `/api/app/lookup_device`
+    endpoint stay public — a customer needs to be able to reach them
+    BEFORE knowing their device URL or having a login.
+    """
+    if path.startswith("/admin") or path.startswith("/api/admin"):
+        return True
+    if path == "/app" or path == "/app/":
+        return False  # bare landing form, public
+    if path.startswith("/app/_static/"):
+        return False  # public static assets — reuses the `_`-prefixed
+                      # reserved-namespace convention from `_catalog/`
+    if path.startswith("/api/app/"):
+        return False  # public lookup endpoints
+    if path.startswith("/app/"):
+        return True   # /app/<app>/<device>/... — auth required
+    return False
+
+
 @app.middleware("http")
 async def admin_auth_middleware(request: Request, call_next):
     path = request.url.path
-    if path.startswith("/admin") or path.startswith("/api/admin"):
+    if _path_needs_admin_auth(path):
         # Check cookie first
         cookie = request.cookies.get("admin_session")
         if cookie:
@@ -162,6 +186,18 @@ app.include_router(device_router, tags=["device"])
 # Mount Static UI
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/admin", StaticFiles(directory=os.path.join(BASE_DIR, "static"), html=True), name="static")
+
+# Customer-facing application view (see docs/fr_application_view.md).
+# Static assets live at `/app/_static/` (underscore-prefixed reserved
+# namespace, public per the auth middleware). Mount BEFORE the router
+# so the mount claims that path prefix first; the dynamic routes
+# (`/app/`, `/app/{app}/{device}`) catch everything else under /app/.
+APP_STATIC_DIR = os.path.join(BASE_DIR, "static", "app")
+app.mount("/app/_static", StaticFiles(directory=APP_STATIC_DIR), name="app-static")
+# No prefix on the router — routes_app declares its own (`/app/...` and
+# `/api/app/...`) so the route handlers' paths read naturally and
+# the auth middleware's path-matching logic stays in one place.
+app.include_router(app_router, tags=["app"])
 
 # Mount Firmware OTA directory. Default /firmware matches the Docker
 # volume mount in docker-compose.yml; override with STRA2US_FIRMWARE_DIR

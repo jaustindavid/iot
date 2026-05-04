@@ -32,6 +32,8 @@ the app's repository root. Example:
 
 ```yaml
 app: critterchron
+telemetry_topic: "{app}/public/heartbeep"   # tail this for status / activity
+heartbeat_interval_seconds: 300             # 5min cadence; thresholds scale
 
 vars:
   heartbeep:
@@ -39,14 +41,24 @@ vars:
     default: 300
     scope: [app, device]
     range: [10, 3600]
+    label: Heartbeat interval                # customer-facing title; presence
+                                             # is the app-view visibility gate
     help: |
       Stra2us heartbeat cadence in seconds. Device reads this once per
       loop iteration and adjusts in-place.
+
+  wifi_password:
+    type: string
+    scope: [app, device]
+    label: WiFi password
+    encrypted: true                          # encrypted on the wire to devices
+    help: WPA2 PSK for the device's home network.
 
   ir:
     type: string
     scope: [device]
     ops_only: true
+    # No `label`: this is operator-only — the customer never sees it.
     help: |
       Script name this device should run. Empty string = keep current.
 ```
@@ -58,6 +70,8 @@ vars:
 | `app`  | yes      | string | App identifier. Matches the `<app>` segment in KV keys. Lowercase, alphanumeric + underscore, must not contain `/`. |
 | `vars` | yes      | map    | Map from key name → variable descriptor (see §2). |
 | `version` | no    | int    | Catalog revision counter. Bump on backward-incompatible changes (e.g. renames, type changes). Used by the UI to detect stale stashed copies. Defaults to `1`. |
+| `telemetry_topic` | no | string | Topic the customer-facing app view tails for "is this device alive" + recent activity. Supports `{app}` and `{device}` placeholders. Default: `{app}/public/heartbeep`. Consumed by the `/app/<app>/<device>` UI per [`fr_application_view.md`](fr_application_view.md). Apps with a single shared telemetry topic per fleet (e.g. critterchron) declare it explicitly; apps with per-device topics use the default convention. |
+| `heartbeat_interval_seconds` | no | int | App's expected telemetry cadence. Drives the app view's status-badge thresholds: a device is "Online" if its last message was `< 2 × interval` ago, "Recently active" if `< 20 × interval`, otherwise "Offline". Default: `60`. A 5-minute-cadence app should set this to `300` so a healthy device isn't called Offline at 4 minutes since last message. |
 
 ### Variable name rules
 
@@ -88,6 +102,8 @@ Each entry under `vars:` is a map with the following fields.
 | `ops_only`           | no       | bool             | Opt out of the "must have a firmware reader" drift-lint check. Used for keys consumed by Stra2us client libraries themselves (e.g. the OTA script pointer) rather than by `get_*` calls in app code. Defaults to `false`. |
 | `read_cadence`       | no       | string           | Hint to the UI about how quickly a write takes effect on-device. One of `loop`, `poll`, `boot`, or a free-form string. Default: unspecified / unknown. |
 | `enforce`            | no       | bool             | When `true`, the stra2us server (M2+) advisory-rejects writes that fall outside `range` with a 409. Defaults to `false`: server remains permissive, CLI/UI validate. |
+| `label`              | no       | string           | Human-friendly title surfaced in the customer-facing app view (`/app/<app>/<device>`, see [fr_application_view.md](fr_application_view.md)). **Presence is the visibility gate**: a var with a `label` shows up in the customer's settings list, a var without one is hidden. Operator-jargon vars (`debug_flag_experimental`, perf knobs) just don't get a `label`. Distinct from `help` — `label` is a few words for the title, `help` is a sentence for the description. The admin UI shows both regardless. |
+| `encrypted`          | no       | bool             | Declares that the value should be encrypted on the wire to devices (see [fr_encrypted_values.md](fr_encrypted_values.md)). Catalog declaration is **advisory** — the per-record server-side flag is what governs wire behavior — but operators should mark this `true` on any var that holds secret material (wifi passwords, API tokens). The drift lint can verify "every var marked `encrypted: true` is actually stored as encrypted on the server" and "vars whose names match `password|secret|key` are marked `encrypted: true`." |
 
 ### 2.1 Types
 
@@ -267,6 +283,33 @@ implementation is per-app.
 Failing lint on a new `get_*` call with no catalog entry is the
 point — it forces the dev to either add a catalog entry or
 deliberately mark the call as intentionally uncataloged.
+
+### 5.1 Recommended name-pattern lints
+
+These are catalog-only checks (no firmware walk required). Cheap to
+wire up in the same CI job:
+
+- **Encrypted secrets.** Vars whose names match `password|secret|key|token`
+  (case-insensitive) should have `encrypted: true`. Catches the
+  "forgot to mark sensitive" footgun (filed as a related concern in
+  [`fr_encrypted_values.md`](fr_encrypted_values.md)).
+- **No customer-facing label on operator-only vars.** Vars whose
+  names match `debug_|perf_|.*_experimental$|_internal$` should NOT
+  have a `label` field. Inverse of the visibility convention from
+  [`fr_application_view.md`](fr_application_view.md): `label`-presence
+  is what makes a var customer-facing, so the lint enforces "if it
+  looks like an internal var, it shouldn't be."
+- **No reserved sub-namespace names as device identifiers.** No
+  device should be named `public` (or any other reserved
+  sub-namespace under `<app>/`). Stra2us-server enforces this at
+  HMAC-client provisioning time per
+  [`fr_application_view.md`](fr_application_view.md), but the
+  catalog-side lint catches accidental drift in app-controlled
+  provisioning scripts.
+
+These lint patterns are mirrored / inverted from each other —
+"sensitive vars MUST be encrypted" vs "operator vars MUST NOT have
+a label" — and use the same scaffolding. Worth picking up as a set.
 
 ---
 

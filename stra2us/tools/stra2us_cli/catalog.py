@@ -257,7 +257,24 @@ def coerce_value(var: Var, raw: str, name: str = "<value>") -> object:
 
 
 def kv_path(app: str, key: str, device: str | None) -> str:
-    """Build the KV key for a given scope. `device=None` → app scope."""
+    """Build the KV key for a given scope. `device=None` → app scope.
+
+    App-scope writes land under `<app>/public/<key>` (the public/
+    namespace convention from docs/fr_application_view.md). This is
+    what makes the customer's narrow ACL (`<app>/<device>:rw` +
+    `<app>/public:r`) able to *read* app-scope defaults without
+    granting them cross-device read.
+
+    Per-device writes are unchanged — devices keep using their own
+    `<app>/<device>/<key>` paths and don't need to know about public/.
+
+    *Migration dependency:* this returns the new path unconditionally,
+    so any pre-migration deployment must complete the operator-side
+    data move (`kv:<app>/<key>` → `kv:<app>/public/<key>`) before
+    deploying this code, or app-scope writes/reads will land at the
+    new path while old data sits at the old. See the firmware-team
+    brief in `fr_application_view.md`.
+    """
     if device is None:
-        return f"{app}/{key}"
+        return f"{app}/public/{key}"
     return f"{app}/{device}/{key}"

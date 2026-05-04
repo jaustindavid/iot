@@ -296,9 +296,17 @@ def test_coerce_string_passthrough():
 
 # ----- kv_path -----
 
-def test_kv_path_app_scope():
-    assert kv_path("myapp", "heartbeep", None) == "myapp/heartbeep"
+def test_kv_path_app_scope_lands_under_public():
+    """App-scope writes go under `<app>/public/` per the namespace
+    convention from docs/fr_application_view.md, not directly under
+    `<app>/`. This is what makes a customer's narrow ACL
+    (`<app>/<device>:rw` + `<app>/public:r`) able to read app-scope
+    defaults without granting cross-device read."""
+    assert kv_path("myapp", "heartbeep", None) == "myapp/public/heartbeep"
 
 
-def test_kv_path_device_scope():
+def test_kv_path_device_scope_unchanged():
+    """Device-scope path is unchanged by the namespace migration —
+    devices keep using their own `<app>/<device>/<key>` paths and
+    don't need to know about public/."""
     assert kv_path("myapp", "heartbeep", "ricky") == "myapp/ricky/heartbeep"

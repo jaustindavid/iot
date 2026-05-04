@@ -806,7 +806,13 @@ async function fetchCatalogRaw() {
 let _editorContext = null;  // { app, keyName, var }
 
 function _kvPath(app, keyName, device) {
-    return device ? `${app}/${device}/${keyName}` : `${app}/${keyName}`;
+    // App-scope writes land under `<app>/public/<key>` per the
+    // public/ namespace convention from docs/fr_application_view.md.
+    // Per-device writes unchanged. Migration dependency: the
+    // operator-side data move (`kv:<app>/<key>` → `kv:<app>/public/<key>`)
+    // must complete before this code deploys, or app-scope reads/writes
+    // will land at the new path while old data sits at the old.
+    return device ? `${app}/${device}/${keyName}` : `${app}/public/${keyName}`;
 }
 
 // The admin POST /kv handler json.loads() the value string and falls back
@@ -1480,7 +1486,13 @@ document.querySelectorAll('.nav-links a').forEach(link => {
 async function applyWhoami() {
     // Hide nav entries the caller can't use. Backend still enforces —
     // this is UX, not a security boundary.
-    const { ok, data } = await fetchAPI('/whoami');
+    //
+    // Calls /me (the unified identity endpoint per fr_application_view.md
+    // Phase 1) — supersedes the older /whoami. Returns a strict superset
+    // (adds scope_kind/scope_app/scope_device); we only consume
+    // is_superuser here, but the richer fields are available for any
+    // future per-scope nav gating.
+    const { ok, data } = await fetchAPI('/me');
     if (!ok || !data) return;
     if (!data.is_superuser) {
         document.querySelectorAll('.nav-superuser').forEach(el => {

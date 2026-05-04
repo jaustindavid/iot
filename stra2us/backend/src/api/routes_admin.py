@@ -21,6 +21,32 @@ import os
 
 router = APIRouter()
 
+# Client IDs we refuse to mint, because they collide with sub-namespaces
+# under each `<app>/`. See "Reserved-name enforcement" in
+# docs/fr_application_view.md. A device named `public` would have its
+# per-device data at `<app>/public/...`, which is the shared-namespace
+# convention — a customer's narrow `<app>/public:r` grant would suddenly
+# include the rogue device's private data, and the rogue device's writes
+# would land in the shared namespace.
+#
+# Match is case-sensitive and exact: `public` is blocked, `Public`,
+# `_public`, `publik`, etc. are not. Fuzzy/case-folded matching invites
+# its own edge-case bugs; the convention is just "don't pick the literal
+# word `public`."
+RESERVED_CLIENT_IDS = {"public"}
+
+
+def _reject_if_reserved(client_id: str) -> None:
+    if client_id in RESERVED_CLIENT_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Client id {client_id!r} is reserved as a namespace under "
+                f"each app. Reserved: {sorted(RESERVED_CLIENT_IDS)}."
+            ),
+        )
+
+
 class ClientCreate(BaseModel):
     client_id: str
 
@@ -63,6 +89,7 @@ async def list_keys(_: dict = Depends(require_admin_superuser)):
 
 @router.post("/keys")
 async def create_client(client: ClientCreate, _: dict = Depends(require_admin_superuser)):
+    _reject_if_reserved(client.client_id)
     redis = get_redis_client()
     secret = generate_secret()
     await redis.set(f"client:{client.client_id}:secret", secret)
@@ -91,23 +118,6 @@ async def revoke_client(client_id: str, _: dict = Depends(require_admin_superuse
     await redis.delete(f"client:{client_id}:secret")
     await redis.delete(f"client:{client_id}:acl")
     return {"status": "ok"}
-
-@router.get("/whoami")
-async def whoami(admin_ctx: dict = Depends(get_admin_context)):
-    """Return the logged-in admin's identity + ACL so the UI can hide
-    features the caller can't use (e.g. Key Management for a scoped admin).
-    Not a security boundary — the routes themselves still enforce."""
-    acl = admin_ctx["acl"]
-    is_superuser = any(
-        p.get("prefix") == "*" and p.get("access") == "rw"
-        for p in acl.get("permissions", [])
-    )
-    return {
-        "username": admin_ctx["client_id"],
-        "acl": acl,
-        "is_superuser": is_superuser,
-    }
-
 
 # --- Admin users ---
 #
@@ -163,6 +173,69 @@ async def update_admin_user_acl(username: str, acl_update: AclUpdate, _: dict = 
     acl = {"permissions": [p.dict() for p in acl_update.permissions]}
     await redis.set(ADMIN_ACL_KEY_FMT.format(user=username), json.dumps(acl))
     return {"status": "ok", "username": username, "acl": acl}
+
+
+@router.get("/me")
+async def get_me(admin_ctx: dict = Depends(get_admin_context)):
+    """Return the caller's identity, ACL, and a derived scope hint.
+
+    Used by both `/admin` and `/app/<app>/<device>` JS to drive UI
+    gating without each gate re-deriving "what kind of user is this?"
+    in three places. See docs/fr_application_view.md.
+
+    `scope_kind` derivation:
+      - any `*:rw` perm           → "superadmin"
+      - exactly one `rw` perm with prefix `<app>` (one segment)
+                                  → "app", with `scope_app` populated
+      - exactly one `rw` perm with prefix `<app>/<device>` (two
+        segments)               → "device", with `scope_app` and
+                                  `scope_device` populated
+      - anything else            → "custom" (multi-device operators,
+                                  read-only personas, weird shapes
+                                  — UI treats as "show everything,
+                                  rely on per-route ACL enforcement")
+
+    Read-only perms (the customer's `<app>/public:r` + `_catalog:r`
+    grants) are *ignored* when deriving scope — they're scaffolding
+    for the device-scoped read paths the customer needs, not what
+    defines who they are.
+    """
+    acl = admin_ctx["acl"]
+    perms = acl.get("permissions", [])
+
+    is_superuser = any(
+        p.get("prefix") == "*" and p.get("access") == "rw"
+        for p in perms
+    )
+
+    scope_kind = "superadmin" if is_superuser else "custom"
+    scope_app = None
+    scope_device = None
+
+    if not is_superuser:
+        rw_prefixes = [
+            p.get("prefix", "") for p in perms
+            if p.get("access") == "rw"
+        ]
+        if len(rw_prefixes) == 1:
+            parts = rw_prefixes[0].split("/")
+            if len(parts) == 1 and parts[0]:
+                scope_kind = "app"
+                scope_app = parts[0]
+            elif len(parts) == 2 and all(parts):
+                scope_kind = "device"
+                scope_app = parts[0]
+                scope_device = parts[1]
+            # anything else (3+ segments, empty parts) stays "custom"
+
+    return {
+        "username": admin_ctx["client_id"],
+        "acl": acl,
+        "is_superuser": is_superuser,
+        "scope_kind": scope_kind,
+        "scope_app": scope_app,
+        "scope_device": scope_device,
+    }
 
 
 @router.get("/stats")
@@ -271,8 +344,21 @@ async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_con
     (`<app>/<device>:rw`). Returned device IDs are client IDs — and by
     convention also the second path segment in <app>/<device>/<key> KV
     writes, which is what the per-device effective-value view depends on.
+
+    The returned set is *filtered* by the caller's own ACL: a scoped
+    admin (e.g. `<app>/ricky:rw`) only sees devices they have rw on,
+    not the whole fleet. This stops device-name leakage to scoped
+    customer-style admins (Phase 0a finding from
+    fr_application_view.md). Superadmins (`*:rw`) and app-scoped
+    admins (`<app>:rw`) still see every device under the app.
+
+    The outer gate is `_catalog/<app>:r` — that's the natural
+    prerequisite (you need the catalog to make sense of device data),
+    and it's what the recommended scoped-admin ACL shape grants.
+    The legacy `kv/<app>:r` gate was too restrictive under the new
+    public/ namespace convention (scoped admins don't have it).
     """
-    await check_acl(admin_ctx, f"kv/{app}", mode="read")
+    await check_acl(admin_ctx, f"kv/_catalog/{app}", mode="read")
 
     redis = get_redis_client()
     acl_keys = await redis.keys("client:*:acl")
@@ -298,7 +384,19 @@ async def list_catalog_devices(app: str, admin_ctx: dict = Depends(get_admin_con
                 devices.add(client_id)
                 break
 
-    return {"app": app, "devices": sorted(devices)}
+    # Filter to devices the *caller* has rw on. Superadmins (`*:rw`) and
+    # app-scoped admins (`<app>:rw`) pass everything; a scoped admin
+    # (`<app>/ricky:rw`) only sees ricky. Phase 0a finding from
+    # fr_application_view.md.
+    visible: list[str] = []
+    for device in sorted(devices):
+        try:
+            await check_acl(admin_ctx, f"kv/{app}/{device}", mode="write")
+            visible.append(device)
+        except HTTPException:
+            pass
+
+    return {"app": app, "devices": visible}
 
 
 @router.get("/peek/kv/{key:path}")
@@ -464,6 +562,12 @@ async def restore_keys(payload: BackupPayload, force: bool = Query(False), _: di
     results = {"restored": [], "skipped": [], "overwritten": []}
 
     for client in payload.clients:
+        # Same reserved-name guard as `create_client` — prevents a
+        # backup file from silently un-reserving `client:public:*`
+        # entries that pre-date the convention. (See comment on
+        # RESERVED_CLIENT_IDS.)
+        _reject_if_reserved(client.client_id)
+
         existing = await redis.get(f"client:{client.client_id}:secret")
         if existing and not force:
             results["skipped"].append(client.client_id)
@@ -525,7 +629,7 @@ async def get_perf_log(
 
 # --- Topic Stream Monitor ---
 
-@router.get("/stream/q/{topic}")
+@router.get("/stream/q/{topic:path}")
 async def stream_monitor(
     topic: str,
     limit: int = 50,
@@ -534,6 +638,11 @@ async def stream_monitor(
 ):
     """Read-only scan of the last N messages from a topic stream.
     Uses XREVRANGE — does not advance any subscriber cursor.
+
+    `:path` on the topic param so multi-segment topic names like
+    `<app>/public/heartbeep` (the post-namespace-migration shape per
+    fr_application_view.md) match. Single-segment topics still match
+    the same route.
     """
     redis = get_redis_client()
     records = await redis.xrevrange(f"q:{topic}", max="+", min="-", count=limit)

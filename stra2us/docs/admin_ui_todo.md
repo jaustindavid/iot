@@ -5,7 +5,26 @@ live in [catalog_todo.md](catalog_todo.md) instead.
 
 ## Active
 
-_(none)_
+- **Logout link in the admin UI nav.** No way to "switch users" today —
+  basic-auth credentials are browser-cached, the `admin_session` cookie
+  persists, and the only workaround is incognito-per-user or manually
+  clearing site data via DevTools. Surfaces sharply when testing
+  scoped-admin personas (Phase 0 of
+  [fr_application_view.md](fr_application_view.md)) or operating
+  multiple personas day-to-day.
+
+  Implementation sketch: new route `GET /admin/logout` that deletes
+  the `admin_session` cookie and serves a "logged out" landing page.
+  Browsers handle basic-auth re-prompting inconsistently — a 401
+  response can sometimes evict the cached credentials, but not
+  reliably. Worst case: the page tells the user "close all your
+  browser windows to fully log out," which is honest if ugly.
+
+  Likely rolls up into the broader v1.5 customer-auth UX work (real
+  login page, self-service password reset, etc.) called out as open
+  question #3 in the application view FR — basic-auth's browser-
+  managed credential cache is part of the same problem. File as
+  standalone for now; may get absorbed.
 
 ## Closed
 
