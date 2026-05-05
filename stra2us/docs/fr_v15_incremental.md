@@ -49,10 +49,10 @@ phase status as of this writing.
                                      │ HTTP, port 8153, HMAC-signed
                                      ▼
 iot.stra2us.austindavid.com ─── A ──► server public IP
-   (split-horizon: same name      │
-    resolves to a private IP      │  docker port mapping
-    for internal hosts; both      ▼
-    routes are valid)         stra2us-iot container (FastAPI)
+                                     │
+                                     │ docker port mapping
+                                     ▼
+                                 stra2us-iot container (FastAPI)
                                      ▲
                                      │ HTTP, internal docker network
                                      │
@@ -69,8 +69,8 @@ stra2us.austindavid.com ─── CNAME ──► CF tunnel (CF edge IPs)
 ```
 
 - **Devices** see only the upper half. DNS `iot.stra2us.austindavid.com`
-  → server IP (public) or private IP (internal, via split-horizon DNS);
-  HTTP on 8153 directly to the server. Identical to 1.0.
+  → A record to the server's public IP; HTTP on 8153 directly to the
+  server. Identical to 1.0.
 - **Browsers** see only the lower half. DNS `stra2us.austindavid.com`
   → CF edge; HTTPS on 443 to CF; CF tunnels to the same backend
   container over the docker internal network.
@@ -96,7 +96,7 @@ browser path.**
 | 1 | Stand up the second hostname (CF tunnel) | **Done** |
 | 2 | Add OAuth code, dormant behind feature flag | **Done** |
 | 3 | Flag on, operator self-test of OAuth round-trip | **Done** |
-| 4 | Hostname-aware middleware redirects browser → OAuth | **Not started** (next) |
+| 4 | Hostname-aware middleware redirects browser → OAuth | **Done** |
 | 4.5 | Build staging environment | TBD (gates Phase 5+) |
 | 5 | Provisioning UI for granting access | TBD (requires staging) |
 | 6 | Migrate operator off htpasswd; narrow to RESCUE_USERS | TBD |
@@ -165,8 +165,9 @@ What landed:
   public IP (devices, unproxied).
 - DNS for `stra2us.austindavid.com` is a CNAME to the CF tunnel
   (browsers, proxied).
-- Internal hosts get `iot.stra2us...` via split-horizon DNS to a
-  private IP.
+- No split-horizon DNS — `iot.stra2us...` resolves to the public IP
+  from anywhere (internal or external). The earlier split-horizon
+  setup was unrolled during recovery.
 
 **Phase 1 checkpoint (verified):**
 - Real device heartbeat in activity log within 60 seconds.

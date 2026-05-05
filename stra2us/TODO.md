@@ -2,6 +2,39 @@
 
 ## Near-term
 
+- **Scoped admins can't see Activity Logs view.** A non-superuser
+  admin (e.g. `austin`, ACL has `critterchron/...` prefixes but no
+  `*:rw`) sees a blank Activity Logs page and no filter chips. Root
+  cause: the page calls `/api/admin/keys` first to populate filter
+  chips; `/keys` is gated on `require_admin_superuser` → 403 for
+  scoped admins; the frontend's error chain prevents the subsequent
+  `/api/admin/logs` call (which IS scope-aware and would return
+  correct entries) from running. Two-part fix:
+  1. **Backend:** add `/api/admin/visible_clients` (or similar) that
+     returns only the `client_id`s whose ACL paths the caller's
+     permissions cover. No secrets, no ACL contents — just IDs.
+     `/keys` stays superuser-locked since it's tied to the
+     client-management UI which scoped admins shouldn't access.
+  2. **Frontend:** in `fetchLogs()` (`backend/src/static/app.js`),
+     swap the `/keys` call for `/visible_clients`, and make a
+     `/visible_clients` failure non-fatal — render logs without
+     chips rather than render nothing.
+  Worth doing before Phase 5 (provisioning UI), since that work will
+  also have to think about scoped-admin views.
+
+- **Add an admin logout endpoint.** Today there's no way to sign
+  out of either auth path. To clear an htpasswd session you have to
+  delete the cookie AND fully quit Chrome (Basic Auth creds are
+  cached per browser process); to clear an OAuth session you have
+  to clear cookies and the 7-day `admin_session` cookie. Both make
+  testing auth flows painful — discovered during Phase 4 verification.
+  Build `GET /admin/logout`: clears `admin_session`, `oauth_state`,
+  `oauth_redirect_to` cookies; returns a `WWW-Authenticate: Basic
+  realm="logged-out"` response with a different realm string than
+  the live one (Chrome treats different realms as different
+  credential namespaces, busting the Basic Auth cache); add a small
+  "Sign out" link in the admin UI header. ~15-30 lines total.
+
 - **Build a staging environment.** Today, "rebuild" means rebuilding
   the live container; the only safety net is `tools/smoke_test.sh`
   catching regressions after the fact, with a manual image re-tag
@@ -17,6 +50,15 @@
   check (mirror a subset of device traffic, or a synthetic
   HMAC-signed probe)? Until staging exists, image-tag-before-rebuild
   is the manual workaround.
+
+  Scope to bring in when staging lands:
+  - A deploy script (`tools/deploy.sh` or similar) that handles
+    `docker compose build` + `up -d` + waiting for the cloudflared
+    tunnel to finish registering all connections before the smoke
+    test runs. Today this is a manual "sleep 12, then run smoke"
+    or a `grep -q connIndex=3` poll on `docker compose logs
+    cloudflared`. Belongs in deploy orchestration, not the smoke
+    test itself.
 
 - ~~**Draft a "Stra2us client implementor's guide" / spec.**~~ Landed
   2026-05-03 as [`docs/client_spec.md`](docs/client_spec.md). Covers
