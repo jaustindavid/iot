@@ -402,9 +402,16 @@ a clear RuntimeError so the failure mode is obvious at startup)
 - Phase 1 ships dormant. To exercise it on staging:
   1. Set the four env vars above on the staging container.
   2. Provision your own Google email in Redis:
-     `redis-cli SET 'admin_acls:<you>@gmail.com' '{"acls":["*:rw"]}'`
-     (the existing admin-acls JSON shape — the same one
-     `routes_admin.set_admin_acl` writes).
+     `redis-cli SET 'admin_acls:<you>@gmail.com' '{"permissions":[{"prefix":"*","access":"rw"}]}'`
+     This is the same JSON shape `routes_admin.set_admin_acl` writes
+     and `dependencies.check_acl` reads — `permissions` is a list of
+     `{prefix, access}` objects; `prefix: "*"` is the wildcard that
+     matches every namespace; `access: "rw"` is read+write. (Common
+     pitfall: the FR was originally drafted with a hand-wavy
+     `{"acls": ["*:rw"]}` string form that the code does NOT
+     understand — anything not matching the `permissions` shape
+     evaluates as zero perms and you'll be locked out of every
+     resource despite the OAuth flow letting you "in.")
   3. Visit `https://staging.example.com/oauth/google/login` directly
      in a fresh browser session (no `admin_session` cookie set).
   4. Confirm the round-trip lands you back in `/admin/` signed in

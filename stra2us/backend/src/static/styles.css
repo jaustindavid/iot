@@ -168,6 +168,13 @@ a { text-decoration: none; color: inherit; }
     border-radius: 20px;
     font-size: 0.85rem;
     font-weight: 600;
+    /* Badges read as a single visual token (e.g. "🔒 encrypted",
+       "ALERT ✱ retry"). Allowing the inner whitespace to break makes
+       the emoji wrap onto a different line from the word, which looks
+       like a bug. Pin nowrap globally so every present + future badge
+       stays atomic by default — earlier table-scoped fixes (further
+       down this file) are now redundant but harmless. */
+    white-space: nowrap;
 }
 
 .card-content {
