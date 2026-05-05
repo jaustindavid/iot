@@ -2,6 +2,14 @@
 
 ## Near-term
 
+- **"Last seen just now ago" on single-device screen.** Time-format
+  bug: the relative-time formatter is concatenating "just now" with
+  "ago" when the duration is sub-threshold. Should be "just now"
+  (no "ago") for very recent events, and "<N> <unit> ago" for older
+  ones. Lives somewhere in `backend/src/static/app.js` or the
+  `/app/` view templates — short grep for "just now" / "ago" should
+  find it.
+
 - **Scoped admins can't see Activity Logs view.** A non-superuser
   admin (e.g. `austin`, ACL has `critterchron/...` prefixes but no
   `*:rw`) sees a blank Activity Logs page and no filter chips. Root
@@ -34,6 +42,35 @@
   the live one (Chrome treats different realms as different
   credential namespaces, busting the Basic Auth cache); add a small
   "Sign out" link in the admin UI header. ~15-30 lines total.
+
+- **`tools/stage nuke` — reset staging Redis + re-seed.** Today
+  staging Redis state persists across deploys (intentional —
+  preserves provisioned clients, logs, ACLs between test cycles).
+  When a schema change lands that's incompatible with the previous
+  state, the operator needs a one-shot way to wipe staging and
+  start clean. Shape: `tools/stage nuke` stops the staging stack,
+  removes the `redis_data_staging` volume, brings staging back up,
+  and re-runs `tools/stage seed-users`. Confirms with the operator
+  before destroying state (no `--yes` shortcut by default; staging
+  data is sometimes painful to recreate). Not needed today — filing
+  so it exists when we hit the first incompatible schema change.
+
+- **Synthetic device-traffic CLI for staging top-up.** A short-lived
+  job that posts signed device traffic to a target host for a
+  configured duration. Built as a subcommand of the existing
+  `tools/stra2us_cli` Python client (which already has HMAC signing,
+  msgpack body construction, and the wire format implemented). Rough
+  shape: `stra2us synth-traffic --target iot-staging.stra2us.austindavid.com:8253
+  --client-id staging-probe --duration 5m --rate 2Hz`. Reads the
+  client's HMAC secret from a flag or `~/.stra2us/credentials`.
+  Runs to completion, prints summary stats. Use cases: kicking off
+  device traffic before a staging smoke run when no real LAN device
+  is heartbeating, generating load for testing, validating a
+  device-path code change without rebooting a real device.
+  Complements the LAN-only real staging devices (which are the
+  primary traffic source); this is the on-demand top-up. See
+  [`docs/staging_environment.md`](docs/staging_environment.md)
+  for surrounding context.
 
 - **Build a staging environment.** Today, "rebuild" means rebuilding
   the live container; the only safety net is `tools/smoke_test.sh`
