@@ -16,6 +16,63 @@ Stra2Us is a high-performance, stateless IoT messaging and configuration relay d
 
 ---
 
+## Rules of Operation
+
+These distill the failure modes that have hurt us before. They apply
+to any change that touches the running service — dep bumps, code
+edits, topology changes, recovery work.
+
+1. **Verify before reacting.** When something breaks, diagnose with
+   tests and logs before changing anything. Don't act on intuition.
+
+2. **Tests are the truth.** A claim ("OAuth works", "the rebuild is
+   safe", "deps are stable") needs receipts: a green
+   [`tools/smoke_test.sh`](tools/smoke_test.sh) run or a reproducible
+   repro. No receipts, no claim, no forward motion.
+
+3. **Invariants pass, or fail in a predicted way.** Every smoke-test
+   check has an expected pass-state and a known set of failure modes.
+   A surprising failure mode means the test is wrong before the
+   system is — fix the test first.
+
+4. **Reproduce before fixing.** When a real failure surfaces, expand
+   the smoke test to reproduce it *first*, then patch the underlying
+   issue. This makes the regression catchable next time.
+
+5. **Devices are sacred.** The IoT path
+   (`iot.stra2us.austindavid.com:8153`, HTTP, HMAC-signed) must keep
+   working through every change. Anything touching `/q/`, `/kv/`, or
+   `/firmware/` request handling gets explicit smoke-test coverage.
+
+6. **One variable per phase.** Code, dependencies, and network
+   topology change in separate steps. If a change wants all three,
+   it's three steps. Entanglement is what made the first v1.5
+   attempt unrecoverable.
+
+7. **Rollbacks go to a verified-working target — guesses don't
+   count.** "Verified working" means a smoke-test pass at that
+   version, or an image tag from a deploy that ran successfully.
+   Picking arbitrary old version numbers without that evidence is
+   *not* a rollback — it's a guess that adds new variables on top
+   of the original failure, and is worse than no action. The first
+   v1.5 attempt's "uvicorn rolled back 18 months" was this kind of
+   guess.
+
+8. **Pin direct deps; lock transitive ones.** `requirements.txt` is
+   the human-readable list of direct deps, pinned with `==`.
+   `requirements.lock.txt` (when it lands) captures the full
+   transitive resolution against a known-good container. The two
+   move together, never independently.
+
+9. **Don't skip checkpoints.** A change is done when its checkpoint
+   passes — which means the smoke test passes. "It probably works"
+   and "looks fine to me" are not checkpoints.
+
+See [`docs/fr_v15_incremental.md`](docs/fr_v15_incremental.md) for
+the v1.5 rollout that made these rules concrete.
+
+---
+
 ## Installation
 
 ### 1. Requirements

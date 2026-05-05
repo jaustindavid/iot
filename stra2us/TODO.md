@@ -2,6 +2,22 @@
 
 ## Near-term
 
+- **Build a staging environment.** Today, "rebuild" means rebuilding
+  the live container; the only safety net is `tools/smoke_test.sh`
+  catching regressions after the fact, with a manual image re-tag
+  before each rebuild as a workaround snap-back. A real staging
+  environment — separate compose stack, separate hostname, separate
+  Cloudflare tunnel, fed by the same image build pipeline — would
+  let us validate dep bumps, OAuth changes, and middleware edits
+  before they touch the production hostname. The smoke test already
+  accepts `STRA2US_BROWSER_HOST` / `STRA2US_DEVICE_HOST` env vars,
+  so it can target staging unchanged. Open questions: what runs on
+  staging (a separate VM, a docker network alias, a second Pi)? How
+  does staging get a real device's heartbeat for the activity-log
+  check (mirror a subset of device traffic, or a synthetic
+  HMAC-signed probe)? Until staging exists, image-tag-before-rebuild
+  is the manual workaround.
+
 - ~~**Draft a "Stra2us client implementor's guide" / spec.**~~ Landed
   2026-05-03 as [`docs/client_spec.md`](docs/client_spec.md). Covers
   wire basics, request signing, response verification, msgpack value
