@@ -15,10 +15,26 @@ app = FastAPI(title="IoT Telemetry Service")
 
 import time
 import base64
+from urllib.parse import urlencode
 from fastapi import Request, Response
+from fastapi.responses import RedirectResponse
 from core.redis_client import get_redis_client
 from core.admin_auth import verify_password, generate_session_token, verify_session_token
 from core.perf_log import DEFAULT_THRESHOLD_MS, write_perf_entry
+
+
+# Configured browser-facing hostname (the Cloudflare-tunneled path).
+# A request whose Host matches this hostname AND whose session is
+# missing gets a 302 to /oauth/google/login. Anything else (the
+# device hostname, an unknown Host header, a raw-IP probe) falls
+# through to the htpasswd challenge — fail-closed default that
+# preserves the iot.stra2us... rescue path. See
+# fr_v15_incremental.md Phase 4.
+BROWSER_HOST = os.environ.get("STRA2US_BROWSER_HOST", "stra2us.austindavid.com")
+
+
+def _is_browser_host(request: Request) -> bool:
+    return request.url.hostname == BROWSER_HOST
 
 
 def _path_needs_admin_auth(path: str) -> bool:
@@ -78,7 +94,20 @@ async def admin_auth_middleware(request: Request, call_next):
             except Exception:
                 pass # Fall through to 401
 
-        # Not authenticated
+        # Not authenticated. Two paths:
+        #   - Browser host + OAuth enabled → 302 to /oauth/google/login
+        #     with the originally-requested URL preserved as ?next=.
+        #   - Anything else → htpasswd challenge (today's behavior;
+        #     preserves the iot.stra2us...:8153 rescue path and
+        #     fails closed for unexpected Host headers).
+        if _is_browser_host(request) and oauth_config.is_enabled():
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return RedirectResponse(
+                url=f"/oauth/google/login?{urlencode({'next': target})}",
+                status_code=302,
+            )
         return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Admin Area"'})
 
     return await call_next(request)

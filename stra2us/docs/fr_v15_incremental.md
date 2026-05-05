@@ -97,7 +97,8 @@ browser path.**
 | 2 | Add OAuth code, dormant behind feature flag | **Done** |
 | 3 | Flag on, operator self-test of OAuth round-trip | **Done** |
 | 4 | Hostname-aware middleware redirects browser → OAuth | **Not started** (next) |
-| 5 | Provisioning UI for granting access | TBD |
+| 4.5 | Build staging environment | TBD (gates Phase 5+) |
+| 5 | Provisioning UI for granting access | TBD (requires staging) |
 | 6 | Migrate operator off htpasswd; narrow to RESCUE_USERS | TBD |
 | 7 | Optional cleanup of legacy browser access | TBD |
 
@@ -270,7 +271,38 @@ Steps:
 Rollback: revert the middleware change, redeploy. Feature flag
 unaffected; OAuth routes still callable directly.
 
-## Phase 5 — Provisioning UI (TBD)
+## Phase 4.5 — Build staging environment (gates Phase 5+)
+
+Goal: a separate compose stack on a separate hostname with its own
+Cloudflare tunnel, fed by the same image build pipeline, so that
+Phase 5 onward can be validated end-to-end before touching production.
+
+Phase 4 is small enough (a middleware diff plus a smoke-test
+addition) that the existing smoke test plus a UI eyeball is adequate
+verification. Phase 5 (provisioning UI) and Phase 6 (operator
+migration off htpasswd) have larger surface area — admin forms,
+error states, ACL JSON shapes, the rescue-path migration — and
+warrant pre-prod validation.
+
+Implementation tracker is in [`TODO.md`](../TODO.md) (top of the
+Near-term list). Open questions captured there: where staging runs,
+how staging gets device-heartbeat coverage for the smoke test's hard
+checkpoint.
+
+Out-clause: if Phase 4 verification turns up anything non-obvious
+(smoke test catches a regression, UI eyeball reveals layout issues),
+staging gets promoted from "before Phase 5" to non-negotiable —
+nothing further ships through prod-only validation. Until then,
+Phase 4 ships directly with smoke test + UI eyeball as the
+checkpoint.
+
+The smoke test already accepts `STRA2US_BROWSER_HOST` and
+`STRA2US_DEVICE_HOST` env vars — once staging is up, the same script
+runs against it unchanged. That's the minimum CI-shaped contract:
+green smoke against staging is required before any phase ships to
+prod.
+
+## Phase 5 — Provisioning UI (TBD — requires staging from Phase 4.5)
 
 Goal: replace the `redis-cli SET` step with a form. Eliminates the
 ACL-shape footgun.

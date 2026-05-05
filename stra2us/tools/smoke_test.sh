@@ -119,20 +119,24 @@ code=$(http_code "${DEVICE_BASE}/health")
 [[ "$code" == "200" ]] && report "device /health"   ok   "200" || report "device /health"   fail "got $code"
 
 echo
-echo "[admin auth — both hostnames should challenge htpasswd today]"
-res=$(http_status_header "www-authenticate" "${BROWSER_BASE}/admin/")
-code="${res%%|*}"; auth="${res##*|}"
-if [[ "$code" == "401" && "$auth" == Basic* ]]; then
-    report "browser /admin/ → 401 Basic" ok "$auth"
+echo "[admin auth — browser host redirects to OAuth, device host htpasswd (rescue)]"
+# Browser host: no cookie → 302 to /oauth/google/login (Phase 4).
+# We don't follow the redirect; we just verify it points where it should.
+res=$(http_status_header "location" "${BROWSER_BASE}/admin/")
+code="${res%%|*}"; loc="${res##*|}"
+if [[ "$code" == "302" && "$loc" == */oauth/google/login* ]]; then
+    report "browser /admin/ → 302 OAuth" ok "${loc:0:70}"
 else
-    report "browser /admin/ → 401 Basic" fail "code=$code auth='$auth'"
+    report "browser /admin/ → 302 OAuth" fail "code=$code loc='$loc'"
 fi
+# Device host: still htpasswd. This is the rescue path — it must NOT
+# break when the browser-host OAuth redirect is in effect.
 res=$(http_status_header "www-authenticate" "${DEVICE_BASE}/admin/")
 code="${res%%|*}"; auth="${res##*|}"
 if [[ "$code" == "401" && "$auth" == Basic* ]]; then
-    report "device /admin/ → 401 Basic"  ok "$auth"
+    report "device /admin/ → 401 Basic (rescue)" ok "$auth"
 else
-    report "device /admin/ → 401 Basic"  fail "code=$code auth='$auth'"
+    report "device /admin/ → 401 Basic (rescue)" fail "code=$code auth='$auth'"
 fi
 
 echo

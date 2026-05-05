@@ -13,7 +13,7 @@ staging without disturbing the live auth path.
 
 import json
 import os
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from core import oauth
@@ -40,9 +40,18 @@ def _cookie_secure() -> bool:
 
 
 @router.get("/oauth/google/login", include_in_schema=False)
-async def oauth_login(request: Request):
+async def oauth_login(
+    request: Request,
+    next_: str = Query("", alias="next"),
+):
     """Kick off the OAuth round-trip. Generates a fresh state token,
     stashes it in a cookie, redirects to Google's authorize URL.
+
+    The optional `next` query param carries the originally-requested
+    URL when the middleware bounces an unauthenticated browser here
+    (Phase 4). Stored in the `oauth_redirect_to` cookie; the callback
+    reads it and redirects there post-login (or /admin/ if absent or
+    malformed). Same-origin only — must start with a single `/`.
 
     Idempotent — calling repeatedly issues new state tokens and
     overwrites the cookie. This is fine; the only consequence is the
@@ -60,10 +69,6 @@ async def oauth_login(request: Request):
     state = oauth.generate_state_token()
     auth_url = oauth.build_authorize_url(state)
 
-    # Preserve the original target URL across the round-trip — the
-    # middleware (Phase 2) will set `oauth_redirect_to` before
-    # redirecting here, but for direct navigation in Phase 1 we
-    # default to /admin/ as a sane post-auth landing.
     response = RedirectResponse(url=auth_url, status_code=302)
     response.set_cookie(
         key=oauth.COOKIE_OAUTH_STATE,
@@ -75,6 +80,20 @@ async def oauth_login(request: Request):
                          # cross-origin Google → callback redirect
         path=COOKIE_PATH,
     )
+    # Stash `next` for the callback. Only honor same-origin paths:
+    # must start with `/` AND not `//` (protocol-relative URLs like
+    # `//evil.example/...` would let an attacker redirect off-origin
+    # post-login, an OAuth-callback open-redirect footgun).
+    if next_ and next_.startswith("/") and not next_.startswith("//"):
+        response.set_cookie(
+            key=oauth.COOKIE_OAUTH_REDIRECT_TO,
+            value=next_,
+            max_age=oauth.OAUTH_TEMP_COOKIE_TTL_SECONDS,
+            httponly=True,
+            secure=_cookie_secure(),
+            samesite="lax",
+            path=COOKIE_PATH,
+        )
     return response
 
 

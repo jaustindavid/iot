@@ -65,8 +65,12 @@ edits, topology changes, recovery work.
    move together, never independently.
 
 9. **Don't skip checkpoints.** A change is done when its checkpoint
-   passes — which means the smoke test passes. "It probably works"
-   and "looks fine to me" are not checkpoints.
+   passes — which means the smoke test is green AND, for any change
+   that touches human-facing UI, a deliberate end-to-end walk-through
+   in a real browser (sign in, navigate to the affected pages,
+   exercise the changed flow). Automated tests can't see layout,
+   shape, or "does this still feel right" — eyeballs do. "It probably
+   works" and "I glanced at it" are not checkpoints.
 
 See [`docs/fr_v15_incremental.md`](docs/fr_v15_incremental.md) for
 the v1.5 rollout that made these rules concrete.
