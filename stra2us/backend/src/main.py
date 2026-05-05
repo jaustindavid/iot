@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes_device import router as device_router
 from api.routes_admin import router as admin_router
 from api.routes_app import router as app_router
+from api.routes_oauth import router as oauth_router
+from core import oauth as oauth_config
 
 app = FastAPI(title="IoT Telemetry Service")
 
@@ -28,6 +30,10 @@ def _path_needs_admin_auth(path: str) -> bool:
     endpoint stay public — a customer needs to be able to reach them
     BEFORE knowing their device URL or having a login.
     """
+    if path.startswith("/oauth/"):
+        return False  # OAuth login/callback/unauthorized must be reachable
+                      # without a session — that's their whole purpose.
+                      # See fr_v15_auth.md.
     if path.startswith("/admin") or path.startswith("/api/admin"):
         return True
     if path == "/app" or path == "/app/":
@@ -211,6 +217,18 @@ app.mount("/app/_static", StaticFiles(directory=APP_STATIC_DIR), name="app-stati
 # `/api/app/...`) so the route handlers' paths read naturally and
 # the auth middleware's path-matching logic stays in one place.
 app.include_router(app_router, tags=["app"])
+
+# Google OAuth routes (Phase 1 of v1.5 — see fr_v15_auth.md).
+# Feature-flagged: routes ALWAYS register so they can return a clear
+# 503 when called with the flag off (better than 404 + confusion). The
+# routes themselves check `oauth.is_enabled()` and 503 internally.
+# When the operator opts in via STRA2US_GOOGLE_OAUTH_ENABLED=1 + sets
+# the client_id/secret/redirect_uri env vars, the flow becomes live.
+# Phase 2 will plumb the redirect-from-no-cookie path into the auth
+# middleware; Phase 1 ships only direct navigation to /oauth/google/login
+# so the flow can be exercised on staging without disturbing the live
+# auth path.
+app.include_router(oauth_router, tags=["oauth"])
 
 # Mount Firmware OTA directory. Default /firmware matches the Docker
 # volume mount in docker-compose.yml; override with STRA2US_FIRMWARE_DIR

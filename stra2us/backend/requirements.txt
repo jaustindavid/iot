@@ -5,3 +5,8 @@ msgpack>=1.0.5
 pydantic>=2.0.0
 pytest>=7.0.0
 httpx>=0.24.0
+# Google OAuth (v1.5 — see fr_v15_auth.md). google-auth validates
+# ID tokens against Google's JWKS; requests is the transitive dep
+# the token-exchange call uses.
+google-auth>=2.0.0
+requests>=2.28.0

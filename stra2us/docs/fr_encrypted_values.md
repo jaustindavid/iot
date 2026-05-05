@@ -34,11 +34,13 @@ procyon rescue WiFi flow.*
   primitive, `lastResponseTimestamp()` accessor, and a
   `decryptKVResponseIfEncrypted` convenience helper that detects the
   full ext family (fixext1..16, ext8/16/32) with type 0x21, decrypts
-  in place, and updates the caller's length. Future device ports start
-  here instead of copying from critterchron's HAL. **Not yet
-  compile-validated against Particle/ESP32 toolchains** — code
-  mirrors the working critterchron HAL line-for-line but a real build
-  on either platform is still a follow-up.
+  in place, and updates the caller's length. **Illustrative reference
+  code for future device ports** — mirrors critterchron's HAL
+  line-for-line but is not itself compile-tested or production-
+  deployed. The canonical production-validated implementation lives
+  in critterchron's HAL (linked above). A 4th-platform port should
+  start here, run the cross-language test vectors below as a
+  smoke-check on its toolchain, then verify against a real device.
 - Test coverage: 7 unit tests pin the cipher wire format including a
   cross-impl agreement check (server's `kvenc_xor` byte-for-byte equal
   to CLI's `_kvenc_xor`); 5 live-server integration tests cover
@@ -47,16 +49,6 @@ procyon rescue WiFi flow.*
   live tests cover the `KVPayload.encrypted` flag (set/clear/demote/
   Pydantic-default/delete-clears-sidecar). All 53 pass against a real
   uvicorn instance.
-
-**Not yet covered (small, non-blocking):**
-- Reference SDK compile-check on Particle and ESP32 toolchains.
-- ESP32 device-side end-to-end verification of the *critterchron* HAL
-  (cipher is mirrored from Particle byte-for-byte and built clean on
-  timmy/ESP32-C3, but the full procyon-rescue cycle hasn't been
-  replayed there yet — it should Just Work).
-- Cross-language test vectors in this doc — fixed `(secret, nonce,
-  plaintext) → ciphertext` triples generated from the Python impl,
-  for any future port to drop into a unit test before going live.
 
 **Cross-language test vectors:**
 

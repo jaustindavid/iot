@@ -176,13 +176,25 @@ The server route handler:
    takes over, reading `window.location.pathname` to discover its
    own (app, device) and fetching from the existing admin APIs.
 
-**Bare-URL landing form.** A customer who lost their bookmark or got
-their device name written on a sticker but doesn't know the URL
-pattern hits `/app/` and sees a single-input form: "Enter your device
-name." Submit → the server looks up which app contains that device →
-302 to `/app/<app>/<device>/`. Auth happens at the destination via
-the same flow as a direct visit (basic auth prompt or existing
-session cookie).
+**Bare-URL landing form.** *Deprecated by v1.5 — see
+[fr_v15_auth.md](fr_v15_auth.md). Kept here for historical
+reference; the `landing.html` page, the form's JS handler, and
+the `/api/app/lookup_device` endpoint are scheduled for removal
+in v1.5 Phase 7.* Original v1 design: a customer who lost their
+bookmark or got their device name written on a sticker but
+doesn't know the URL pattern hits `/app/` and sees a single-
+input form: "Enter your device name." Submit → the server looks
+up which app contains that device → 302 to `/app/<app>/<device>/`.
+Auth happens at the destination via the same flow as a direct
+visit (basic auth prompt or existing session cookie).
+
+**Why v1.5 removes it:** Google sign-in dissolves the chicken-
+and-egg the form was solving. With universal sign-in, a customer
+who hits `/app/` (no session) gets redirected to Google, signs
+in, and lands on a device-list page derived from their ACL — no
+need to "look up" their device by name. The lookup form's
+enumeration risk (which Turnstile was added to mitigate) goes
+away as a bonus.
 
 Lookup mechanism for v1: scan `kv:*/<device>/*` on each form submit
 to find the app. Single Redis call, no schema work. The form is
