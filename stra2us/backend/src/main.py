@@ -34,7 +34,17 @@ BROWSER_HOST = os.environ.get("STRA2US_BROWSER_HOST", "stra2us.austindavid.com")
 
 
 def _is_browser_host(request: Request) -> bool:
-    return request.url.hostname == BROWSER_HOST
+    # Behind the Cloudflare tunnel, request.url.hostname is the
+    # internal docker service name (e.g. "stra2us-iot") because
+    # cloudflared rewrites the Host header to the configured
+    # upstream service URL. The original public hostname survives
+    # in X-Forwarded-Host. Prefer that when present; fall back to
+    # request.url.hostname for direct (non-tunneled) access. Take
+    # only the first comma-separated value — the header can carry
+    # a list when multiple proxies are in path.
+    fwd = request.headers.get("x-forwarded-host", "")
+    host = fwd.split(",")[0].strip() if fwd else request.url.hostname
+    return host == BROWSER_HOST
 
 
 def _path_needs_admin_auth(path: str) -> bool:
