@@ -4,6 +4,38 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Re-homogenize the staging fleet to all-C3 once SuperMinis arrive.**
+  Current staging fleet is `timmy_tanuki` (C3), `tommy_tanuki` (C6),
+  `tammy_tanuki` (C6). The mixed chip class actively works against
+  FAILURE_TRIAGE.md §4's premise — C3 and C6 have different baselines
+  for chip-class-sensitive metrics (`mem`, `phys_*`, `rend_*`), so
+  fleet-MAD detection on those metrics is noise. Closed §4 with the
+  `cheap` workaround: dropped `phys_max_us` from `fleet_rules` and
+  added an absolute threshold rule instead (analyzer.yaml). When the
+  C3 SuperMinis (~$2 each) land:
+
+  1. Provision two new client_ids on staging Stra2us (e.g.
+     `tucker_tanuki`, `truman_tanuki`); add device headers under
+     `hal/devices/` mirroring `timmy_tanuki.h`.
+  2. Flash via `hal/esp32c3/Makefile` (`make DEVICE=<name> swarm
+     flash-usb PORT=...`).
+  3. Retire `tommy_tanuki` + `tammy_tanuki` from the fleet — they're
+     proof the cross-chip-class HAL works, not active fleet members.
+     Either power them off or leave them running on a different
+     `STRA2US_CLIENT_ID` so they don't confuse fleet stats. (Easiest:
+     change DEVICES list in `tools/fleet_reflash.sh` and let them
+     stay on whatever firmware they last got, isolated from the
+     reset cycle.)
+  4. Restore the `phys_max_us` fleet rule in `analyzer.yaml` (remove
+     the threshold rule, re-add the MAD rule).
+  5. Tune `mad_multiplier` and `freshness_seconds` from the now-tight
+     same-chip cluster.
+
+  Background: see the C3 vs C6 vs S3 discussion in
+  FAILURE_TRIAGE.md notes — for critterchron's modest workload, C3
+  is the right answer on cost, RMT-without-DMA-workaround, and
+  fleet-uniformity grounds.
+
 - **Network latency observability — heartbeat stats + optional on-device
   graph.** Two layered features sharing the same instrumentation. The
   goal is *deviation from norm* detection, not absolute network

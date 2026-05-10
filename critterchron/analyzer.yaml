@@ -26,18 +26,23 @@ threshold_rules:
     name: wifi_marginal
     auto_dump: false
 
+  # Replaces the former phys_max_us fleet rule. Mixed-chip-class fleet
+  # (C3 + C6) has different per-chip baselines for timing metrics, so
+  # MAD across all of them is noise. Absolute ceiling is chip-agnostic:
+  # 100000us = 80% of the default 125ms physics budget. Re-tune (or
+  # restore the fleet rule) once the fleet is homogenized — see TODO.md.
+  - metric: phys_max_us
+    op: ">"
+    value: 100000
+    name: phys_budget_saturated
+    auto_dump: false
+
 fleet_rules:
   - metric: seeks_fail
     mad_multiplier: 6.0
     min_devices: 3
     freshness_seconds: 300
     auto_dump: true
-
-  - metric: phys_max_us
-    mad_multiplier: 5.0
-    min_devices: 3
-    freshness_seconds: 300
-    auto_dump: false
 
 sinks:
   - type: log
