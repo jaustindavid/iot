@@ -232,6 +232,20 @@ publish: $(FIRMWARE_BIN)
 	$(PYTHON) $(REPO_ROOT)/tools/publish_fw.py $(FIRMWARE_BIN) \
 		--target $(PLATFORM) \
 		$(if $(FORCE),--force,)
+	@echo
+	@echo "  NOTE: this stages a PLATFORM blob (target=$(PLATFORM)),"
+	@echo "        not a device-specific firmware. No device pulls it"
+	@echo "        until you point one at this target:"
+	@echo
+	@echo "          stra2us set $(DEVICE) fw_target $(PLATFORM)"
+	@echo
+	@echo "        Per-device only on heterogeneous fleets — never"
+	@echo "        \`stra2us set --app fw_target $(PLATFORM)\` while"
+	@echo "        non-$(PLATFORM) devices share the app scope (a c6"
+	@echo "        flashing a c3 image crashloops to USB recovery)."
+	@echo "        Pull happens on next fw_poll cycle (default 1 day);"
+	@echo "        reboot the device to force-pull, or temporarily"
+	@echo "        shorten fw_poll_interval to e.g. 60."
 
 # --- Source assembly ---
 assemble: $(ENGINE_COPIES) $(ESP32_COPIES)
