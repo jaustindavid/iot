@@ -111,6 +111,45 @@ class S2sClient:
             raise Stra2usError(f"GET {key} → {r.status_code}: {r.text[:200]}")
         return msgpack.unpackb(r.content, raw=False)
 
+    # ----- queue API -----
+
+    @staticmethod
+    def _q_uri(topic: str, envelope: bool) -> str:
+        path = "/q/" + "/".join(quote(p, safe="") for p in topic.split("/"))
+        return path + ("?envelope=true" if envelope else "")
+
+    def consume(self, topic: str, envelope: bool = True):
+        """GET /q/<topic>. Returns the next message or None when the queue
+        is empty (HTTP 204).
+
+        With envelope=True (default), returns a dict
+        ``{"data": <decoded>, "client_id": <publisher>, "received_at": <unix>}``.
+        With envelope=False, returns the raw decoded payload.
+
+        Cursors are tracked server-side per client_id, so a dedicated
+        analyzer client reads its own progression through the stream
+        without disturbing other consumers.
+
+        Note: the signing payload uses the URI without the query string,
+        per the device-side convention. The query is added back when
+        sending the request."""
+        base_uri = "/q/" + "/".join(quote(p, safe="") for p in topic.split("/"))
+        ts = int(time.time())
+        sig = self._sign(base_uri, b"", ts)
+        url = self.base_url + base_uri + ("?envelope=true" if envelope else "")
+        headers = {
+            "X-Client-ID": self.client_id,
+            "X-Timestamp": str(ts),
+            "X-Signature": sig,
+        }
+        r = requests.get(url, headers=headers, timeout=self.timeout)
+        if r.status_code == 204:
+            return None
+        if not (200 <= r.status_code < 300):
+            raise Stra2usError(f"GET {topic} → {r.status_code}: {r.text[:200]}")
+        self._verify_resp(base_uri, r.content, r.headers)
+        return msgpack.unpackb(r.content, raw=False)
+
 
 # ----- credential lookup -----
 

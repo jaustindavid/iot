@@ -337,6 +337,7 @@ vars:
     type: string
     scope: [app, device]
     encrypted: true   # MUST be set with `stra2us set ... --encrypted`
+    widget: secret
     help: |
       Password for the WiFi network named in `wifi_ssid`.
 
