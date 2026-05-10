@@ -27,11 +27,12 @@ import re
 from typing import Any
 
 
-# Triple/pair extraction. `us` suffix optional (timing fields use it).
+# Triple/pair extraction. Trailing unit suffix optional — accept any
+# lowercase letters: `us` (timing fields), `s` (wobble), `ms`, etc.
 _TRIPLE_RE = re.compile(
-    r"^\((-?\d+)<(-?\d+)<(-?\d+)(?:\s+(\S+))?\)(?:us)?$"
+    r"^\((-?\d+)<(-?\d+)<(-?\d+)(?:\s+(\S+))?\)[a-z]*$"
 )
-_PAIR_RE = re.compile(r"^\((-?\d+)<(-?\d+)\)(?:us)?$")
+_PAIR_RE = re.compile(r"^\((-?\d+)<(-?\d+)\)[a-z]*$")
 
 
 def _try_int(s: str) -> Any:
@@ -129,6 +130,12 @@ def _assign(out: dict, key: str, value: str) -> None:
             out["light_cal_bright"] = a
             out["light_raw"] = b
             out["light_cal_dark"] = c
+        elif key == "wobble":
+            # `wobble=(min<cur<max)s`. Center value is the diagnostic;
+            # bounds are the configured knobs.
+            out["wobble_min"] = a
+            out["wobble"] = b
+            out["wobble_max"] = c
         else:
             # Unknown triple — preserve as a tuple under the key so
             # operators can still see it without the parser growing

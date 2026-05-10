@@ -36,6 +36,24 @@ public:
     bool   valid()             const override { return inner_.valid(); }
     float  zone_offset_hours() const override { return inner_.zone_offset_hours(); }
 
+    // Heartbeat diagnostic — emit `wobble=(min<cur<max)s` per the
+    // existing `(a<b<c)` triple convention. Print in literal
+    // min<cur<max position WITHOUT sorting: when the algorithm is
+    // healthy the `<` ordering holds; if the current offset somehow
+    // falls outside [min,max] the symbols visually break
+    // (e.g. `(120<-30<300)`), making the bug obvious at a glance.
+    // Same idea as `bri=(min<cur<max)`.
+    //
+    // Reads `virt_epoch_s_` un-locked. Mirror of the ESP32 accessors;
+    // see that header for the full thread-safety rationale.
+    int wobble_min_s() const { return cfg_.get_int("wobble_min_seconds", 120); }
+    int wobble_max_s() const { return cfg_.get_int("wobble_max_seconds", 300); }
+    int wobble_offset_s() const {
+        if (!init_ || !inner_.valid()) return 0;
+        return (int)(virt_epoch_s_ - (double)inner_.wall_now());
+    }
+
+
     time_t wall_now() const override {
         if (!inner_.valid()) return 0;
         time_t real_now = inner_.wall_now();

@@ -638,6 +638,23 @@ static int telemetry_cycle() {
         (unsigned long)m.failed_seeks);
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
 
+    // WobblyTime diagnostic — `wobble=(min<cur<max)s`. See WobblyTimeSource.h
+    // for why the order is fixed (not sorted): a healthy run satisfies
+    // `min < cur < max`; a bug manifests as a visually broken `<` chain.
+    // Prints `cur=0` while the underlying clock is pre-sync (init_ false).
+    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " wobble=(%d<%d<%d)s",
+                             g_clock.wobble_min_s(),
+                             g_clock.wobble_offset_s(),
+                             g_clock.wobble_max_s());
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+        } else {
+            report[sizeof(report) - 1] = '\0';
+        }
+    }
+
 #if defined(LIGHT_SENSOR_TYPE)
     // Calibration diagnostic. `bri=(min<cur<max)` above only shows the
     // *output* of the sensor-mapping pipeline; when bri goes pathological

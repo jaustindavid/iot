@@ -41,6 +41,26 @@ public:
     bool   valid()             const override { return inner_.valid(); }
     float  zone_offset_hours() const override { return inner_.zone_offset_hours(); }
 
+    // Heartbeat diagnostic — emit `wobble=(min<cur<max)s` per the
+    // existing `(a<b<c)` triple convention. Caller is expected to
+    // print these in literal min<cur<max position WITHOUT sorting:
+    // when the algorithm is healthy the `<` ordering holds; if the
+    // current offset somehow falls outside [min,max] the symbols
+    // visually break (e.g. `(120<-30<300)`), making the bug obvious
+    // at a glance. Same idea as `bri=(min<cur<max)`.
+    //
+    // Reads `virt_epoch_s_` un-locked. Engine thread updates it on
+    // every wall_now() call, so this can return a value off by one
+    // tick of drift; for a heartbeat snprintf that's noise. No double
+    // alignment guarantees on 32-bit platforms either, but a torn
+    // read produces a plausible-looking offset, not a crash.
+    int wobble_min_s() const { return cfg_.get_int("wobble_min_seconds", 120); }
+    int wobble_max_s() const { return cfg_.get_int("wobble_max_seconds", 300); }
+    int wobble_offset_s() const {
+        if (!init_ || !inner_.valid()) return 0;
+        return (int)(virt_epoch_s_ - (double)inner_.wall_now());
+    }
+
     time_t wall_now() const override {
         if (!inner_.valid()) return 0;
         time_t real_now = inner_.wall_now();

@@ -106,6 +106,26 @@ def test_parser_with_light():
           == (100, 2000, 3500))
 
 
+def test_parser_with_wobble():
+    line = "up=100 wobble=(120<248<300)s agents=5"
+    p = parse_heartbeat(line)
+    check("parser: wobble triple",
+          (p.get("wobble_min"), p.get("wobble"), p.get("wobble_max"))
+          == (120, 248, 300))
+
+
+def test_parser_wobble_negative_current():
+    # The diagnostic case: bug pushes current outside [min, max].
+    # The `<` chain in the source string is visually broken (-300 < 120
+    # numerically), but the parser must still extract all three values
+    # so analyzer detection can fire.
+    line = "wobble=(120<-300<300)s"
+    p = parse_heartbeat(line)
+    check("parser: wobble with out-of-range current",
+          (p.get("wobble_min"), p.get("wobble"), p.get("wobble_max"))
+          == (120, -300, 300))
+
+
 def test_parser_err_consumes_rest():
     line = "agents=5 seeks_fail=2 err=Net:tcp connect failed after 3 retries"
     p = parse_heartbeat(line)
@@ -407,6 +427,8 @@ ALL_TESTS = [
     test_parser_with_sched,
     test_parser_with_sched_err,
     test_parser_with_light,
+    test_parser_with_wobble,
+    test_parser_wobble_negative_current,
     test_parser_err_consumes_rest,
     test_parser_empty,
     test_numeric_metrics,

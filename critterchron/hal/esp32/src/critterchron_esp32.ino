@@ -944,6 +944,23 @@ static int telemetry_cycle() {
 #endif
     if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
 
+    // WobblyTime diagnostic — `wobble=(min<cur<max)s`. Mirror of the
+    // Particle heartbeat hook. Order is fixed (not sorted): healthy
+    // runs satisfy `min < cur < max`; the `<` chain visually breaks
+    // when the wobble algorithm misbehaves.
+    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " wobble=(%d<%d<%d)s",
+                             g_clock.wobble_min_s(),
+                             g_clock.wobble_offset_s(),
+                             g_clock.wobble_max_s());
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+        } else {
+            report[sizeof(report) - 1] = '\0';
+        }
+    }
+
     // Error-channel drain. One entry per heartbeat (ring is 4 deep).
     // Mirror of telemetry_cycle() in hal/particle/src/critterchron_particle.cpp;
     // mark_sent only on successful publish so a transient network failure
