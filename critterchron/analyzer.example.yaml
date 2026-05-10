@@ -1,0 +1,83 @@
+# Analyzer configuration — see tools/analyzer/__main__.py for the runner.
+#
+# Two queue topics shown: staging + prod. The same analyzer can tail
+# both because cursors are per-client_id server-side. If you want
+# different alerting for staging vs prod, run two analyzer processes
+# with different configs (and different client_ids).
+
+queues:
+  - topic: critterchron/public/heartbeep
+    label: prod
+  - topic: critterchron/staging/heartbeep
+    label: staging
+
+# How often (seconds) the runner polls each queue when it's caught up.
+# When messages are flowing, the loop drains each queue fully before
+# sleeping, so this is the "queue empty" backoff, not the throughput.
+poll_interval_seconds: 5.0
+
+storage_path: analyzer.sqlite
+
+# Keep 24 hours of metric rows for post-hoc "when did this start?"
+# queries. Pruned every 10 minutes.
+metrics_retention_seconds: 86400
+
+# ---- Detection ----------------------------------------------------
+#
+# Threshold rules: blunt absolute checks. Cheap to evaluate; useful
+# for hard floors/ceilings that don't depend on the rest of the fleet.
+threshold_rules:
+  - metric: mem
+    op: "<"
+    value: 5000
+    name: heap_low
+    auto_dump: true
+
+  - metric: rssi
+    op: "<"
+    value: -85
+    name: wifi_marginal
+    # Don't dump on every weak-signal heartbeat — log only.
+    auto_dump: false
+
+# Fleet-MAD rules: flag a device whose metric is >K MADs from the
+# fleet median. Needs `min_devices` distinct devices reporting in the
+# last `freshness_seconds` before firing.
+fleet_rules:
+  - metric: seeks_fail
+    mad_multiplier: 6.0
+    min_devices: 3
+    freshness_seconds: 300
+    auto_dump: true
+
+  - metric: phys_max_us
+    mad_multiplier: 5.0
+    min_devices: 3
+    freshness_seconds: 300
+    auto_dump: false
+
+# ---- Alert sinks --------------------------------------------------
+#
+# At minimum, log to stdout. Add a webhook for Slack/Discord/etc.
+sinks:
+  - type: log
+    level: WARNING
+
+  # Uncomment to enable a Slack incoming webhook:
+  # - type: webhook
+  #   url: https://hooks.slack.com/services/T000/B000/XXXX
+  #   slack_text: true   # wrap as {"text": "..."} for Slack
+  #   timeout: 5.0
+
+# ---- Auto-dump (closes the loop with FAILURE_TRIAGE.md §1) -------
+#
+# When an alert with `auto_dump: true` fires, the analyzer writes
+# `kv:<app>/<device>/dump_now = 1`. The device picks this up on its
+# next heartbeat cycle and ships its ring buffer (§1).
+#
+# Per-(device, rule) cooldown prevents a persistent failure mode
+# from thrashing dumps. Cooldowns reset on analyzer restart.
+auto_dump:
+  enabled: false
+  app: critterchron
+  cooldown_seconds: 600

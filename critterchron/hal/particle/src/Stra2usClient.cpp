@@ -101,7 +101,43 @@ void Stra2usClient::close() {
 
 bool Stra2usClient::ensure_connected_() {
     if (tcp_.connected()) return true;
-    return tcp_.connect(host_, port_);
+
+    // Reset per-request diag (mirror of hal/esp32/src/Stra2usClient.cpp).
+    diag_resolved_ip_[0]  = '\0';
+    diag_local_ip_   [0]  = '\0';
+    diag_local_port_      = 0;
+    diag_dns_ms_          = 0;
+    diag_connect_ms_      = 0;
+    diag_sent_bytes_      = 0;
+    diag_resp_head_len_   = 0;
+
+    // DNS resolve before connect to capture timing + result separately.
+    // WiFi.resolve returns INADDR_NONE (0.0.0.0) on failure on Particle.
+    uint32_t t0 = millis();
+    IPAddress addr = WiFi.resolve(host_);
+    diag_dns_ms_ = millis() - t0;
+    if (addr) {
+        snprintf(diag_resolved_ip_, sizeof(diag_resolved_ip_),
+                 "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+    } else {
+        strncpy(diag_resolved_ip_, "DNS_FAIL", sizeof(diag_resolved_ip_));
+        diag_resolved_ip_[sizeof(diag_resolved_ip_) - 1] = '\0';
+    }
+
+    t0 = millis();
+    bool ok = tcp_.connect(host_, port_);
+    diag_connect_ms_ = millis() - t0;
+    if (ok) {
+        // Particle's TCPClient doesn't expose localIP/localPort directly;
+        // WiFi.localIP() gives the device's IP on the active interface,
+        // which is the diagnostic info we actually want ("is this the
+        // network you think"). The ephemeral source port isn't available
+        // and stays 0 on Particle.
+        IPAddress lip = WiFi.localIP();
+        snprintf(diag_local_ip_, sizeof(diag_local_ip_),
+                 "%u.%u.%u.%u", lip[0], lip[1], lip[2], lip[3]);
+    }
+    return ok;
 }
 
 void Stra2usClient::hex_to_bytes_(const char* hex, uint8_t* out, size_t n) {
@@ -175,9 +211,14 @@ bool Stra2usClient::send_all_(const char* data, int len) {
     int sent = 0;
     while (sent < len) {
         int n = tcp_.write((const uint8_t*)(data + sent), len - sent);
-        if (n <= 0) { close(); return false; }
+        if (n <= 0) {
+            diag_sent_bytes_ = (uint32_t)sent;
+            close();
+            return false;
+        }
         sent += n;
     }
+    diag_sent_bytes_ = (uint32_t)sent;
     return true;
 }
 
@@ -215,8 +256,38 @@ int Stra2usClient::read_response_(const char* uri,
         delay(10);
     }
     if (!strstr(buf, "\r\n\r\n")) {
-        Log.warn("read_response_: header timeout total=%d", total);
-        g_errlog.record(ErrCat::OtaFetch, "rr hdr timeout total=%d", total);
+        // Capture first 16 bytes of whatever we DID receive — most embedded
+        // HTTP libs throw away "garbage before headers" silently. Mirror of
+        // hal/esp32/src/Stra2usClient.cpp.
+        diag_resp_head_len_ = total < (int)sizeof(diag_resp_head_)
+                            ? (size_t)total
+                            : sizeof(diag_resp_head_);
+        if (diag_resp_head_len_ > 0) {
+            memcpy(diag_resp_head_, buf, diag_resp_head_len_);
+        }
+        char head_hex[2 * sizeof(diag_resp_head_) + 1] = {0};
+        for (size_t i = 0; i < diag_resp_head_len_; ++i) {
+            snprintf(head_hex + i * 2, 3, "%02x", diag_resp_head_[i]);
+        }
+        uint32_t wait_ms = (uint32_t)(millis() - start);
+
+        Log.warn("read_response_: header timeout host=%s:%d ip=%s "
+                 "local=%s:%u uri=%s sent=%lu recv=%d head=%s "
+                 "phases=dns=%lums,conn=%lums,wait=%lums",
+                 host_, port_, diag_resolved_ip_,
+                 diag_local_ip_, (unsigned)diag_local_port_, uri,
+                 (unsigned long)diag_sent_bytes_, total, head_hex,
+                 (unsigned long)diag_dns_ms_,
+                 (unsigned long)diag_connect_ms_,
+                 (unsigned long)wait_ms);
+        g_errlog.record(ErrCat::OtaFetch,
+                        "rr hdr timeout %s ip=%s sent=%lu recv=%d head=%s "
+                        "dns=%lums conn=%lums wait=%lums",
+                        host_, diag_resolved_ip_,
+                        (unsigned long)diag_sent_bytes_, total, head_hex,
+                        (unsigned long)diag_dns_ms_,
+                        (unsigned long)diag_connect_ms_,
+                        (unsigned long)wait_ms);
         close(); return -1;
     }
 

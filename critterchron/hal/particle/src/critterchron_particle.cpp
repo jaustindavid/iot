@@ -1619,7 +1619,7 @@ void loop() {
     // Emit rollup. System.freeMemory() reflects heap headroom — if it keeps
     // falling monotonically we're leaking; if it oscillates we're churning.
     if ((long)(now - diag_next_ms) >= 0) {
-        diag_next_ms = now + 1000;
+        diag_next_ms = now + 10000;   // 10s rollup; was 1s, too chatty
         uint32_t free_mem = System.freeMemory();
         uint32_t phys_avg   = diag_phys_count ? (diag_phys_total   / diag_phys_count) : 0;
         uint32_t rend_avg   = diag_rend_count ? (diag_rend_total   / diag_rend_count) : 0;

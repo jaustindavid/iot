@@ -1,0 +1,52 @@
+# Live analyzer config. Started from analyzer.example.yaml; edit
+# freely as you tune. Add to .gitignore if you don't want it tracked.
+
+queues:
+  - topic: critterchron/public/heartbeep
+    label: staging
+  # Add the staging-prefix topic here once it's in use:
+  # - topic: critterchron/staging/heartbeep
+  #   label: staging-prefix
+
+poll_interval_seconds: 5.0
+
+storage_path: analyzer.sqlite
+metrics_retention_seconds: 86400
+
+threshold_rules:
+  - metric: mem
+    op: "<"
+    value: 5000
+    name: heap_low
+    auto_dump: true
+
+  - metric: rssi
+    op: "<"
+    value: -85
+    name: wifi_marginal
+    auto_dump: false
+
+fleet_rules:
+  - metric: seeks_fail
+    mad_multiplier: 6.0
+    min_devices: 3
+    freshness_seconds: 300
+    auto_dump: true
+
+  - metric: phys_max_us
+    mad_multiplier: 5.0
+    min_devices: 3
+    freshness_seconds: 300
+    auto_dump: false
+
+sinks:
+  - type: log
+    level: WARNING
+
+# §1 isn't shipped yet — leave auto_dump disabled until devices know
+# how to consume `dump_now`. Flipping it earlier just writes orphan
+# KV keys, which is harmless but noisy.
+auto_dump:
+  enabled: false
+  app: critterchron
+  cooldown_seconds: 600

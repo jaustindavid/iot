@@ -330,6 +330,19 @@ private:
     // schedule.
     char           brightness_schedule_[160] = {0};
 
+    // ---------- Per-request transport diag accumulator ----------
+    // Mirror of hal/esp32/src/Stra2usClient.h. Populated through
+    // ensure_connected_ + send_all_ + read_response_; surfaced on
+    // failure paths so the operator sees what was actually attempted.
+    mutable char     diag_resolved_ip_[16]   = {0};
+    mutable char     diag_local_ip_   [16]   = {0};
+    mutable uint16_t diag_local_port_        = 0;
+    mutable uint32_t diag_dns_ms_            = 0;
+    mutable uint32_t diag_connect_ms_        = 0;
+    mutable uint32_t diag_sent_bytes_        = 0;
+    mutable uint8_t  diag_resp_head_[16]     = {0};
+    mutable size_t   diag_resp_head_len_     = 0;
+
     // ---------- Procyon rescue: target WiFi credential buffers ----------
     // Refreshed in poll_all() with device-then-app fallback; left
     // untouched if both KV fetches fail so a transient network blip
