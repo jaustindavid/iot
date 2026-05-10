@@ -45,6 +45,12 @@ def load(path: str | Path) -> dict:
         "poll_interval_seconds": float(doc.get("poll_interval_seconds", 5.0)),
         "storage_path": doc.get("storage_path", "analyzer.sqlite"),
         "metrics_retention_seconds": int(doc.get("metrics_retention_seconds", 24 * 3600)),
+        # How long to suppress repeated emit of the same (device, rule) alert
+        # to sinks. Defaults to 60s — long enough to dedup the "rule fires
+        # every heartbeat" pattern, short enough that genuinely persistent
+        # issues still surface periodically. sqlite alert log is unaffected;
+        # every alert is still persisted for forensics.
+        "alert_dedup_seconds": int(doc.get("alert_dedup_seconds", 60)),
         "detector": detector,
         "sinks": build_sinks(doc.get("sinks") or [{"type": "log"}]),
         "auto_dump": doc.get("auto_dump") or {},  # {enabled, cooldown_seconds}

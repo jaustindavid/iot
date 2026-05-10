@@ -24,6 +24,7 @@
 #include "creds.h"
 #include "CritterEngine.h"
 #include "ErrLog.h"
+#include "SnapshotBuffer.h"
 #include "interface/Config.h"
 #include "LightSensor.h"
 #include "NeoPixelSink.h"
@@ -46,6 +47,29 @@ SYSTEM_THREAD(ENABLED);
 // in their per-device header before this file is included.
 #ifndef STRA2US_TELEMETRY_TOPIC
 #define STRA2US_TELEMETRY_TOPIC STRA2US_APP "/public/heartbeep"
+#endif
+
+// Snapshot publish topic (FAILURE_TRIAGE.md §1) — sibling of heartbeep.
+#ifndef STRA2US_SNAPSHOT_TOPIC
+#define STRA2US_SNAPSHOT_TOPIC STRA2US_APP "/public/snapshots"
+#endif
+
+// Per-device trace topic (FAILURE_TRIAGE.md §2). Out of /public/ —
+// trace is hands-on debug, not customer-aggregate.
+#ifndef STRA2US_TRACE_TOPIC
+#define STRA2US_TRACE_TOPIC STRA2US_APP "/trace/" DEVICE_NAME
+#endif
+
+// Per-device default for the runtime ring depth. 0 = feature dormant
+// even if compiled in. Staging device headers override; OG Photon
+// (rico_raccoon.h) defines NO_SNAPSHOT_BUFFER instead, eliding the
+// feature at compile time entirely.
+#ifndef SNAPSHOT_BUFFER_FRAMES_DEFAULT
+#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 0
+#endif
+
+#ifndef SNAPSHOT_PUBLISH_BUF_BYTES
+#define SNAPSHOT_PUBLISH_BUF_BYTES 4096
 #endif
 
 #if !defined(GRID_WIDTH) || !defined(GRID_HEIGHT)
@@ -830,6 +854,17 @@ static void telemetry_worker() {
     (void)g_cfg.get_int("night_enter_brightness",  NIGHT_ENTER_BRIGHTNESS);
     (void)g_cfg.get_int("night_exit_brightness",   NIGHT_EXIT_BRIGHTNESS);
     (void)g_cfg.get_int("latency_display",         0);
+#ifndef NO_SNAPSHOT_BUFFER
+    // FAILURE_TRIAGE.md §1 KV pre-registers — same rationale as the
+    // block above. Compile-elided on rico_raccoon (NO_SNAPSHOT_BUFFER)
+    // so this device class doesn't carry the cache cost.
+    (void)g_cfg.get_int("snapshot_buffer_frames",  SNAPSHOT_BUFFER_FRAMES_DEFAULT);
+    (void)g_cfg.get_int("dump_now",                0);
+    (void)g_cfg.get_int("snapshot_seeks_spike",    5);
+    (void)g_cfg.get_int("snapshot_heap_low",       5000);
+    (void)g_cfg.get_int("snapshot_agent_drop_pct", 50);
+    (void)g_cfg.get_int("trace_mode",              0);
+#endif
 
     Log.info("tel heap: after key pre-register, free=%lu",
              (unsigned long)System.freeMemory());
@@ -973,6 +1008,70 @@ static void telemetry_worker() {
         last_attempt_ms = now;
         first = false;
         int status = telemetry_cycle();
+
+#ifndef NO_SNAPSHOT_BUFFER
+        // FAILURE_TRIAGE.md §1: snapshot config + dump path. Mirror of
+        // the ESP32 hook in critterchron_esp32.ino — runs after
+        // telemetry_cycle so this iteration's poll_all has refreshed
+        // dump_now/snapshot_buffer_frames/etc. before we act.
+        critterchron::snapshot::configure(
+            (uint16_t)g_cfg.get_int("snapshot_buffer_frames",
+                                    SNAPSHOT_BUFFER_FRAMES_DEFAULT));
+        critterchron::snapshot::set_thresholds(
+            g_cfg.get_int("snapshot_seeks_spike",     5),
+            g_cfg.get_int("snapshot_heap_low",        5000),
+            g_cfg.get_int("snapshot_agent_drop_pct",  50));
+        critterchron::snapshot::check_dump_now_kv(
+            g_cfg.get_int("dump_now", 0));
+
+        // FAILURE_TRIAGE.md §2: continuous trace mode. See ESP32 mirror
+        // for design notes; same shape here. Operator must set with TTL
+        // via tools/trace_on.py.
+        {
+            int trace_period_s = g_cfg.get_int("trace_mode", 0);
+            static unsigned long s_last_trace_pub_ms = 0;
+            if (trace_period_s > 0) {
+                unsigned long period_ms = (unsigned long)trace_period_s * 1000UL;
+                if (s_last_trace_pub_ms == 0 ||
+                    now - s_last_trace_pub_ms >= period_ms) {
+                    critterchron::snapshot::force_dump(
+                        critterchron::snapshot::trigger_name::TRACE, "");
+                    s_last_trace_pub_ms = now;
+                }
+            } else {
+                s_last_trace_pub_ms = 0;
+            }
+        }
+
+        if (critterchron::snapshot::dump_pending()) {
+            // Static buffer, not stack — see the boot_light comment
+            // below re: tel-thread stack pressure on the Photon 2.
+            static char snap_buf[SNAPSHOT_PUBLISH_BUF_BYTES];
+            uint32_t now_unix = (uint32_t)Time.now();
+            size_t n = critterchron::snapshot::encode(
+                snap_buf, sizeof(snap_buf), DEVICE_NAME, now_unix);
+            const char* trig = critterchron::snapshot::pending_trigger();
+            const bool is_trace =
+                (strcmp(trig, critterchron::snapshot::trigger_name::TRACE) == 0);
+            const char* topic = is_trace
+                ? STRA2US_TRACE_TOPIC
+                : STRA2US_SNAPSHOT_TOPIC;
+            if (n > 0) {
+                g_cfg.connect();
+                int pub = g_cfg.publish(topic, snap_buf);
+                g_cfg.close();
+                Log.info("snap publish=%d bytes=%u trigger=%s",
+                         pub, (unsigned)n, trig);
+                if (pub >= 200 && pub < 300) {
+                    critterchron::snapshot::clear_pending();
+                } else {
+                    critterchron::g_errlog.record(
+                        critterchron::ErrCat::Net,
+                        "snap publish=%d", pub);
+                }
+            }
+        }
+#endif  // !NO_SNAPSHOT_BUFFER
 
 #if defined(LIGHT_SENSOR_TYPE)
         // OOB boot-light diagnostic. One-shot per boot, fires once the main
@@ -1562,6 +1661,19 @@ void loop() {
             if (interp_dt > diag_interp_max) diag_interp_max = interp_dt;
             diag_astar_total  += astar_dt;
             if (astar_dt > diag_astar_max) diag_astar_max = astar_dt;
+
+            // FAILURE_TRIAGE.md §1: ring-buffer frame per physics tick.
+            // No-op when feature dormant (frames=0) or compile-elided
+            // (NO_SNAPSHOT_BUFFER on rico_raccoon).
+            static uint32_t s_phys_tick_counter = 0;
+            ++s_phys_tick_counter;
+            critterchron::snapshot::append(
+                s_phys_tick_counter, now,
+                (uint16_t)g_engine.liveAgentCount(),
+                (uint32_t)System.freeMemory(),
+                (uint32_t)g_engine.metrics().failed_seeks,
+                /*phys_us=*/ dt,
+                /*rend_us=*/ 0);
         }
     }
 

@@ -13,6 +13,11 @@ poll_interval_seconds: 5.0
 storage_path: analyzer.sqlite
 metrics_retention_seconds: 86400
 
+# Suppress sink (log/webhook) re-emit of the same (device, rule) alert
+# within this window. sqlite alert log is unaffected — every alert is
+# persisted for "when did this start" queries.
+alert_dedup_seconds: 60
+
 threshold_rules:
   - metric: mem
     op: "<"
@@ -52,6 +57,6 @@ sinks:
 # how to consume `dump_now`. Flipping it earlier just writes orphan
 # KV keys, which is harmless but noisy.
 auto_dump:
-  enabled: false
+  enabled: true
   app: critterchron
   cooldown_seconds: 600

@@ -62,6 +62,11 @@ def main(argv: list[str]) -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # urllib3 + requests log every HTTP request at DEBUG; under -v the
+    # heartbeep poll loop drowns out everything else. Clamp them to
+    # INFO so analyzer's own DEBUG output stays readable.
+    logging.getLogger("urllib3").setLevel(logging.INFO)
+    logging.getLogger("requests").setLevel(logging.INFO)
 
     try:
         cfg = analyzer_config.load(args.config)
@@ -81,9 +86,17 @@ def main(argv: list[str]) -> int:
              len(cfg["detector"].threshold_rules),
              len(cfg["detector"].fleet_rules))
 
-    # Process-local cooldown tracker so the same (device, rule) doesn't
-    # thrash dump_now on every heartbeat. Resets on restart, which is fine
-    # — a restart is an operator action and we'd rather over-dump once.
+    # Process-local cooldown trackers. Both reset on restart, which is fine
+    # — restart is an operator action and we'd rather over-emit once than
+    # silently swallow a real failure across analyzer process boundaries.
+    #
+    # `_alert_cooldown` gates SINK emission (log/webhook) per (device, rule)
+    # to prevent the "rule fires every heartbeat" log spam. sqlite alert
+    # log is unaffected — every alert is still persisted.
+    #
+    # `_dump_cooldown` gates auto-dump KV writes; longer interval since a
+    # snapshot publish is heavier than a log line.
+    cfg["_alert_cooldown"] = {}
     cfg["_dump_cooldown"] = {}
 
     last_prune = 0
@@ -146,14 +159,25 @@ def _process(msg: dict, label: str, cfg: dict,
     storage.record_metrics(device, ts, metrics)
 
     alerts = cfg["detector"].evaluate(device, ts, metrics)
+    dedup_window = cfg["alert_dedup_seconds"]
+    alert_cd: dict = cfg["_alert_cooldown"]
     for alert in alerts:
         alert["queue"] = label
+        # Always persist — forensic record is the source of truth, and
+        # "when did this start firing" needs every sample.
         storage.record_alert(alert)
-        for sink in cfg["sinks"]:
-            try:
-                sink.emit(alert)
-            except Exception as e:  # sink failure shouldn't kill the loop
-                log.exception("sink failed: %s", e)
+        # Emit to sinks only if outside the per-(device, rule) dedup
+        # window. First fire always emits; subsequent fires within the
+        # window are silently swallowed.
+        cd_key = (alert["device"], alert["rule"])
+        last_emit = alert_cd.get(cd_key)
+        if last_emit is None or (alert["ts"] - last_emit) >= dedup_window:
+            alert_cd[cd_key] = alert["ts"]
+            for sink in cfg["sinks"]:
+                try:
+                    sink.emit(alert)
+                except Exception as e:  # sink failure shouldn't kill the loop
+                    log.exception("sink failed: %s", e)
         if alert.get("auto_dump"):
             _maybe_trigger_dump(alert, cfg, client, storage)
 
@@ -181,11 +205,18 @@ def _maybe_trigger_dump(alert: dict, cfg: dict,
                   alert["device"], alert["rule"])
         return
     kv_key = f"{app}/{alert['device']}/dump_now"
+    # Generation-number semantics on the device side: any nonzero int
+    # different from the device's last-seen value triggers one dump.
+    # Use `int(time.time())` so each auto-dump gets a unique token —
+    # if the analyzer fires twice in a second for the same device+rule
+    # the cooldown above would already short-circuit; otherwise the
+    # second-resolution timestamp is a fine generation token.
+    gen = int(time.time())
     try:
-        client.put(kv_key, 1)
+        client.put(kv_key, gen)
         cooldowns[key_t] = alert["ts"]
-        log.warning("dump_now=1 set for %s (rule=%s)",
-                    alert["device"], alert["rule"])
+        log.warning("dump_now=%d set for %s (rule=%s)",
+                    gen, alert["device"], alert["rule"])
     except Stra2usError as e:
         log.error("dump_now write failed for %s: %s", alert["device"], e)
 

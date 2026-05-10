@@ -348,3 +348,88 @@ vars:
       plaintext, which the catalog drift test rejects (any
       /password|secret|key/i key must be marked encrypted).
     ops_only: true    # device reads via Stra2usClient::wifi_password()
+
+  # ---------- Failure-triage: ring-buffer snapshots (FAILURE_TRIAGE.md §1) ----------
+
+  snapshot_buffer_frames:
+    type: int
+    default: 0
+    scope: [app, device]
+    range: [0, 32]
+    help: |
+      How many engine-state frames the device's snapshot ring keeps.
+      0 = feature dormant (zero per-tick cost); set to 32 to enable a
+      full ~4-second history at the default 8Hz physics tick. Compile-
+      time max is SNAPSHOT_MAX_FRAMES (default 32) — values above that
+      clamp. Per-device device headers default to 0 except the staging
+      ESP32 fleet which defaults to 32.
+
+  dump_now:
+    type: int
+    default: 0
+    scope: [device]
+    help: |
+      Generation token: write any nonzero int to trigger one snapshot
+      dump on the device; write 0 to "rearm" so the same number can
+      be re-fired. Device tracks the last-acted-on value in RAM and
+      ignores duplicates — the value itself doesn't matter, only that
+      it differs from what the device last saw. `int(time.time())`
+      from operators or the analyzer is the easy idiom.
+
+      Reboot loses the in-RAM tracking, so any nonzero value sitting
+      in KV at boot fires once per boot. That's intentional — fresh
+      boots are exactly when you want a snapshot.
+
+  snapshot_seeks_spike:
+    type: int
+    default: 5
+    scope: [app, device]
+    range: [1, 10000]
+    help: |
+      Auto-trigger threshold: dump if `seeks_fail` advances by more
+      than this within a sliding 1-second window. Default 5 catches
+      A* pathological cases without firing on routine 1-3/sec noise.
+
+  snapshot_heap_low:
+    type: int
+    default: 5000
+    scope: [app, device]
+    range: [0, 100000]
+    help: |
+      Auto-trigger threshold: dump when `heap_free` falls below this
+      (bytes). Per-chip baselines vary so override per device when
+      tuning. Default 5000 picks a "real trouble" floor on every
+      device class without firing on routine GC swings.
+
+  snapshot_agent_drop_pct:
+    type: int
+    default: 50
+    scope: [app, device]
+    range: [10, 100]
+    help: |
+      Auto-trigger threshold: dump when live agent count drops by
+      this %% inter-tick (engine-tick granularity, not heartbeat).
+      Default 50 catches a "half the swarm just vanished" pattern;
+      lower numbers fire on noisier scripts. Set to 100 to disable.
+
+  trace_mode:
+    type: int
+    default: 0
+    scope: [device]
+    range: [0, 60]
+    help: |
+      FAILURE_TRIAGE.md §2: continuous trace publish. 0 = off.
+      N>0 = publish a multi-frame snapshot every N seconds to the
+      per-device topic `<app>/trace/<device>`. Reuses the §1 ring
+      buffer (so `snapshot_buffer_frames` must be > 0 for trace
+      output to contain frames).
+
+      Bandwidth: ~3 KB per publish at the default 32-frame ring →
+      cadence N=4 means ~750 B/s/device. STAGING ONLY — never enable
+      in prod, the queue volume isn't free.
+
+      ALWAYS SET WITH TTL via `tools/trace_on.py` (default 30 min).
+      Server-side TTL is the safety net: forgotten traces auto-
+      expire instead of running indefinitely. A bare
+      `stra2us-cli set ... trace_mode 1` with no TTL is a foot-gun.
+    ops_only: true

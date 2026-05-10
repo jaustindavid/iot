@@ -22,6 +22,13 @@ storage_path: analyzer.sqlite
 # queries. Pruned every 10 minutes.
 metrics_retention_seconds: 86400
 
+# Suppress sink (log/webhook) re-emit of the same (device, rule) alert
+# within this window. Long enough to dedup the "rule fires every
+# heartbeat" pattern, short enough that genuinely persistent issues
+# still surface periodically. sqlite alert log is unaffected — every
+# alert is persisted regardless of dedup.
+alert_dedup_seconds: 60
+
 # ---- Detection ----------------------------------------------------
 #
 # Threshold rules: blunt absolute checks. Cheap to evaluate; useful

@@ -38,6 +38,7 @@
 #include "creds.h"
 #include "src/CritterEngine.h"
 #include "src/ErrLog.h"
+#include "src/SnapshotBuffer.h"
 #include "src/interface/Config.h"
 #include "src/FastLEDSink.h"
 
@@ -106,6 +107,35 @@
 // Mirror of hal/particle/src/critterchron_particle.cpp.
 #ifndef STRA2US_TELEMETRY_TOPIC
 #define STRA2US_TELEMETRY_TOPIC STRA2US_APP "/public/heartbeep"
+#endif
+
+// Snapshot publish topic — sibling of heartbeep. Devices write here when
+// FAILURE_TRIAGE.md §1's ring buffer dumps; the analyzer (or operator
+// via `stra2us-cli follow`) tails to consume.
+#ifndef STRA2US_SNAPSHOT_TOPIC
+#define STRA2US_SNAPSHOT_TOPIC STRA2US_APP "/public/snapshots"
+#endif
+
+// Per-device trace topic (FAILURE_TRIAGE.md §2). Different prefix from
+// snapshots: trace is hands-on debugging, not customer-aggregate, so
+// keep it out of /public/. DEVICE_NAME comes from creds.h.
+#ifndef STRA2US_TRACE_TOPIC
+#define STRA2US_TRACE_TOPIC STRA2US_APP "/trace/" DEVICE_NAME
+#endif
+
+// Per-device default for the runtime ring depth. 0 = feature dormant
+// even if compiled in (no append() cost). Staging fleet device headers
+// override to 32 (4 seconds at the default 8Hz physics tick); prod
+// devices stay at 0 until explicitly opted in via stra2us KV.
+#ifndef SNAPSHOT_BUFFER_FRAMES_DEFAULT
+#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 0
+#endif
+
+// Max bytes a single snapshot publish can carry. Sized for the v1
+// frame format (~80 bytes/frame) at the SNAPSHOT_MAX_FRAMES default
+// of 32: ~2.6 KB body + header. 4 KB headroom is comfortable.
+#ifndef SNAPSHOT_PUBLISH_BUF_BYTES
+#define SNAPSHOT_PUBLISH_BUF_BYTES 4096
 #endif
 
 static inline uint32_t physics_tick_ms() { return critter_ir::RUNTIME_TICK_MS; }
@@ -1087,6 +1117,15 @@ static void telemetry_task(void*) {
     // (driven by poll_all's string-fallback block). No get_int
     // pre-register needed.
     (void)g_cfg.get_int("max_brightness",   MAX_BRIGHTNESS);
+    // Snapshot-buffer KV pre-registers (FAILURE_TRIAGE.md §1). Mirror of
+    // the heartbeep/ir_poll/etc. block above — primes the cache so
+    // cycle-1's poll_all picks up live overrides from the first iteration.
+    (void)g_cfg.get_int("snapshot_buffer_frames",  SNAPSHOT_BUFFER_FRAMES_DEFAULT);
+    (void)g_cfg.get_int("dump_now",                0);
+    (void)g_cfg.get_int("snapshot_seeks_spike",    5);
+    (void)g_cfg.get_int("snapshot_heap_low",       5000);
+    (void)g_cfg.get_int("snapshot_agent_drop_pct", 50);
+    (void)g_cfg.get_int("trace_mode",              0);
 
     for (;;) {
         uint32_t now = millis();
@@ -1196,6 +1235,73 @@ static void telemetry_task(void*) {
         last_attempt_ms = now;
         first = false;
         int status = telemetry_cycle();
+
+        // FAILURE_TRIAGE.md §1: snapshot config + dump path. Runs after
+        // telemetry_cycle so the freshly-poll_all'd KV cache reflects any
+        // server-side changes (`dump_now`, `snapshot_buffer_frames`, etc.)
+        // immediately. No-ops when the feature is dormant (frames=0).
+        critterchron::snapshot::configure(
+            (uint16_t)g_cfg.get_int("snapshot_buffer_frames",
+                                    SNAPSHOT_BUFFER_FRAMES_DEFAULT));
+        critterchron::snapshot::set_thresholds(
+            g_cfg.get_int("snapshot_seeks_spike",     5),
+            g_cfg.get_int("snapshot_heap_low",        5000),
+            g_cfg.get_int("snapshot_agent_drop_pct",  50));
+        critterchron::snapshot::check_dump_now_kv(
+            g_cfg.get_int("dump_now", 0));
+
+        // FAILURE_TRIAGE.md §2: continuous trace mode. trace_mode KV is
+        // an int = "publish every N seconds" (0 = off). Reuses §1's
+        // ring + encode + publish; differentiated by the `trigger=trace`
+        // label, which routes the publish to the per-device trace topic
+        // below. Operator must set this with TTL via `tools/trace_on.py`
+        // — server-side TTL is the safety net against forgotten traces.
+        {
+            int trace_period_s = g_cfg.get_int("trace_mode", 0);
+            static uint32_t s_last_trace_pub_ms = 0;
+            if (trace_period_s > 0) {
+                uint32_t period_ms = (uint32_t)trace_period_s * 1000UL;
+                if (s_last_trace_pub_ms == 0 ||
+                    now - s_last_trace_pub_ms >= period_ms) {
+                    critterchron::snapshot::force_dump(
+                        critterchron::snapshot::trigger_name::TRACE, "");
+                    s_last_trace_pub_ms = now;
+                }
+            } else {
+                s_last_trace_pub_ms = 0;  // reset cadence on disable
+            }
+        }
+
+        if (critterchron::snapshot::dump_pending()) {
+            // Static so the 4KB doesn't sit on the tel-task stack — see
+            // debug_ota_hardfault_stack.md re: tel-thread stack pressure.
+            static char snap_buf[SNAPSHOT_PUBLISH_BUF_BYTES];
+            uint32_t now_unix = (uint32_t)time(nullptr);
+            size_t n = critterchron::snapshot::encode(
+                snap_buf, sizeof(snap_buf), DEVICE_NAME, now_unix);
+            // Route by trigger label: §2 trace dumps go to the per-device
+            // trace topic; everything else (manual / heap_low / spikes)
+            // goes to the shared snapshot topic.
+            const char* trig = critterchron::snapshot::pending_trigger();
+            const bool is_trace =
+                (strcmp(trig, critterchron::snapshot::trigger_name::TRACE) == 0);
+            const char* topic = is_trace
+                ? STRA2US_TRACE_TOPIC
+                : STRA2US_SNAPSHOT_TOPIC;
+            if (n > 0) {
+                g_cfg.connect();
+                int pub = g_cfg.publish(topic, snap_buf);
+                Serial.printf("[snap] publish=%d bytes=%u trigger=%s\n",
+                              pub, (unsigned)n, trig);
+                if (pub >= 200 && pub < 300) {
+                    critterchron::snapshot::clear_pending();
+                } else {
+                    critterchron::g_errlog.record(
+                        critterchron::ErrCat::Net,
+                        "snap publish=%d", pub);
+                }
+            }
+        }
 
         // Read heartbeep AFTER the cycle so a newly-fetched override
         // schedules the next fire — same ordering as the Particle shim.
@@ -1739,6 +1845,21 @@ void loop() {
         if (interp_dt > diag_interp_max) diag_interp_max = interp_dt;
         diag_astar_total  += astar_dt;
         if (astar_dt > diag_astar_max) diag_astar_max = astar_dt;
+
+        // FAILURE_TRIAGE.md §1: record one ring-buffer frame per physics
+        // tick. No-op when `snapshot_buffer_frames` KV is 0 (default).
+        // `rend_max_us` arg is 0 in v1 — the per-tick render dt isn't
+        // lifted out of the render block; the heartbeat-window aggregate
+        // is in `g_rend_max_us` if we want it later.
+        static uint32_t s_phys_tick_counter = 0;
+        ++s_phys_tick_counter;
+        critterchron::snapshot::append(
+            s_phys_tick_counter, now,
+            (uint16_t)g_engine.liveAgentCount(),
+            (uint32_t)ESP.getFreeHeap(),
+            (uint32_t)g_engine.metrics().failed_seeks,
+            /*phys_us=*/ dt,
+            /*rend_us=*/ 0);
     }
 
     // Render tick

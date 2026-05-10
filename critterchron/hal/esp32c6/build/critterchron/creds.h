@@ -1,11 +1,12 @@
 #pragma once
 
-// tammy_tanuki — second headless ESP32-C6-DevKitC-1, sibling of
-// tommy_tanuki. Same role: FAILURE_TRIAGE.md §4 differential staging
-// fleet member. No LED strip, no light sensor.
+// tommy_tanuki — headless ESP32-C6-DevKitC-1. First of the C6 critters,
+// running as part of the FAILURE_TRIAGE.md §4 differential staging fleet.
+// No LED strip, no light sensor; the engine + telemetry path runs as
+// normal and the FastLEDSink emits to nothing.
 
 // --- Identity ---
-#define DEVICE_NAME         "tammy_tanuki"
+#define DEVICE_NAME         "tommy_tanuki"
 #define DEVICE_PLATFORM     "esp32c6"
 
 // --- WiFi credentials ---
@@ -13,12 +14,8 @@
 #define WIFI_PASSWORD       "david fam"
 
 // --- Stra2us creds (staging) ---
-// !!! PLACEHOLDER — NOT A REAL SECRET !!!
-// Provision a real client_id+secret on the staging Stra2us instance
-// and replace before flashing. The deadbeef pattern is intentionally
-// obvious so it can't be mistaken for the real thing.
 #define STRA2US_CLIENT_ID    DEVICE_NAME
-#define STRA2US_SECRET_HEX  "57d45f2252f2841f344c452515139485bb1e990d43b7cfa7d72ffc2e9df5ec86"
+#define STRA2US_SECRET_HEX  "2cb174a5ffee20a178971f91f0a11b041f78c4601fee33b02c2baba280916298"
 #define STRA2US_HOST        "iot-staging.stra2us.austindavid.com"
 #define STRA2US_PORT         8253
 #define STRA2US_APP         "critterchron"
@@ -42,6 +39,11 @@
 // Headless — no sensor wired. Leaving LIGHT_SENSOR_TYPE undefined makes
 // the .ino skip the BH1750 init block (`#if defined(LIGHT_SENSOR_TYPE)`)
 // so I2C never comes up.
+
+// --- Failure-triage opt-in (FAILURE_TRIAGE.md §1) ---
+// Staging-fleet member: ring buffer always-on at 32 frames. Override
+// at runtime via the `snapshot_buffer_frames` KV if needed.
+#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 32
 
 // --- Tuning ---
 #define MAX_BRIGHTNESS         64           // moot when no strip is wired

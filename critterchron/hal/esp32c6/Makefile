@@ -86,6 +86,8 @@ ENGINE_COPIES := \
 	$(SRC_DIR)/CritterEngine.cpp \
 	$(SRC_DIR)/ErrLog.h \
 	$(SRC_DIR)/ErrLog.cpp \
+	$(SRC_DIR)/SnapshotBuffer.h \
+	$(SRC_DIR)/SnapshotBuffer.cpp \
 	$(SRC_DIR)/interface/Config.h \
 	$(SRC_DIR)/interface/LedSink.h \
 	$(SRC_DIR)/interface/CritTimeSource.h \
@@ -252,6 +254,10 @@ $(SRC_DIR)/CritterEngine.cpp: $(HAL_ROOT)/CritterEngine.cpp | $(SRC_DIR)
 $(SRC_DIR)/ErrLog.h: $(HAL_ROOT)/ErrLog.h | $(SRC_DIR)
 	cp $< $@
 $(SRC_DIR)/ErrLog.cpp: $(HAL_ROOT)/ErrLog.cpp | $(SRC_DIR)
+	cp $< $@
+$(SRC_DIR)/SnapshotBuffer.h: $(HAL_ROOT)/SnapshotBuffer.h | $(SRC_DIR)
+	cp $< $@
+$(SRC_DIR)/SnapshotBuffer.cpp: $(HAL_ROOT)/SnapshotBuffer.cpp | $(SRC_DIR)
 	cp $< $@
 $(SRC_DIR)/interface/Config.h: $(HAL_ROOT)/interface/Config.h | $(SRC_DIR)/interface
 	cp $< $@
