@@ -548,7 +548,17 @@ int Stra2usClient::publish(const char* topic, const char* message) {
     char sig[65];
     sign_(uri, message, body_len, ts, sig);
 
-    char req[1024];
+    // Static, not stack: publish() is serial on the tel task, so static
+    // is safe and avoids tel-thread stack pressure (cf.
+    // debug_ota_hardfault_stack.md). Size depends on whether snapshots
+    // are enabled — heartbeats are ~700 B, snapshot dumps
+    // (FAILURE_TRIAGE.md §1) are ~3 KB. ESP32 has plenty of RAM but
+    // mirror the Particle conditional anyway for code symmetry.
+#ifdef NO_SNAPSHOT_BUFFER
+    static char req[1024];
+#else
+    static char req[5120];
+#endif
     int req_len = snprintf(req, sizeof(req),
         "POST %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"

@@ -497,7 +497,17 @@ int Stra2usClient::publish(const char* topic, const char* message) {
     char sig[65];
     sign_(uri, message, body_len, ts, sig);
 
-    char req[1024];
+    // Static, not stack: publish() is serial on the tel thread, so
+    // static is safe and avoids stack pressure (cf.
+    // debug_ota_hardfault_stack.md). Size depends on whether snapshots
+    // are enabled — heartbeats are ~700 B, but snapshot dumps
+    // (FAILURE_TRIAGE.md §1) are ~3 KB. NO_SNAPSHOT_BUFFER devices
+    // (rico_raccoon) only publish heartbeats; keep their .bss small.
+#ifdef NO_SNAPSHOT_BUFFER
+    static char req[1024];
+#else
+    static char req[5120];
+#endif
     int req_len = snprintf(req, sizeof(req),
         "POST %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
