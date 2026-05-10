@@ -29,7 +29,7 @@ if str(_HERE) not in sys.path:
 
 from tools.analyzer.parser import parse_heartbeat, numeric_metrics
 from tools.analyzer.detector import (
-    Detector, FleetMadDetector, ThresholdRule,
+    Detector, FleetMadDetector, StalenessDetector, ThresholdRule,
 )
 from tools.analyzer.storage import Storage
 from tools.analyzer import config as analyzer_config
@@ -203,6 +203,86 @@ def test_fleet_mad_freshness():
     check("fleet_mad: stale fleet doesn't anchor median", a is None)
 
 
+def test_staleness_warmup():
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3)
+    a = d.update("rachel", 100, {"phys_max_us": 1500, "up": 100})
+    check("staleness: first sample silent", a is None)
+
+
+def test_staleness_fires_on_streak():
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3)
+    d.update("rachel", 100, {"phys_max_us": 1500, "up": 100})
+    d.update("rachel", 130, {"phys_max_us": 1500, "up": 130})
+    a = d.update("rachel", 160, {"phys_max_us": 1500, "up": 160})
+    check("staleness: fires after N unchanged samples with up advancing",
+          a is not None)
+    if a is not None:
+        check("staleness: alert reports unchanged_samples",
+              a.get("unchanged_samples") == 3)
+
+
+def test_staleness_resets_on_change():
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3)
+    d.update("rachel", 100, {"phys_max_us": 1500, "up": 100})
+    d.update("rachel", 130, {"phys_max_us": 1500, "up": 130})
+    d.update("rachel", 160, {"phys_max_us": 1700, "up": 160})  # changed
+    # Streak resets; needs 3 more unchanged before firing.
+    a = d.update("rachel", 190, {"phys_max_us": 1700, "up": 190})
+    check("staleness: silent after value changed (streak reset)", a is None)
+
+
+def test_staleness_silent_when_up_not_advancing():
+    # Critical: distinguishes engine freeze from offline/clock-stalled.
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3,
+                          require_up_advancing=True)
+    d.update("rachel", 100, {"phys_max_us": 1500, "up": 100})
+    d.update("rachel", 130, {"phys_max_us": 1500, "up": 100})  # up flat
+    a = d.update("rachel", 160, {"phys_max_us": 1500, "up": 100})
+    check("staleness: silent when up not advancing (different failure)",
+          a is None)
+
+
+def test_staleness_silent_on_reboot():
+    # Reboot: up resets to small value; should not fire even with stuck metric.
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3)
+    d.update("rachel", 100, {"phys_max_us": 1500, "up": 100000})
+    d.update("rachel", 130, {"phys_max_us": 1500, "up": 100030})
+    # Device reboots — up resets to a small number
+    a = d.update("rachel", 160, {"phys_max_us": 1500, "up": 5})
+    check("staleness: silent when up went backwards (reboot)", a is None)
+
+
+def test_staleness_per_device_isolation():
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=3)
+    # rachel goes stale; rico stays healthy
+    d.update("rachel", 100, {"phys_max_us": 1500, "up": 100})
+    d.update("rico",   100, {"phys_max_us": 2000, "up": 100})
+    d.update("rachel", 130, {"phys_max_us": 1500, "up": 130})
+    d.update("rico",   130, {"phys_max_us": 2400, "up": 130})  # rico changes
+    rachel_alert = d.update("rachel", 160, {"phys_max_us": 1500, "up": 160})
+    rico_alert   = d.update("rico",   160, {"phys_max_us": 2700, "up": 160})
+    check("staleness: per-device state — frozen device fires",
+          rachel_alert is not None)
+    check("staleness: per-device state — healthy device silent",
+          rico_alert is None)
+
+
+def test_staleness_metric_absent():
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=2)
+    a = d.update("rachel", 100, {"agents": 5, "up": 100})  # no phys_max_us
+    check("staleness: missing metric → no alert", a is None)
+
+
+def test_staleness_can_disable_up_gate():
+    # When require_up_advancing=False, even an offline-but-still-publishing
+    # device can fire (rare; included for symmetry).
+    d = StalenessDetector(metric="phys_max_us", min_unchanged_samples=2,
+                          require_up_advancing=False)
+    d.update("rachel", 100, {"phys_max_us": 1500})
+    a = d.update("rachel", 130, {"phys_max_us": 1500})
+    check("staleness: fires without up gate when configured", a is not None)
+
+
 def test_detector_composite():
     det = Detector(
         threshold_rules=[ThresholdRule(metric="mem", op="<", value=5000)],
@@ -337,6 +417,14 @@ ALL_TESTS = [
     test_fleet_mad_outlier,
     test_fleet_mad_skips_zero_mad,
     test_fleet_mad_freshness,
+    test_staleness_warmup,
+    test_staleness_fires_on_streak,
+    test_staleness_resets_on_change,
+    test_staleness_silent_when_up_not_advancing,
+    test_staleness_silent_on_reboot,
+    test_staleness_per_device_isolation,
+    test_staleness_metric_absent,
+    test_staleness_can_disable_up_gate,
     test_detector_composite,
     test_storage_metrics_roundtrip,
     test_storage_alerts_roundtrip,

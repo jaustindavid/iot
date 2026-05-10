@@ -49,6 +49,21 @@ fleet_rules:
     freshness_seconds: 300
     auto_dump: true
 
+# Staleness rules: catches the "frozen engine, live heartbeat" class —
+# values bit-identical across N samples while up= advances. See
+# debug_frozen_engine_live_heartbeat memory note for the failure-mode
+# signature this is built to catch.
+staleness_rules:
+  - metric: phys_max_us
+    min_unchanged_samples: 5
+    require_up_advancing: true
+    auto_dump: true
+
+  - metric: interp_max_us
+    min_unchanged_samples: 5
+    require_up_advancing: true
+    auto_dump: false
+
 sinks:
   - type: log
     level: WARNING

@@ -134,10 +134,101 @@ class FleetMadDetector:
 
 
 @dataclass
+class StalenessDetector:
+    """Flag a device whose `metric` hasn't changed across N consecutive
+    samples while `up` is advancing.
+
+    Catches the "frozen engine, live heartbeat" class — the failure mode
+    where the telemetry thread keeps publishing but the physics tick is
+    wedged, so engine-derived metrics (`seeks_fail`, `phys_*`, etc.) go
+    bit-for-bit identical from one heartbeat to the next. Threshold
+    rules and fleet-MAD outliers both miss this — they look at *values*,
+    not at whether values are *changing*. See FAILURE_TRIAGE.md §3
+    "where the gap is" + the debug_frozen_engine_live_heartbeat memory
+    note.
+
+    The `up` advance check is the load-bearing distinguisher. A truly
+    offline device just stops sending heartbeats; the analyzer never
+    sees its samples and we don't false-positive. A frozen-engine
+    device keeps publishing, with `up=` and `wall=` ticking forward
+    while engine metrics flatline. So: only fire when `up` is advancing
+    *and* the watched metric is stuck.
+
+    Choose metrics that are naturally jittery on a healthy device.
+    `phys_max_us`, `interp_max_us`, `seeks_fail` are good candidates.
+    `agents` is borderline (steady-state for many scripts). `heap_free`
+    can be too noisy/quiet depending on workload.
+    """
+    metric: str
+    min_unchanged_samples: int = 5
+    require_up_advancing: bool = True
+    name: str = ""
+    auto_dump: bool = False
+
+    # Per-device state: device → (last_value, unchanged_count, last_up)
+    _state: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        if not self.name:
+            self.name = f"staleness:{self.metric}"
+
+    def update(self, device: str, ts: int, metrics: dict) -> dict | None:
+        if self.metric not in metrics:
+            return None
+        v = metrics[self.metric]
+        up_now = metrics.get("up")
+        prev = self._state.get(device)
+
+        if prev is None:
+            # First observation for this device. Stash baseline; can't
+            # decide staleness yet.
+            self._state[device] = (v, 1, up_now)
+            return None
+
+        prev_v, prev_count, prev_up = prev
+
+        if v != prev_v:
+            # Value changed → reset the streak.
+            self._state[device] = (v, 1, up_now)
+            return None
+
+        # Value unchanged → extend the streak.
+        new_count = prev_count + 1
+        self._state[device] = (v, new_count, up_now)
+
+        if new_count < self.min_unchanged_samples:
+            return None
+
+        if self.require_up_advancing:
+            # Distinguish frozen-engine (up advancing, metric stuck)
+            # from offline/clock-stalled (up not advancing). If we
+            # can't tell from this sample's `up` field, stay silent.
+            if up_now is None or prev_up is None:
+                return None
+            if up_now <= prev_up:
+                return None
+
+        return {
+            "device": device,
+            "ts": ts,
+            "metric": self.metric,
+            "rule": self.name,
+            "value": v,
+            "unchanged_samples": new_count,
+            "up_now": up_now,
+            "up_prev": prev_up,
+            "detail": (f"{self.metric}={v} unchanged across {new_count} samples "
+                       f"while up advanced ({prev_up}→{up_now})"),
+            "auto_dump": self.auto_dump,
+        }
+
+
+@dataclass
 class Detector:
     """Composite — runs all configured rules per sample."""
     threshold_rules: list = field(default_factory=list)
     fleet_rules: list = field(default_factory=list)
+    staleness_rules: list = field(default_factory=list)
 
     def evaluate(self, device: str, ts: int, metrics: dict) -> list[dict]:
         out = []
@@ -146,6 +237,10 @@ class Detector:
             if a is not None:
                 out.append(a)
         for r in self.fleet_rules:
+            a = r.update(device, ts, metrics)
+            if a is not None:
+                out.append(a)
+        for r in self.staleness_rules:
             a = r.update(device, ts, metrics)
             if a is not None:
                 out.append(a)

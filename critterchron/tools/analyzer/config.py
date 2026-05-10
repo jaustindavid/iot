@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from .detector import Detector, FleetMadDetector, ThresholdRule
+from .detector import Detector, FleetMadDetector, StalenessDetector, ThresholdRule
 from .sinks import build_sinks
 
 
@@ -38,6 +38,7 @@ def load(path: str | Path) -> dict:
     detector = Detector(
         threshold_rules=[_build_threshold(r) for r in doc.get("threshold_rules") or []],
         fleet_rules=[_build_fleet(r) for r in doc.get("fleet_rules") or []],
+        staleness_rules=[_build_staleness(r) for r in doc.get("staleness_rules") or []],
     )
 
     return {
@@ -78,6 +79,18 @@ def _build_fleet(spec: dict) -> FleetMadDetector:
         mad_multiplier=float(spec.get("mad_multiplier", 4.0)),
         min_devices=int(spec.get("min_devices", 3)),
         freshness_seconds=int(spec.get("freshness_seconds", 300)),
+        auto_dump=bool(spec.get("auto_dump", False)),
+        name=spec.get("name", ""),
+    )
+
+
+def _build_staleness(spec: dict) -> StalenessDetector:
+    if "metric" not in spec:
+        raise ConfigError(f"staleness rule missing `metric`: {spec}")
+    return StalenessDetector(
+        metric=spec["metric"],
+        min_unchanged_samples=int(spec.get("min_unchanged_samples", 5)),
+        require_up_advancing=bool(spec.get("require_up_advancing", True)),
         auto_dump=bool(spec.get("auto_dump", False)),
         name=spec.get("name", ""),
     )

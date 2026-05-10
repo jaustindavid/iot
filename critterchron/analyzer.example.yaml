@@ -63,6 +63,23 @@ fleet_rules:
     freshness_seconds: 300
     auto_dump: false
 
+# Staleness rules: flag a device whose metric is bit-identical across
+# N consecutive heartbeats while `up=` is advancing. Catches the
+# "frozen engine, live heartbeat" class — telemetry thread alive,
+# physics tick wedged. Pick metrics that are naturally jittery on a
+# healthy device; `agents` and `heap_free` are bad candidates because
+# they can be steady-state under normal operation.
+staleness_rules:
+  - metric: phys_max_us
+    min_unchanged_samples: 5
+    require_up_advancing: true
+    auto_dump: true
+
+  - metric: interp_max_us
+    min_unchanged_samples: 5
+    require_up_advancing: true
+    auto_dump: false  # belt-and-suspenders to phys_max_us; don't double-dump
+
 # ---- Alert sinks --------------------------------------------------
 #
 # At minimum, log to stdout. Add a webhook for Slack/Discord/etc.
