@@ -190,18 +190,20 @@ void Stra2usClient::sign_(const char* uri, const char* body, size_t body_len,
     char ts_str[16];
     snprintf(ts_str, sizeof(ts_str), "%lu", (unsigned long)ts);
 
-    uint8_t payload[512];
-    size_t uri_len = strlen(uri);
-    size_t ts_len  = strlen(ts_str);
-    size_t total   = uri_len + body_len + ts_len;
-    if (total >= sizeof(payload)) { out_hex[0] = '\0'; return; }
-
-    memcpy(payload, uri, uri_len);
-    if (body && body_len > 0) memcpy(payload + uri_len, body, body_len);
-    memcpy(payload + uri_len + body_len, ts_str, ts_len);
-
+    // Streaming HMAC over URI || body || ts_str. Mirrors the ESP32
+    // sign_(); replaces a 512-byte payload[] buffer that silently
+    // truncated and zeroed out_hex when bodies exceeded it (heartbeat
+    // ~600 B fits, FAILURE_TRIAGE.md §1 snapshot dumps ~3 KB don't,
+    // server returned 401 "Invalid Signature").
+    HMAC_SHA256_CTX ctx;
+    hmac_sha256_init(&ctx, secret, 32);
+    hmac_sha256_update(&ctx, (const uint8_t*)uri, strlen(uri));
+    if (body && body_len > 0) {
+        hmac_sha256_update(&ctx, (const uint8_t*)body, body_len);
+    }
+    hmac_sha256_update(&ctx, (const uint8_t*)ts_str, strlen(ts_str));
     uint8_t result[32];
-    hmac_sha256(secret, 32, payload, total, result);
+    hmac_sha256_final(&ctx, result);
     for (int i = 0; i < 32; ++i)
         snprintf(&out_hex[i*2], 3, "%02x", result[i]);
     out_hex[64] = '\0';

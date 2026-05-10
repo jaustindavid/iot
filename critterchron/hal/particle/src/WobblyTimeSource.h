@@ -16,6 +16,14 @@
 // the underlying clock (cloud NTP) that produces a huge jump re-seeds rather
 // than chasing the drift.
 //
+// `elapsed` is derived from the inner (RTC) clock, NOT millis(). On the
+// OG Photon, millis() / System.uptime() runs at ~74% of real time
+// (debug_photon_gen2_systick_drift) — using millis-elapsed there made
+// virt grow at 0.74 × rate, defeating catchup so wobble drifted below
+// min_s and stayed there. The RTC is honest on every platform we ship.
+// Resolution loss (1s vs 1ms) is harmless: wall_now() returns time_t
+// (whole seconds anyway) so callers see no behavioral change.
+//
 // Tuning knobs are pulled from the Config surface on every read (hot-path
 // safe per Config.h contract). First call auto-registers the key + default.
 // Defaults: drift 2..5 minutes ahead of real time, ±30% tick-rate swings.
@@ -73,9 +81,14 @@ public:
             return (time_t)virt_epoch_s_;
         }
 
-        unsigned long now_ms = millis();
-        double elapsed = (double)(now_ms - last_wall_ms_) / 1000.0;
-        last_wall_ms_ = now_ms;
+        // Elapsed since last call, RTC-based. See header comment re:
+        // millis() drift on OG Photon. Negative elapsed (RTC stepped
+        // backward, e.g. minor cloud-NTP adjustment) clamps to 0;
+        // large jumps caught by the |offset| > max_s*2 reseed gate.
+        time_t real_s = real_now;
+        double elapsed = (double)(real_s - last_real_s_);
+        if (elapsed < 0) elapsed = 0;
+        last_real_s_ = real_s;
 
         float fast = cfg_.get_float("wobble_fast_rate", 1.3f);
         float slow = cfg_.get_float("wobble_slow_rate", 0.7f);
@@ -90,7 +103,7 @@ private:
     void seed_(time_t real_now) const {
         pick_target_();
         virt_epoch_s_ = (double)real_now + target_offset_s_;
-        last_wall_ms_ = millis();
+        last_real_s_ = real_now;
         init_ = true;
     }
 
@@ -106,7 +119,7 @@ private:
 
     mutable double        virt_epoch_s_    = 0.0;
     mutable double        target_offset_s_ = 0.0;
-    mutable unsigned long last_wall_ms_    = 0;
+    mutable time_t        last_real_s_     = 0;
     mutable bool          init_            = false;
 };
 
