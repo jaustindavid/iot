@@ -104,10 +104,10 @@ boober:
     incr heap
     incr heap # 30 * 2
     step (0, -1)
-    incr heap
-    incr heap
-    incr heap
-    incr heap # 34 x 2 = 68
+    incr heap # 31 x 2 = 62
+    incr heap # 32 x 2 = 64
+    incr heap # 33 x 2 = 66
+    # incr heap # 34 x 2 = 68
     set state = idle
 
   # randomly hesitate
@@ -170,7 +170,9 @@ boober:
     # Pile dry — stand in
     seek missing
     if on missing:
-      pause 10-20
+      set color = brick
+      pause 75-112 # 30-45s
+      set color = dull_y
     # set state = idle
     # done
 
