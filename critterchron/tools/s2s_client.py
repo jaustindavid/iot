@@ -93,12 +93,33 @@ class S2sClient:
         # get escaped.
         return "/kv/" + "/".join(quote(p, safe="") for p in key.split("/"))
 
-    def put(self, key: str, value) -> requests.Response:
+    def put(self, key: str, value, ttl: int | None = None) -> requests.Response:
         """Write /kv/<key>. Server uses POST for writes (not PUT); name kept
-        as `put` for caller ergonomics. `value` is msgpack-encoded first."""
+        as `put` for caller ergonomics. `value` is msgpack-encoded first.
+
+        `ttl` (seconds) maps to `?ttl=N` on the URL — server auto-expires
+        the key after that interval. Useful for "set this dangerous knob
+        on for an hour and then forget it can stay on" patterns
+        (FAILURE_TRIAGE.md §2 trace_mode is the canonical case). Capped
+        at 1 week (604800) server-side. Per the wire spec, the query
+        string is NOT part of the signing payload — only the bare path."""
         body = msgpack.packb(value, use_bin_type=True)
-        r = self._request("POST", self._kv_uri(key), body, "application/x-msgpack")
-        if not (200 <= r.status_code < 300):
+        uri = self._kv_uri(key)
+        ts = int(time.time())
+        sig = self._sign(uri, body, ts)
+        url = self.base_url + uri
+        if ttl is not None:
+            url = url + f"?ttl={int(ttl)}"
+        headers = {
+            "X-Client-ID": self.client_id,
+            "X-Timestamp": str(ts),
+            "X-Signature": sig,
+            "Content-Type": "application/x-msgpack",
+        }
+        r = requests.post(url, data=body, headers=headers, timeout=self.timeout)
+        if 200 <= r.status_code < 300:
+            self._verify_resp(uri, r.content, r.headers)
+        else:
             raise Stra2usError(f"POST {key} → {r.status_code}: {r.text[:200]}")
         return r
 

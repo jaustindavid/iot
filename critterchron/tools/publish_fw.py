@@ -111,6 +111,11 @@ def main() -> int:
         print(f"error: stra2us client init failed: {e}", file=sys.stderr)
         return 2
 
+    # Print which Stra2us instance we're targeting — without this it's
+    # easy to push prod firmware to the staging host (or vice-versa)
+    # depending on which env / config file resolved first.
+    print(f"server:  {client.base_url}  (client_id={client.client_id})")
+
     if not args.force:
         remote = _read_sidecar(client, sha_key)
         if remote == sidecar:

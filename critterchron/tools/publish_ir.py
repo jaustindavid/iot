@@ -228,6 +228,10 @@ def main() -> int:
         print(f"error: stra2us client init failed: {e}", file=sys.stderr)
         return 2
 
+    # Surface which Stra2us instance + client_id resolved — easy to push
+    # to the wrong host when prod/staging both have valid creds in env.
+    print(f"server:     {client.base_url}  (client_id={client.client_id})")
+
     if not args.force:
         remote = _read_sidecar(client, sha_key)
         if remote == sidecar:

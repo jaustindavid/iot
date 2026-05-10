@@ -186,6 +186,10 @@ def main() -> int:
         print(f"error: stra2us client init failed: {e}", file=sys.stderr)
         return 2
 
+    # Surface which Stra2us instance + client_id resolved — easy to point
+    # the wrong fleet at a script if prod/staging creds both resolve.
+    print(f"server:  {client.base_url}  (client_id={client.client_id})")
+
     if args.clear:
         # No DELETE on the server — write an empty string. Device side sees
         # len==0 on ir_poll and skips the fetch, so the currently-loaded
