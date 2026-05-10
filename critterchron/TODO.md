@@ -4,6 +4,42 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Consolidate Stra2us client: `tools/s2s_client.py` → thin extensions on
+  `stra2us_cli`.** Today the codebase carries two clients with ~95%
+  overlap. The split:
+
+  - `stra2us_cli` (upstream, editable from `../stra2us/tools/`) is used
+    by `publish_fw.py` / `publish_ir.py` / `set_ir_pointer.py`. Has
+    `put(key, value, encrypted=False)` and `get(key)`; no queue ops, no
+    TTL on `put`.
+  - `tools/s2s_client.py` (local) is used by `tools/s2s.py`, the
+    analyzer, `snapshot_dump.py`, and `trace_on.py`. Adds queue
+    `consume(topic, envelope=True)` and `put(key, value, ttl=N)` —
+    both real gaps in upstream.
+
+  Cleanup plan:
+
+  1. New file `tools/s2s_extras.py` — subclass `stra2us_cli.Stra2usClient`
+     to add `consume()` and override `put()` with the optional `ttl`
+     kwarg. ~60 LOC of glue. Mirror the existing `client_from_env`
+     surface so callers don't change shape.
+  2. Re-point analyzer + snapshot_dump + trace_on + s2s.py (the original)
+     at `s2s_extras`. Single line per file.
+  3. Delete `tools/s2s_client.py`.
+
+  Why this matters: upstream protocol changes (response signing
+  refinements, encrypted-value updates, new dep adds like the recent
+  `bleach`) are picked up automatically once we're on the editable
+  install rather than carrying a forked HMAC+msgpack+response-sig
+  implementation locally. The local fork is what made `pip install -e
+  ../stra2us/tools --upgrade` necessary as a manual ritual; after this
+  consolidation, upgrading the editable install is the only thing.
+
+  Don't do (3) — push `consume` / `ttl` back into upstream — until
+  there's a second consumer of stra2us-cli outside critterchron.
+  Today we're effectively the only user; a stable upstream API is
+  premature.
+
 - **Re-homogenize the staging fleet to all-C3 once SuperMinis arrive.**
   Current staging fleet is `timmy_tanuki` (C3), `tommy_tanuki` (C6),
   `tammy_tanuki` (C6). The mixed chip class actively works against
