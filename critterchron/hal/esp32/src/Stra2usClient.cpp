@@ -1577,25 +1577,17 @@ bool fw_chunk_cb_(void* userdata, const uint8_t* chunk, size_t len) {
 }  // anonymous namespace
 
 void Stra2usClient::fw_poll() {
-    // 1) Read target pointer with the standard device-then-app fallback.
-    char ptr_buf[48];
-    size_t ptr_len = 0;
-    char ptr_key[96];
-    snprintf(ptr_key, sizeof(ptr_key), "%s/%s/fw_target", app_, device_);
-    bool got_target = kv_fetch_str_(ptr_key, ptr_buf, sizeof(ptr_buf), ptr_len);
-    if (!got_target || ptr_len == 0) {
-        snprintf(ptr_key, sizeof(ptr_key), "%s/public/fw_target", app_);
-        got_target = kv_fetch_str_(ptr_key, ptr_buf, sizeof(ptr_buf), ptr_len);
-    }
-    if (!got_target || ptr_len == 0) {
-        // No target set at either scope. Not an error — just nothing to do.
-        return;
-    }
-    // ptr_buf is now the target name (e.g. "esp32c3").
+    // Per-device firmware paths. Identity (STRA2US_CLIENT_ID, secret,
+    // DEVICE_NAME) is baked into the firmware at compile time via
+    // creds.h, so a single shared blob would clone identity onto every
+    // device that pulled it. Each device has its own blob keyed at
+    // `<app>/<device>/fw` (with `/sha` sidecar). No fw_target pointer
+    // anymore — if `<app>/<device>/fw/sha` exists, the device pulls;
+    // if not, no-op. Mirrors Particle's per-device cloud-OTA model.
 
-    // 2) Fetch the sidecar.
-    char sha_key[96 + sizeof(ptr_buf) + 16];
-    snprintf(sha_key, sizeof(sha_key), "%s/public/fw/%s/sha", app_, ptr_buf);
+    // 1) Fetch the sidecar directly from this device's path.
+    char sha_key[96];
+    snprintf(sha_key, sizeof(sha_key), "%s/%s/fw/sha", app_, device_);
     char sidecar[96] = {0};
     size_t sidecar_len = 0;
     if (!kv_fetch_str_(sha_key, sidecar, sizeof(sidecar), sidecar_len)) {
@@ -1630,8 +1622,8 @@ void Stra2usClient::fw_poll() {
         return;
     }
 
-    LOG_INFO("fw_poll: candidate %s sidecar=%.8s size=%u (running=%.8s)",
-             ptr_buf, expected_sha, (unsigned)expected_size,
+    LOG_INFO("fw_poll: candidate sidecar=%.8s size=%u (running=%.8s)",
+             expected_sha, (unsigned)expected_size,
              fw_running_sha_[0] ? fw_running_sha_ : "00000000");
 
     // 4) Reserve OTA partition + start streaming write.
@@ -1641,8 +1633,8 @@ void Stra2usClient::fw_poll() {
         return;
     }
 
-    char blob_key[96 + sizeof(ptr_buf)];
-    snprintf(blob_key, sizeof(blob_key), "%s/public/fw/%s", app_, ptr_buf);
+    char blob_key[96];
+    snprintf(blob_key, sizeof(blob_key), "%s/%s/fw", app_, device_);
     LOG_INFO("fw_poll: fetching blob %s (%u bytes)",
              blob_key, (unsigned)expected_size);
 
@@ -1710,7 +1702,7 @@ void Stra2usClient::fw_poll() {
         return;
     }
 
-    LOG_INFO("fw_poll: applied %s sha=%.8s, rebooting", ptr_buf, computed_sha);
+    LOG_INFO("fw_poll: applied sha=%.8s, rebooting", computed_sha);
     delay(500);  // let serial drain
     ESP.restart();
     // unreachable

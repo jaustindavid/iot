@@ -1,20 +1,23 @@
 """Stage an ESP32 firmware binary into Stra2us KV for pull-OTA.
 
-    python3 tools/publish_fw.py path/to/firmware.bin --target esp32c3
+    python3 tools/publish_fw.py path/to/firmware.bin --device c3a_tanuki
         [--dry-run]               # print summary, no network
         [--force]                 # upload even if remote sidecar matches
 
 Auth comes from `stra2us_cli.client_from_env`, same resolution path the
 `stra2us` CLI uses interactively (env vars or a `~/.stra2us` profile).
 
-Key layout: `critterchron/public/fw/<target>` holds the binary blob;
-`critterchron/public/fw/<target>/sha` holds the sidecar string
-`<sha256>:<size>`. The `/public/` segment is part of the public-namespace
-migration (see PUBLIC_NAMESPACE.md and stra2us/docs/fr_application_view.md):
-shared blobs live under `<app>/public/` so customer-facing ACLs can grant
-read on `<app>/public:r` without leaking other devices' data. Pointer
-keys at `critterchron/<device>/fw_target` (with `critterchron/public/fw_target`
-as the fleet-wide fallback) direct each device at a target name.
+Key layout: `critterchron/<device>/fw` holds the binary blob;
+`critterchron/<device>/fw/sha` holds the sidecar string `<sha256>:<size>`.
+
+Per-device paths instead of a shared `<app>/public/fw/<platform>` blob
+because identity (STRA2US_CLIENT_ID, STRA2US_SECRET_HEX, DEVICE_NAME) is
+compiled into the firmware via creds.h — a single blob shared across
+devices would clone identity onto every device that fw_poll'd it. The
+per-device path matches Particle's per-device cloud-OTA model in spirit:
+each device pulls its own binary, identity stays intact. Storage cost
+is N × ~1 MB instead of N_platforms × ~1 MB, which is nothing at fleet
+size of low-double-digits.
 
 Idempotency: probes the remote sidecar and skips upload when it matches.
 Same logic as publish_ir.py.
@@ -70,9 +73,11 @@ def _read_sidecar(client, sha_key: str) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("binary", help="Path to a built firmware .bin")
-    ap.add_argument("--target", required=True,
-                    help="Target platform identifier (e.g. esp32c3, esp32s3). "
-                         "Becomes the KV key suffix: critterchron/public/fw/<target>.")
+    ap.add_argument("--device", required=True,
+                    help="Device this firmware was built for (e.g. c3a_tanuki). "
+                         "Becomes the KV key suffix: critterchron/<device>/fw. "
+                         "Each device has its own published blob since identity "
+                         "is baked in at compile time.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="Upload even if the remote sidecar already matches")
@@ -91,11 +96,11 @@ def main() -> int:
     size       = len(blob_bytes)
     sha        = hashlib.sha256(blob_bytes).hexdigest()
     sidecar    = f"{sha}:{size}"
-    key        = f"critterchron/public/fw/{args.target}"
-    sha_key    = f"critterchron/public/fw/{args.target}/sha"
+    key        = f"critterchron/{args.device}/fw"
+    sha_key    = f"critterchron/{args.device}/fw/sha"
 
     print(f"binary:  {args.binary}")
-    print(f"target:  {args.target}")
+    print(f"device:  {args.device}")
     print(f"key:     {key}")
     print(f"size:    {size} bytes ({size / 1024:.1f} KiB)")
     print(f"sha256:  {sha}")

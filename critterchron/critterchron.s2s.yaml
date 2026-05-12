@@ -107,19 +107,14 @@ vars:
       coupling them through this one. Heartbeat surfaces each kick
       as `err=net:reconnect_kick offline=Nms`.
 
-  fw_target:
-    type: string
-    scope: [app, device]
-    help: |
-      Target firmware identifier the device should pull.
-
-      Matches the suffix used by `tools/publish_fw.py --target <name>`;
-      today the only shipped value is `esp32c3` (timmy's platform).
-      Empty / unset means "no firmware OTA — keep running whatever's
-      flashed." Device-then-app fallback: per-device override wins,
-      otherwise fleet-wide. Pulled on next `fw_poll_interval` cycle
-      and on cold boot.
-    ops_only: true    # device reads via Stra2usClient::fw_poll(), not get_int/get_float
+  # fw_target removed 2026-05-11. The old model used `<app>/public/fw/<target>`
+  # as a shared blob with `fw_target` as the per-device pointer; identity is
+  # baked into the firmware at compile time, so a shared blob would clone
+  # identity across devices. Replaced by per-device paths:
+  # `kv:<app>/<device>/fw` (blob) + `kv:<app>/<device>/fw/sha` (sidecar).
+  # Each device pulls its own keyed firmware; no pointer needed. Operators
+  # who want to retire pre-existing app-scope or device-scope fw_target KV
+  # entries can `stra2us del <full/path>` — devices won't read them anymore.
 
   fw_poll_interval:
     type: int
@@ -270,9 +265,11 @@ vars:
   latency_display:
     label: "Show network latency on panel"
     type: int
+    enum:
+      - {value: 1, label: "true"}
+      - {value: 0, label: "false"}
     default: 0
     scope: [app, device]
-    range: [0, 1]
     help: |
       Show a rolling network-latency graph on the bottom row of the panel.
 
