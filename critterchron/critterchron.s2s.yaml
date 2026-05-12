@@ -72,6 +72,15 @@ vars:
   ir:
     label: "Active script"
     type: string
+    enum:
+      - {value: "ants", label: "ants"}
+      - {value: "coati", label: "coati"}
+      - {value: "swarm", label: "swarm"}
+      - {value: "swarm-fade", label: "swarm-fade"}
+      - {value: "thyme", label: "thyme"}
+      - {value: "tortoise", label: "tortoise"}
+      - {value: "doozer", label: "doozer"}
+      - {value: "boober", label: "boober"}
     scope: [device]
     help: |
       Script name this device should run (e.g. "thyme").
@@ -168,6 +177,57 @@ vars:
     scope: [app, device]
     range: [0.1, 1.0]
     help: Time multiplier while "retreating" (decreasing fastness)
+
+  # ---------- Timezone + DST ----------
+  #
+  # Set together when migrating a device from compile-time tz. For a
+  # US device that should track DST, set BOTH:
+  #   stra2us set <device> timezone_offset_hours -5.0   # EST base
+  #   stra2us set <device> dst_enabled 1                # US rule
+  # Brief incoherent window between the two writes (<1s in transit,
+  # <ir_poll_interval to be read) is acceptable per TODO.md.
+
+  timezone_offset_hours:
+    label: "Timezone offset (standard, hours)"
+    type: float
+    default_per_platform: true
+    scope: [app, device]
+    range: [-12.0, 14.0]
+    help: |
+      UTC offset in hours for the device's STANDARD time (DST OFF).
+      e.g. -5.0 for US-Eastern (EST), -7.0 for US-Mountain (MST),
+      0.0 for UTC, 1.0 for Central Europe.
+
+      If `dst_enabled` is set, the device adds +1.0 during the
+      configured DST window. Always specify the standard-time offset
+      here; the DST shift is applied at runtime.
+
+      Falls back to the compile-time `TIMEZONE_OFFSET_HOURS` macro
+      in creds.h when unset, so a fresh-boot device is correct for
+      its physical location before any KV reads land.
+
+  dst_enabled:
+    label: "DST rule"
+    type: int
+    default: 0
+    scope: [app, device]
+    enum:
+      - {value: 0, label: "disabled"}
+      - {value: 1, label: "US"}
+    help: |
+      Picks which DST rule the device applies. Add new enum values
+      here (e.g. 2=EU, 3=AU) when a deployment needs them — do not
+      pre-stub.
+
+      `disabled` (0): device applies `timezone_offset_hours` verbatim
+      all year. Right for jurisdictions that don't observe DST
+      (Arizona, Hawaii, most of the world) OR for cases where the
+      operator wants to manage the offset manually.
+
+      `US` (1): adds +1.0 during the US DST window — 2nd Sunday of
+      March through 1st Sunday of November, transition at 02:00
+      local. Heartbeat `tz=` field shows the effective offset so
+      you can confirm on the wire.
 
   # ---------- Light sensor + brightness ----------
 

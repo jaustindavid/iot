@@ -4,6 +4,134 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Cloud heartbeat (Particle) should mirror the Stra2us heartbeep
+  payload.** Today the cloud failsafe publishes a tiny `up=N s2s=STATUS
+  url=HOST:PORT fw=VERSION` message (`critterchron_particle.cpp` ~L1180)
+  while the Stra2us heartbeep carries the rich `up/wall/rssi/mem/rst/fw/
+  script/net/bri/phys/rend/interp/astar/agents/seeks_fail/wobble/light/
+  err` block. If Stra2us is down or unreachable, the cloud stream is the
+  only observability path — but it currently shows almost none of the
+  same data, defeating the purpose of "answer 'server down or device
+  misconfigured' from the event stream alone."
+
+  Plan:
+  1. Extract the heartbeat-payload builder out of `telemetry_cycle()`
+     into a helper, e.g. `size_t build_heartbeat_report(char* out,
+     size_t cap, bool include_err)`. Same body that already lands in
+     `report[]` today; just function-ize it.
+  2. Stra2us call site passes `include_err=true` (current behavior —
+     drains one ErrLog entry per successful publish).
+  3. New cloud call site passes `include_err=false` so the cloud
+     publish doesn't double-drain ErrLog. Cloud sees the same metric
+     surface; errors stay tied to Stra2us delivery semantics.
+  4. Bump the cloud `msg[]` buffer from 128 to ~768 bytes (heartbeat
+     fits comfortably; Particle.publish caps payload at 1024).
+  5. Cadences (`heartbeep` vs `cloud_heartbeep`) stay independent —
+     they're separate knobs and operators tune them differently for
+     bandwidth-vs-visibility tradeoffs.
+
+  ESP32 has no Particle Cloud equivalent, so this is Particle-only.
+  No change to the ESP32 .ino.
+
+- **Timezone offset + DST as Stra2us-settable knobs.** Today
+  `TIMEZONE_OFFSET_HOURS` is a compile-time `#define` in each device
+  header (currently `-4.0f` for the eastern fleet; a Denver device
+  would need a per-device override). Move both to runtime:
+
+  - `timezone_offset_hours` (float, scope `[app, device]`) — the
+    base UTC offset to apply, independent of DST. e.g. Denver's
+    base = `-7.0` (MST), eastern's = `-5.0` (EST). Per-device default
+    in creds.h still seeds the value for the first boot before any
+    KV read lands.
+  - `dst_enabled` (int, **enum**, scope `[app, device]`) — picks
+    which DST rule the device applies. Initial values:
+
+    ```yaml
+    enum:
+      - {value: 0, label: "disabled"}
+      - {value: 1, label: "US"}
+    ```
+
+    Mirrors the enum shape recently adopted for the `ir` catalog
+    entry. Add more values (e.g. `2: EU`, `3: AU`) as deployments
+    actually need them — don't pre-populate.
+
+    Default `0` (legacy compatibility — eastern devices were
+    configured at `-4.0` = EDT all year, so flipping `dst_enabled=1`
+    on those requires changing their base to `-5.0` first).
+
+  Plumbing needed:
+  - Catalog entries (`critterchron.s2s.yaml`).
+  - Both device-side `WobblyTimeSource::zone_offset_hours()` and the
+    underlying `inner_.zone_offset_hours()` (`EspTimeSource`,
+    Particle equivalent) currently return the compile-time
+    `TIMEZONE_OFFSET_HOURS` directly. Replace with a Config read,
+    with `TIMEZONE_OFFSET_HOURS` as the fallback default. Same
+    `get_float(key, def)` shape every other tunable uses; hot-path
+    safe.
+  - DST detection: hardcoded US rules behind `dst_enabled == 1`.
+    Switch on the enum value so future rules (EU, AU, ...) plug
+    in without restructuring. The non-US rules don't exist yet
+    and shouldn't be pre-stubbed — when a deployment needs one,
+    add the enum value and the matching rule together.
+
+  **Algorithm spec (US, dst_enabled == 1):**
+
+  Effective offset = `timezone_offset_hours + (1.0 if is_us_dst_active(now_utc, timezone_offset_hours) else 0.0)`.
+
+  `is_us_dst_active(now_utc, base_offset)` is true when
+  `spring_forward_utc <= now_utc < fall_back_utc`, where both
+  bounds are computed for the current calendar year:
+
+  - `spring_forward_utc` = 2nd Sunday of March at 02:00 standard
+    local time = 02:00 − base_offset hours expressed as UTC.
+    For US-Mountain (base = −7): 09:00 UTC.
+  - `fall_back_utc` = 1st Sunday of November at 02:00 standard
+    local time. For US-Mountain: 08:00 UTC.
+
+  All comparisons are UTC vs UTC — no chicken-and-egg with the
+  "what is the local time during the missing hour" ambiguity.
+  Day-of-week math (~50 LOC): build `struct tm` for the 1st of
+  the month, `timegm` it, read `tm_wday`, count days to the first
+  Sunday, add `(nth-1) * 7`, fold in seconds-into-day. `timegm`
+  is in newlib (ESP32 ✓); Particle path can defer until needed.
+
+  Cache the two UTC bounds per year — recompute when `year`
+  changes (cheap check in the per-minute syncTime path).
+
+  **Edge cases:**
+  - Arizona / Hawaii / similar: `dst_enabled = 0`. Algorithm
+    short-circuits.
+  - US Sunshine Protection Act passes (permanent DST): no
+    firmware change required — flip `dst_enabled = 0` fleet-wide,
+    bump `timezone_offset_hours` by +1.
+  - 2007-style rule shift: 10-LOC change in `is_us_dst_active`
+    (transition Sundays move).
+  - EU / AU support: future `dst_enabled = 2` / `3` enum values
+    + matching rule functions. Don't pre-build.
+
+  Surface: `clock_.zone_offset_hours()` is called from
+  `CritterEngine::syncTime()` (engine.cpp:490) once per virtual
+  minute by the tel loop. Hot-path-safe to make it a Config read.
+  Host harness (`FakeTimeSource`) keeps its compile-time path
+  unchanged — the runtime knob only applies to live devices.
+
+  **Heartbeat exposure:** add `tz=%.1f` field showing the
+  effective offset (post-DST math). Lets operators verify on the
+  wire that the device computed the right value, without having
+  to read serial logs.
+
+  **Migration story.** Devices currently compiled with
+  `TIMEZONE_OFFSET_HOURS = -4.0f` represent "EDT, summertime"
+  — already wrong by 1 hour for half the year. Migrating to
+  runtime requires writing BOTH `timezone_offset_hours = -5.0`
+  AND `dst_enabled = 1` per device. Two sequential `stra2us
+  set` calls land in <1s; device poll cycles are sparse
+  (default 1200s) so the chance of reading a mid-pair state is
+  <0.1% per cycle, and the worst symptom is "off by 1 hour
+  until next poll." Acceptable; no atomic-write mechanism
+  needed.
+
 - **Consolidate Stra2us client: `tools/s2s_client.py` → thin extensions on
   `stra2us_cli`.** Today the codebase carries two clients with ~95%
   overlap. The split:

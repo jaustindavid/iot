@@ -35,9 +35,9 @@ GRID_HEIGHT = $(shell grep GRID_HEIGHT $(DEVICE_HEADER) | awk '{print $$3}')
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
             -I $(HAL_ROOT) -I $(BUILD_DIR) -I src
 
-ENGINE_SRCS := $(HAL_ROOT)/CritterEngine.cpp $(HAL_ROOT)/ErrLog.cpp $(HAL_ROOT)/ir/IrRuntime.cpp $(HAL_ROOT)/SnapshotBuffer.cpp src/main.cpp
+ENGINE_SRCS := $(HAL_ROOT)/CritterEngine.cpp $(HAL_ROOT)/ErrLog.cpp $(HAL_ROOT)/ir/IrRuntime.cpp $(HAL_ROOT)/SnapshotBuffer.cpp $(HAL_ROOT)/Dst.cpp src/main.cpp
 
-.PHONY: list clean test-snapshot $(SCRIPTS) $(addsuffix -run, $(SCRIPTS))
+.PHONY: list clean test-snapshot test-dst $(SCRIPTS) $(addsuffix -run, $(SCRIPTS))
 
 default: list
 
@@ -82,3 +82,10 @@ test-snapshot: $(BUILD_DIR)/test_snapshot.bin
 
 $(BUILD_DIR)/test_snapshot.bin: src/test_snapshot.cpp $(HAL_ROOT)/SnapshotBuffer.cpp $(HAL_ROOT)/SnapshotBuffer.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ src/test_snapshot.cpp $(HAL_ROOT)/SnapshotBuffer.cpp
+
+# Same shape as test-snapshot — standalone date-math harness for Dst.{h,cpp}.
+test-dst: $(BUILD_DIR)/test_dst.bin
+	./$<
+
+$(BUILD_DIR)/test_dst.bin: src/test_dst.cpp $(HAL_ROOT)/Dst.cpp $(HAL_ROOT)/Dst.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ src/test_dst.cpp $(HAL_ROOT)/Dst.cpp

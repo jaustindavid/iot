@@ -38,6 +38,7 @@
 #include <Arduino.h>
 #include "interface/Config.h"
 #include "interface/CritTimeSource.h"
+#include "Dst.h"
 #include <cmath>
 #include <cstdlib>
 
@@ -47,7 +48,28 @@ public:
         : inner_(inner), cfg_(cfg) {}
 
     bool   valid()             const override { return inner_.valid(); }
-    float  zone_offset_hours() const override { return inner_.zone_offset_hours(); }
+
+    // Runtime-tunable zone offset + optional DST adjustment. Falls back
+    // to the inner source's compile-time offset if `timezone_offset_hours`
+    // KV is unset, so a fresh-boot device with no live KV reads yet
+    // still gets a sensible offset from creds.h.
+    //
+    // `dst_enabled` is an enum (see Dst.h): 0=disabled, 1=US. Unknown
+    // values fall through to "disabled" via Dst.cpp's switch default.
+    //
+    // Called from CritterEngine::syncTime() once per virtual minute by
+    // the tel loop — hot-path safe (Config getters never block, Dst
+    // math is pure µs-scale arithmetic).
+    float  zone_offset_hours() const override {
+        float base = cfg_.get_float("timezone_offset_hours",
+                                    inner_.zone_offset_hours());
+        int rule_i = cfg_.get_int("dst_enabled", 0);
+        auto rule = static_cast<critterchron::dst::Rule>(rule_i);
+        if (!inner_.valid()) return base;
+        float adj = critterchron::dst::dst_adjustment_hours(
+            rule, inner_.wall_now(), base);
+        return base + adj;
+    }
 
     // Heartbeat diagnostic — emit `wobble=(min<cur<max)s` per the
     // existing `(a<b<c)` triple convention. Caller is expected to

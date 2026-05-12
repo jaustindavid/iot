@@ -33,6 +33,7 @@
 #include "Particle.h"
 #include "interface/Config.h"
 #include "interface/CritTimeSource.h"
+#include "Dst.h"
 #include <cmath>
 #include <cstdlib>
 
@@ -42,7 +43,27 @@ public:
         : inner_(inner), cfg_(cfg) {}
 
     bool   valid()             const override { return inner_.valid(); }
-    float  zone_offset_hours() const override { return inner_.zone_offset_hours(); }
+
+    // Runtime-tunable zone offset + optional DST adjustment. Mirror of
+    // the ESP32 path; see hal/esp32/src/WobblyTimeSource.h for the full
+    // design notes. Falls back to the inner source's compile-time offset
+    // when `timezone_offset_hours` KV is unset, so a fresh-boot device
+    // is correct for its location before any KV reads land.
+    //
+    // `dst_enabled` is an enum (Dst.h): 0=disabled, 1=US. Called from
+    // CritterEngine::syncTime() once per virtual minute by the tel
+    // loop — hot-path safe (Config getters never block; Dst math is
+    // pure µs-scale arithmetic).
+    float  zone_offset_hours() const override {
+        float base = cfg_.get_float("timezone_offset_hours",
+                                    inner_.zone_offset_hours());
+        int rule_i = cfg_.get_int("dst_enabled", 0);
+        auto rule = static_cast<critterchron::dst::Rule>(rule_i);
+        if (!inner_.valid()) return base;
+        float adj = critterchron::dst::dst_adjustment_hours(
+            rule, inner_.wall_now(), base);
+        return base + adj;
+    }
 
     // Heartbeat diagnostic — emit `wobble=(min<cur<max)s` per the
     // existing `(a<b<c)` triple convention. Print in literal

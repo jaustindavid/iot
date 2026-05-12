@@ -948,12 +948,17 @@ static int telemetry_cycle() {
     // Particle heartbeat hook. Order is fixed (not sorted): healthy
     // runs satisfy `min < cur < max`; the `<` chain visually breaks
     // when the wobble algorithm misbehaves.
+    //
+    // `tz=%.1f` shows the effective offset (post-DST math). Operators
+    // can verify on the wire that timezone_offset_hours + dst_enabled
+    // produced the expected value, no serial-log spelunking.
     if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
         int extra = snprintf(report + rlen, sizeof(report) - rlen,
-                             " wobble=(%d<%d<%d)s",
+                             " wobble=(%d<%d<%d)s tz=%.1f",
                              g_clock.wobble_min_s(),
                              g_clock.wobble_offset_s(),
-                             g_clock.wobble_max_s());
+                             g_clock.wobble_max_s(),
+                             (double)g_clock.zone_offset_hours());
         if (extra > 0 && rlen + extra < (int)sizeof(report)) {
             rlen += extra;
         } else {
@@ -1143,6 +1148,12 @@ static void telemetry_task(void*) {
     (void)g_cfg.get_int("snapshot_heap_low",       5000);
     (void)g_cfg.get_int("snapshot_agent_drop_pct", 50);
     (void)g_cfg.get_int("trace_mode",              0);
+    // Timezone + DST KV pre-registers. Default for timezone_offset_hours
+    // comes from the compile-time TIMEZONE_OFFSET_HOURS in creds.h so
+    // a fresh-boot device with no live KV reads is still correct for
+    // its physical location. `dst_enabled` defaults disabled (0).
+    (void)g_cfg.get_float("timezone_offset_hours", TIMEZONE_OFFSET_HOURS);
+    (void)g_cfg.get_int  ("dst_enabled",           0);
 
     for (;;) {
         uint32_t now = millis();
