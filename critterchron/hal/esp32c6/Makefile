@@ -229,14 +229,19 @@ endif
 # working; new invocations should prefer plain `flash`.
 flash-ota: flash
 
-# Stage the built firmware to Stra2us KV at `critterchron/fw/$(PLATFORM)`.
-# No flashing — devices pull on their own cadence (see Phase 2 work).
-# Idempotent (publish_fw.py probes the remote sidecar and skips if
-# unchanged); pass FORCE=1 to override.
+# Stage the built firmware to Stra2us KV at `critterchron/$(DEVICE)/fw`
+# (binary) + `critterchron/$(DEVICE)/fw/sha` (sidecar). Per-device path
+# because identity is compiled into each binary — see TODO.md
+# "Externalize device identity" for the eventual move back to a
+# shared `critterchron/public/fw/<platform>` path.
+#
+# No flashing here — devices fetch on their own `fw_poll_interval`
+# cadence (default 1 day). Idempotent: publish_fw.py probes the
+# remote sidecar and skips if unchanged; pass FORCE=1 to override.
 #
 # Typical usage:
-#   make DEVICE=timmy_tanuki coati publish        (rebuild + stage)
-#   make DEVICE=timmy_tanuki publish              (stage current build)
+#   make DEVICE=tommy_tanuki coati publish        (rebuild + stage)
+#   make DEVICE=tommy_tanuki publish              (stage current build)
 #
 # Auth lives in stra2us_cli's env / profile resolution — same path
 # `publish_ir.py` uses. No --server / --client-id flags here.

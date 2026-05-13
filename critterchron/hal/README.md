@@ -95,15 +95,16 @@ make DEVICE=timmy_tanuki coati publish
 ```
 
 Notes on ESP32 publish:
-- Stages the firmware to `critterchron/fw/<platform>` (`esp32c3` today)
-  plus a sidecar at `critterchron/fw/<platform>/sha`.
+- Stages the firmware to `critterchron/<device>/fw` plus a sidecar
+  at `critterchron/<device>/fw/sha`. Per-device path because identity
+  is baked into the binary (see TODO.md "Externalize device identity"
+  for the longer story); when identity moves to runtime storage, the
+  path is expected to revert to `critterchron/public/fw/<platform>`.
 - Idempotent — re-runs with no source changes are a no-op. Pass
   `FORCE=1` to override.
-- Does not point any device at the staged firmware. Phase 2 of the
-  pull-OTA work (still in TODO) lets devices auto-pull on a cadence.
-- Until Phase 2 lands, `publish` is mostly a wire-layer test
-  vehicle — useful for confirming the staging round-trip works
-  end-to-end against your Stra2us instance.
+- Devices auto-pull on the `fw_poll_interval` cadence (default 1 day).
+  Each device reads its own per-device path; no app-wide pointer to
+  manage.
 
 ### Host harness (PLATFORM=host)
 

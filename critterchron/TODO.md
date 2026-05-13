@@ -128,29 +128,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   whenever someone polishes the rescue-flow visuals; the requirement
   ("visual indicator that new creds got applied") is met today.
 
-- **Public-namespace migration: move cross-device-visible data under
-  `<app>/public/...`.** Companion to Stra2us's `fr_application_view.md`,
-  full scope captured in [`PUBLIC_NAMESPACE.md`](PUBLIC_NAMESPACE.md).
-
-  Code-side scope: 6 path-construction sites in Particle Stra2usClient,
-  9 in ESP32 Stra2usClient, 4 in publish_fw.py + publish_ir.py, 5-6
-  publish-topic call sites (heartbeat + OTA events on both shims),
-  plus catalog YAML additions (`telemetry_topic`,
-  `heartbeat_interval_seconds`, `label:` on customer-facing vars).
-  Cleanest implementation introduces a new `STRA2US_TELEMETRY_TOPIC`
-  constant alongside `STRA2US_APP` so the two concerns (catalog app
-  name vs publish topic) get distinct names.
-
-  Coordinated server-side data migration (Redis RENAME) and per-device
-  ACL update sequence in PUBLIC_NAMESPACE.md. Worst-case-during-roll
-  is "telemetry not captured for a few minutes per device" or "shared
-  fetch returns 404 briefly" — both transient, neither breaks anything
-  permanently.
-
-  Drift-test follow-ups (post-cutover): lint that no KV path lives
-  under `<app>/public/<known_device_id>/...` (footgun for operators);
-  lint that no firmware site publishes to bare `<app>` topic
-  (regression catcher).
 
 - ~~**Suppress `err=ota_fetch:kvs msgpack hdr=0x81` when it's just a
   blank-key fetch.**~~ Closed 2026-05-03 — false alarm. The silencing
@@ -344,6 +321,18 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   only hits on cold-boot or post-rescue-hold. So in the steady-state
   fleet, this window almost never appears.
 
+  **Prerequisite — now satisfied:** the minimal fix below adds an
+  inline network call on the main thread *during boot*, which would
+  be unsafe if a wedged network could hang it indefinitely. The
+  2026-05-12 `LATENCY_FAILURE_MS = 2000` work in `Stra2usClient`
+  (both ESP32 connect-side via the 3-arg overload + read-side
+  `setTimeout`; Particle read-side `setTimeout`) bounds that wait:
+  worst case is a single ~2 s connect timeout + 2 s read timeout
+  ≈ 4 s, then we abandon and let the deferred tel-thread cycle
+  catch up later. Before that timeout work landed, a network wedge
+  at boot could have stalled the spinner indefinitely — that was
+  the real reason this fix wasn't safe to apply earlier.
+
   **Minimal fix (~5 lines) if it ever becomes worth closing.** Drop one
   inline `g_cfg.ir_poll()` call into the main thread between
   `Particle.connected() == true` and `Thread(...telemetry_worker...)`
@@ -352,6 +341,7 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   current. The existing `g_ota_loading` state machine handles the
   visible swap on the next main-loop iteration with the established
   green-streamer cue. No new API, no helper extraction, no enum.
+  Bounded worst-case from the timeout work above.
   ```cpp
   if (Particle.connected()) {
       g_cloud_seen = true;
@@ -369,9 +359,10 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
       if (g_tel_thread == nullptr) { /* unchanged */ }
   }
   ```
-  Spinner's last frame stays on the panel during the 1-3s blocking
-  fetch (slight rotation pause; reads as "still working"). Closes the
-  staleness window from ~15-20s to ~3s.
+  Spinner's last frame stays on the panel during the bounded
+  blocking fetch (≤4 s worst case under the new socket timeouts;
+  ~1-3 s typical, reads as "still working"). Closes the staleness
+  window from ~15-20 s to ~3 s typical, ~4 s worst case.
 
   **Why not the original ir_bootstrap_sync API?** The big refactor
   (helper extraction, `IrBootstrapResult` enum, separate orchestration)
@@ -1206,6 +1197,24 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-13 — Public-namespace migration closed.** The structural
+  work shipped earlier — heartbeat at `<app>/public/heartbeep`, shared
+  IR scripts at `<app>/public/scripts/<name>` + `.../sha`, catalog YAML
+  has `telemetry_topic` / `heartbeat_interval_seconds` / `label:`, and
+  `STRA2US_TELEMETRY_TOPIC` is the dedicated publish-topic constant.
+  Full design notes in [`PUBLIC_NAMESPACE.md`](PUBLIC_NAMESPACE.md).
+  Today's cleanup: brought `hal/README.md` + `hal/esp32c{3,6}/Makefile`
+  publish-target comments current with the 2026-05-11 per-device FW
+  path. FW blobs may move back to `<app>/public/fw/<platform>` when
+  the identity-externalization TODO ships; flagged in the updated
+  doc/comments. Drift lints (warn on `<app>/public/<device>/...`
+  collisions, regression-catch new publishes to bare `<app>` topic)
+  intentionally not pursued — device-side ACLs grant write only on
+  `<app>/public/*` + `<app>/<device>/*` so accidental cross-namespace
+  writes already fail with HTTP 403 server-side. Lints would catch
+  the same class of foot-gun at edit time instead of HTTP-error time,
+  which is convenient but not load-bearing. Park.
 
 - **2026-05-12 — Network latency `rtt=(min<mean<max)ms` heartbeat field
   + 2s socket timeout.** Stra2usClient now filters samples
