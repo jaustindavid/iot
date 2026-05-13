@@ -42,7 +42,7 @@ except ImportError:
           "requirements.txt.", file=sys.stderr)
     sys.exit(2)
 
-from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
+from tools.s2s_extras import client_from_env, Stra2usError  # noqa: E402
 
 
 CATALOG_PATH = _REPO / "critterchron.s2s.yaml"

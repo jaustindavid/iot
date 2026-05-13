@@ -564,17 +564,20 @@ static int schedule_match_max_bri(uint16_t now_min, int* out_min_bri = nullptr) 
 // Returns the HTTP status of the publish (or <=0 on TCP/network failure,
 // 0 if we punted because time isn't synced yet). The worker inspects the
 // status to decide the next attempt cadence.
-static int telemetry_cycle() {
-    if (!Time.isValid()) return 0;
-
-    // 256 bytes was snug before the light-sensor diagnostic fragment widened
-    // the payload (320 in 2026-04-22), and 320 stayed snug after the OTA
-    // error-channel fragment landed (`err=<cat>:<msg>`, up to ~70 bytes per
-    // heartbeat — see ErrLog.h). 384 leaves headroom on either fragment;
-    // truncation is still handled by the final NUL-terminate at the bottom,
-    // but headroom matters because both `light=(...)` and `err=...` are
-    // observability features — silent truncation would defeat the point.
-    char report[384];
+// Build the heartbeat body — everything except the ErrLog drain, which
+// is coupled to mark_sent-on-publish-success and so stays inline in
+// telemetry_cycle. Returns bytes written (NOT including any trailing
+// NUL). The caller can append further fields if `rlen < cap - 1`.
+//
+// Pulled out of telemetry_cycle so the Particle Cloud failsafe path can
+// publish the same payload: observability via the cloud event stream
+// stays meaningful when Stra2us is unreachable, instead of just
+// `up=N s2s=STATUS url=...` and nothing else.
+static int build_heartbeat_report(char* out, size_t cap) {
+    if (!Time.isValid()) {
+        if (cap > 0) out[0] = '\0';
+        return 0;
+    }
     int  rssi = -127;
     if (WiFi.ready()) {
         WiFiSignal sig = WiFi.RSSI();
@@ -615,7 +618,7 @@ static int telemetry_cycle() {
     const char* cur_ssid = WiFi.SSID();
     if (!cur_ssid) cur_ssid = "";
 
-    int rlen = snprintf(report, sizeof(report),
+    int rlen = snprintf(out, cap,
         "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s net=%s "
         "bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
@@ -636,7 +639,7 @@ static int telemetry_cycle() {
         (unsigned long)g_astar_avg_us,  (unsigned long)g_astar_max_us,
         (unsigned)g_engine.liveAgentCount(),
         (unsigned long)m.failed_seeks);
-    if (rlen >= (int)sizeof(report)) report[sizeof(report)-1] = '\0';
+    if (rlen >= (int)cap) out[cap-1] = '\0';
 
     // WobblyTime diagnostic — `wobble=(min<cur<max)s`. See WobblyTimeSource.h
     // for why the order is fixed (not sorted): a healthy run satisfies
@@ -646,17 +649,17 @@ static int telemetry_cycle() {
     // `tz=%.1f` shows the effective offset (post-DST math) so operators
     // can verify timezone_offset_hours + dst_enabled produced the
     // expected value on the wire, no serial-log spelunking.
-    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+    if (rlen > 0 && rlen < (int)cap - 1) {
+        int extra = snprintf(out + rlen, cap - rlen,
                              " wobble=(%d<%d<%d)s tz=%.1f",
                              g_clock.wobble_min_s(),
                              g_clock.wobble_offset_s(),
                              g_clock.wobble_max_s(),
                              (double)g_clock.zone_offset_hours());
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+        if (extra > 0 && rlen + extra < (int)cap) {
             rlen += extra;
         } else {
-            report[sizeof(report) - 1] = '\0';
+            out[cap - 1] = '\0';
         }
     }
 
@@ -672,25 +675,52 @@ static int telemetry_cycle() {
     // glance tells you whether raw is outside the learned range (numeric
     // ordering of the `<` symbols breaks — widen incoming) or inside it
     // (ordering holds — mapping is doing what it was told).
-    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+    if (rlen > 0 && rlen < (int)cap - 1) {
+        int extra = snprintf(out + rlen, cap - rlen,
                              " light=(%d<%d<%d)",
                              g_light.cal_bright,
                              g_light.last_raw,
                              g_light.cal_dark);
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+        if (extra > 0 && rlen + extra < (int)cap) {
             rlen += extra;
         } else {
-            report[sizeof(report) - 1] = '\0';
+            out[cap - 1] = '\0';
         }
     }
 #endif
+
+    return rlen;
+}
+
+
+// Stra2us heartbeat cycle. Builds the rich heartbeat body via the
+// shared helper, drains one ErrLog entry (mark_sent-on-success
+// coupled to the Stra2us publish — NOT shared with the cloud path),
+// publishes to STRA2US_TELEMETRY_TOPIC.
+static int telemetry_cycle() {
+    if (!Time.isValid()) return 0;
+
+    // 256 bytes was snug before the light-sensor diagnostic fragment widened
+    // the payload (320 in 2026-04-22), and 320 stayed snug after the OTA
+    // error-channel fragment landed (`err=<cat>:<msg>`, up to ~70 bytes per
+    // heartbeat — see ErrLog.h). 384 leaves headroom on either fragment;
+    // truncation is still handled by the final NUL-terminate at the bottom,
+    // but headroom matters because both `light=(...)` and `err=...` are
+    // observability features — silent truncation would defeat the point.
+    char report[384];
+    int rlen = build_heartbeat_report(report, sizeof(report));
+    if (rlen == 0) return 0;
 
     // Error-channel drain. One entry per heartbeat (ring is 4 deep, so
     // a burst clears in 4 cycles = ~40s at 10s heartbeats — fast enough
     // to track an OTA failure cluster, slow enough not to flood). Mark
     // sent ONLY on successful publish; a network blip leaves the entry
     // queued for retry on the next cycle.
+    //
+    // Stays inline (not in the shared builder) because the cloud
+    // failsafe path uses the same builder but MUST NOT consume errors
+    // — those need to stay on the Stra2us delivery channel so a
+    // cloud-only success doesn't silently drain them.
     critterchron::ErrEntry pending_err;
     bool have_err = critterchron::g_errlog.peek_oldest_unsent(pending_err);
     if (have_err && rlen > 0 && rlen < (int)sizeof(report) - 8) {
@@ -1179,20 +1209,42 @@ static void telemetry_worker() {
         // Failsafe heartbeat to Particle cloud. Fires at most once per
         // cloud_heartbeep seconds, independent of the Stra2us status —
         // specifically so a broken Stra2us doesn't silence device
-        // observability. Payload is grep-friendly k=v with the last Stra2us
-        // status and the URL we're trying, so "is the server down, or is the
-        // device misconfigured" is answerable from the event stream alone.
+        // observability.
+        //
+        // Payload mirrors the full Stra2us heartbeep (built via the
+        // same `build_heartbeat_report` helper) so the cloud event
+        // stream carries the same observability surface — answers
+        // "what was the device doing when Stra2us went down?" with
+        // the rich metric set, not just `up=` + `s2s=`. Appends a
+        // `cloud_s2s=N cloud_url=HOST:PORT` suffix specific to this
+        // publish path so an operator tailing the cloud event stream
+        // sees the last Stra2us cycle's HTTP status without needing
+        // to cross-reference. Does NOT drain ErrLog — that channel
+        // is tied to Stra2us delivery so a cloud-only success can't
+        // silently mark errors as sent.
         int cloud_hb = g_cfg.get_int("cloud_heartbeep", CLOUD_HEARTBEEP_DEFAULT);
         if (cloud_hb < 60) cloud_hb = 60;
         unsigned long cloud_hb_ms = (unsigned long)cloud_hb * 1000UL;
         if (Particle.connected() &&
             (last_cloud_ms == 0 || now - last_cloud_ms >= cloud_hb_ms)) {
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "up=%lu s2s=%d url=%s:%d fw=%s",
-                     (unsigned long)System.uptime(),
-                     status, STRA2US_HOST, STRA2US_PORT, APP_VERSION);
-            Particle.publish("stra2us", msg, PRIVATE);
+            // Static so 768 B doesn't sit on the tel-thread stack
+            // (cf. debug_ota_hardfault_stack.md). Particle.publish
+            // payload cap is 1024 B; we sit well under.
+            static char msg[768];
+            int len = build_heartbeat_report(msg, sizeof(msg));
+            if (len > 0 && len < (int)sizeof(msg) - 1) {
+                int extra = snprintf(msg + len, sizeof(msg) - len,
+                                     " cloud_s2s=%d cloud_url=%s:%d",
+                                     status, STRA2US_HOST, STRA2US_PORT);
+                if (extra > 0 && len + extra < (int)sizeof(msg)) {
+                    len += extra;
+                } else {
+                    msg[sizeof(msg) - 1] = '\0';
+                }
+            }
+            if (len > 0) {
+                Particle.publish("stra2us", msg, PRIVATE);
+            }
             last_cloud_ms = now;
         }
 

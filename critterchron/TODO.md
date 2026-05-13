@@ -4,71 +4,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
-- **Cloud heartbeat (Particle) should mirror the Stra2us heartbeep
-  payload.** Today the cloud failsafe publishes a tiny `up=N s2s=STATUS
-  url=HOST:PORT fw=VERSION` message (`critterchron_particle.cpp` ~L1180)
-  while the Stra2us heartbeep carries the rich `up/wall/rssi/mem/rst/fw/
-  script/net/bri/phys/rend/interp/astar/agents/seeks_fail/wobble/light/
-  err` block. If Stra2us is down or unreachable, the cloud stream is the
-  only observability path — but it currently shows almost none of the
-  same data, defeating the purpose of "answer 'server down or device
-  misconfigured' from the event stream alone."
-
-  Plan:
-  1. Extract the heartbeat-payload builder out of `telemetry_cycle()`
-     into a helper, e.g. `size_t build_heartbeat_report(char* out,
-     size_t cap, bool include_err)`. Same body that already lands in
-     `report[]` today; just function-ize it.
-  2. Stra2us call site passes `include_err=true` (current behavior —
-     drains one ErrLog entry per successful publish).
-  3. New cloud call site passes `include_err=false` so the cloud
-     publish doesn't double-drain ErrLog. Cloud sees the same metric
-     surface; errors stay tied to Stra2us delivery semantics.
-  4. Bump the cloud `msg[]` buffer from 128 to ~768 bytes (heartbeat
-     fits comfortably; Particle.publish caps payload at 1024).
-  5. Cadences (`heartbeep` vs `cloud_heartbeep`) stay independent —
-     they're separate knobs and operators tune them differently for
-     bandwidth-vs-visibility tradeoffs.
-
-  ESP32 has no Particle Cloud equivalent, so this is Particle-only.
-  No change to the ESP32 .ino.
-
-- **Consolidate Stra2us client: `tools/s2s_client.py` → thin extensions on
-  `stra2us_cli`.** Today the codebase carries two clients with ~95%
-  overlap. The split:
-
-  - `stra2us_cli` (upstream, editable from `../stra2us/tools/`) is used
-    by `publish_fw.py` / `publish_ir.py` / `set_ir_pointer.py`. Has
-    `put(key, value, encrypted=False)` and `get(key)`; no queue ops, no
-    TTL on `put`.
-  - `tools/s2s_client.py` (local) is used by `tools/s2s.py`, the
-    analyzer, `snapshot_dump.py`, and `trace_on.py`. Adds queue
-    `consume(topic, envelope=True)` and `put(key, value, ttl=N)` —
-    both real gaps in upstream.
-
-  Cleanup plan:
-
-  1. New file `tools/s2s_extras.py` — subclass `stra2us_cli.Stra2usClient`
-     to add `consume()` and override `put()` with the optional `ttl`
-     kwarg. ~60 LOC of glue. Mirror the existing `client_from_env`
-     surface so callers don't change shape.
-  2. Re-point analyzer + snapshot_dump + trace_on + s2s.py (the original)
-     at `s2s_extras`. Single line per file.
-  3. Delete `tools/s2s_client.py`.
-
-  Why this matters: upstream protocol changes (response signing
-  refinements, encrypted-value updates, new dep adds like the recent
-  `bleach`) are picked up automatically once we're on the editable
-  install rather than carrying a forked HMAC+msgpack+response-sig
-  implementation locally. The local fork is what made `pip install -e
-  ../stra2us/tools --upgrade` necessary as a manual ritual; after this
-  consolidation, upgrading the editable install is the only thing.
-
-  Don't do (3) — push `consume` / `ttl` back into upstream — until
-  there's a second consumer of stra2us-cli outside critterchron.
-  Today we're effectively the only user; a stable upstream API is
-  premature.
-
 - **Network latency observability — heartbeat stats + optional on-device
   graph.** Two layered features sharing the same instrumentation. The
   goal is *deviation from norm* detection, not absolute network
@@ -1231,6 +1166,35 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-12 — Cloud heartbeat (Particle) mirrors the Stra2us heartbeep
+  payload.** Extracted `build_heartbeat_report(char* out, size_t cap)`
+  out of `telemetry_cycle` in `critterchron_particle.cpp`. Both call
+  sites consume it: Stra2us path appends an `err=cat:msg` drain inline
+  (mark_sent-on-success coupling stays tied to Stra2us delivery so a
+  cloud-only success can't silently consume errors); cloud path appends
+  `cloud_s2s=N cloud_url=HOST:PORT` so an operator tailing the Particle
+  event stream sees the last Stra2us cycle's HTTP status without
+  cross-referencing. Cloud `msg[]` static buffer 768 B (was 128 B);
+  Particle.publish caps payload at 1024. ESP32 unaffected — no Particle
+  Cloud equivalent. All five platforms build clean (sizes +80 bytes
+  flash, +~700 RAM per Particle platform); 30/30 + 29/29 + 57/57 tests.
+
+- **2026-05-12 — Consolidate Stra2us client → `tools/s2s_extras.py`.**
+  Replaced the local `tools/s2s_client.py` (which carried ~95% of
+  upstream's HMAC + msgpack + response-sig machinery as a fork that
+  drifted) with a thin subclass of `stra2us_cli.Stra2usClient`. Adds
+  `consume(topic, envelope=True)` for queue tail and overrides `put`
+  to accept `ttl=` for the trace-mode safety-net pattern. Overrode
+  `_request` with an optional `query_string` kwarg so both new
+  surfaces work without re-implementing the signing path
+  (server contract: signing uses bare URI, query is on the wire
+  only). `client_from_env` keeps the historical positional
+  signature so callers don't need keyword conversion. Updated four
+  importers (analyzer, snapshot_dump, trace_on, s2s.py), deleted
+  s2s_client.py. Now upstream protocol changes + transitive dep
+  adds (like the recent `bleach` incident) ride through without
+  manual reinstalls. 57/57 tests pass.
 
 - **2026-05-12 — Rejected: re-homogenize staging fleet to all-C3.**
   Originally filed when only `timmy_tanuki` (C3) + `tommy_tanuki` /

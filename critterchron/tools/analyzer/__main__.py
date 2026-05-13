@@ -34,7 +34,7 @@ _REPO = _HERE.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from tools.s2s_client import client_from_env, S2sClient, Stra2usError  # noqa: E402
+from tools.s2s_extras import client_from_env, S2sClient, Stra2usError  # noqa: E402
 
 from . import config as analyzer_config  # noqa: E402
 from .parser import numeric_metrics, parse_heartbeat  # noqa: E402

@@ -37,7 +37,7 @@ _REPO = _HERE.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from tools.s2s_client import client_from_env, Stra2usError  # noqa: E402
+from tools.s2s_extras import client_from_env, Stra2usError  # noqa: E402
 
 
 # Server caps TTL at 1 week (604800s); we won't touch the cap, but
