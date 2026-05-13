@@ -16,7 +16,7 @@
 # arrive and tommy/tammy are retired, update DEVICES below.
 set -euo pipefail
 
-DEVICES="${DEVICES:-timmy_tanuki tommy_tanuki tammy_tanuki roberta_raccoon}"
+DEVICES="${DEVICES:-timmy_tanuki c3a_tanuki c3b_tanuki c3c_tanuki tommy_tanuki tammy_tanuki roberta_raccoon}"
 SCRIPT="${1:-${SCRIPT:-swarm}}"
 
 cd "$(dirname "$0")/../hal"

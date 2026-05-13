@@ -33,105 +33,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   ESP32 has no Particle Cloud equivalent, so this is Particle-only.
   No change to the ESP32 .ino.
 
-- **Timezone offset + DST as Stra2us-settable knobs.** Today
-  `TIMEZONE_OFFSET_HOURS` is a compile-time `#define` in each device
-  header (currently `-4.0f` for the eastern fleet; a Denver device
-  would need a per-device override). Move both to runtime:
-
-  - `timezone_offset_hours` (float, scope `[app, device]`) — the
-    base UTC offset to apply, independent of DST. e.g. Denver's
-    base = `-7.0` (MST), eastern's = `-5.0` (EST). Per-device default
-    in creds.h still seeds the value for the first boot before any
-    KV read lands.
-  - `dst_enabled` (int, **enum**, scope `[app, device]`) — picks
-    which DST rule the device applies. Initial values:
-
-    ```yaml
-    enum:
-      - {value: 0, label: "disabled"}
-      - {value: 1, label: "US"}
-    ```
-
-    Mirrors the enum shape recently adopted for the `ir` catalog
-    entry. Add more values (e.g. `2: EU`, `3: AU`) as deployments
-    actually need them — don't pre-populate.
-
-    Default `0` (legacy compatibility — eastern devices were
-    configured at `-4.0` = EDT all year, so flipping `dst_enabled=1`
-    on those requires changing their base to `-5.0` first).
-
-  Plumbing needed:
-  - Catalog entries (`critterchron.s2s.yaml`).
-  - Both device-side `WobblyTimeSource::zone_offset_hours()` and the
-    underlying `inner_.zone_offset_hours()` (`EspTimeSource`,
-    Particle equivalent) currently return the compile-time
-    `TIMEZONE_OFFSET_HOURS` directly. Replace with a Config read,
-    with `TIMEZONE_OFFSET_HOURS` as the fallback default. Same
-    `get_float(key, def)` shape every other tunable uses; hot-path
-    safe.
-  - DST detection: hardcoded US rules behind `dst_enabled == 1`.
-    Switch on the enum value so future rules (EU, AU, ...) plug
-    in without restructuring. The non-US rules don't exist yet
-    and shouldn't be pre-stubbed — when a deployment needs one,
-    add the enum value and the matching rule together.
-
-  **Algorithm spec (US, dst_enabled == 1):**
-
-  Effective offset = `timezone_offset_hours + (1.0 if is_us_dst_active(now_utc, timezone_offset_hours) else 0.0)`.
-
-  `is_us_dst_active(now_utc, base_offset)` is true when
-  `spring_forward_utc <= now_utc < fall_back_utc`, where both
-  bounds are computed for the current calendar year:
-
-  - `spring_forward_utc` = 2nd Sunday of March at 02:00 standard
-    local time = 02:00 − base_offset hours expressed as UTC.
-    For US-Mountain (base = −7): 09:00 UTC.
-  - `fall_back_utc` = 1st Sunday of November at 02:00 standard
-    local time. For US-Mountain: 08:00 UTC.
-
-  All comparisons are UTC vs UTC — no chicken-and-egg with the
-  "what is the local time during the missing hour" ambiguity.
-  Day-of-week math (~50 LOC): build `struct tm` for the 1st of
-  the month, `timegm` it, read `tm_wday`, count days to the first
-  Sunday, add `(nth-1) * 7`, fold in seconds-into-day. `timegm`
-  is in newlib (ESP32 ✓); Particle path can defer until needed.
-
-  Cache the two UTC bounds per year — recompute when `year`
-  changes (cheap check in the per-minute syncTime path).
-
-  **Edge cases:**
-  - Arizona / Hawaii / similar: `dst_enabled = 0`. Algorithm
-    short-circuits.
-  - US Sunshine Protection Act passes (permanent DST): no
-    firmware change required — flip `dst_enabled = 0` fleet-wide,
-    bump `timezone_offset_hours` by +1.
-  - 2007-style rule shift: 10-LOC change in `is_us_dst_active`
-    (transition Sundays move).
-  - EU / AU support: future `dst_enabled = 2` / `3` enum values
-    + matching rule functions. Don't pre-build.
-
-  Surface: `clock_.zone_offset_hours()` is called from
-  `CritterEngine::syncTime()` (engine.cpp:490) once per virtual
-  minute by the tel loop. Hot-path-safe to make it a Config read.
-  Host harness (`FakeTimeSource`) keeps its compile-time path
-  unchanged — the runtime knob only applies to live devices.
-
-  **Heartbeat exposure:** add `tz=%.1f` field showing the
-  effective offset (post-DST math). Lets operators verify on the
-  wire that the device computed the right value, without having
-  to read serial logs.
-
-  **Migration story.** Devices currently compiled with
-  `TIMEZONE_OFFSET_HOURS = -4.0f` represent "EDT, summertime"
-  — already wrong by 1 hour for half the year. Migrating to
-  runtime requires writing BOTH `timezone_offset_hours = -5.0`
-  AND `dst_enabled = 1` per device. Two sequential `stra2us
-  set` calls land in <1s; device poll cycles are sparse
-  (default 1200s) so the chance of reading a mid-pair state is
-  <0.1% per cycle, and the worst symptom is "off by 1 hour
-  until next poll." Acceptable; no atomic-write mechanism
-  needed.
-
 - **Consolidate Stra2us client: `tools/s2s_client.py` → thin extensions on
   `stra2us_cli`.** Today the codebase carries two clients with ~95%
   overlap. The split:
@@ -167,38 +68,6 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   there's a second consumer of stra2us-cli outside critterchron.
   Today we're effectively the only user; a stable upstream API is
   premature.
-
-- **Re-homogenize the staging fleet to all-C3 once SuperMinis arrive.**
-  Current staging fleet is `timmy_tanuki` (C3), `tommy_tanuki` (C6),
-  `tammy_tanuki` (C6). The mixed chip class actively works against
-  FAILURE_TRIAGE.md §4's premise — C3 and C6 have different baselines
-  for chip-class-sensitive metrics (`mem`, `phys_*`, `rend_*`), so
-  fleet-MAD detection on those metrics is noise. Closed §4 with the
-  `cheap` workaround: dropped `phys_max_us` from `fleet_rules` and
-  added an absolute threshold rule instead (analyzer.yaml). When the
-  C3 SuperMinis (~$2 each) land:
-
-  1. Provision two new client_ids on staging Stra2us (e.g.
-     `tucker_tanuki`, `truman_tanuki`); add device headers under
-     `hal/devices/` mirroring `timmy_tanuki.h`.
-  2. Flash via `hal/esp32c3/Makefile` (`make DEVICE=<name> swarm
-     flash-usb PORT=...`).
-  3. Retire `tommy_tanuki` + `tammy_tanuki` from the fleet — they're
-     proof the cross-chip-class HAL works, not active fleet members.
-     Either power them off or leave them running on a different
-     `STRA2US_CLIENT_ID` so they don't confuse fleet stats. (Easiest:
-     change DEVICES list in `tools/fleet_reflash.sh` and let them
-     stay on whatever firmware they last got, isolated from the
-     reset cycle.)
-  4. Restore the `phys_max_us` fleet rule in `analyzer.yaml` (remove
-     the threshold rule, re-add the MAD rule).
-  5. Tune `mad_multiplier` and `freshness_seconds` from the now-tight
-     same-chip cluster.
-
-  Background: see the C3 vs C6 vs S3 discussion in
-  FAILURE_TRIAGE.md notes — for critterchron's modest workload, C3
-  is the right answer on cost, RMT-without-DMA-workaround, and
-  fleet-uniformity grounds.
 
 - **Network latency observability — heartbeat stats + optional on-device
   graph.** Two layered features sharing the same instrumentation. The
@@ -1362,6 +1231,43 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-12 — Rejected: re-homogenize staging fleet to all-C3.**
+  Originally filed when only `timmy_tanuki` (C3) + `tommy_tanuki` /
+  `tammy_tanuki` (C6) were on staging — the chip-class mix forced
+  us to swap `phys_max_us`'s fleet-MAD rule for an absolute threshold,
+  losing per-device deviation signal. Now that the three C3 SuperMinis
+  (`c3a/b/c_tanuki`) have landed, the staging fleet expanded to seven
+  devices (4× C3 + 2× C6 + 1× Photon 2). Operator chose to keep the
+  mix rather than homogenize — the cross-platform soak surface is more
+  valuable than the tighter fleet stats. `analyzer.yaml` stays on the
+  chip-class-agnostic configuration: `seeks_fail` as fleet-MAD rule
+  (logic-level metric, clusters across chip classes), `phys_max_us`
+  stays as an absolute threshold rule. Path forward if we ever want
+  per-class MAD: scope fleet rules to a `devices:` allowlist (small
+  extension to `FleetMadDetector` in `tools/analyzer/detector.py`),
+  not filed since the current setup works fine.
+
+- **2026-05-12 — Timezone offset + DST as Stra2us-settable knobs.**
+  Shipped runtime-tunable `timezone_offset_hours` (float) and
+  `dst_enabled` (int enum, 0=disabled / 1=US). `hal/Dst.{h,cpp}` for
+  the cross-platform US-rule date math (2nd Sunday March → 1st Sunday
+  November, transition at 02:00 standard local for spring, 02:00
+  daylight local for fall — those are different formulas, tests
+  caught a bug there). `WobblyTimeSource::zone_offset_hours()` on both
+  ESP32 and Particle now reads the KVs and applies the DST adjustment;
+  compile-time `TIMEZONE_OFFSET_HOURS` from creds.h remains the boot
+  default. Heartbeat `tz=%.1f` field shows the effective offset
+  (post-DST math) so operators can verify on the wire. Catalog
+  drift clean, 29/29 host tests, all four platform builds succeed
+  (ESP32-C3/C6, Photon 2, OG Photon, Argon). For Denver-style
+  deployments: bake compile-time `-7.0f` (MST) as default, then
+  `stra2us set <device> dst_enabled 1` once. EU/AU/etc. plug in as
+  new enum values + matching rule functions when needed (don't
+  pre-stub). Code: `hal/Dst.{h,cpp}`, `hal/host/src/test_dst.cpp`,
+  `hal/{esp32,particle}/src/WobblyTimeSource.h`, .ino/.cpp
+  heartbeat hooks, catalog entries, all 5 platform Makefiles
+  pulled in `Dst.{h,cpp}`.
 
 - **2026-04-29 — Rejected: Phase 5 OTA IR persistence.** Originally
   scoped 2026-04-27 to skip the cold-boot re-fetch by writing
