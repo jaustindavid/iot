@@ -114,6 +114,23 @@ def test_parser_with_wobble():
           == (120, 248, 300))
 
 
+def test_parser_with_rtt():
+    line = "up=100 rtt=(45<82<140)ms agents=5"
+    p = parse_heartbeat(line)
+    check("parser: rtt triple",
+          (p.get("rtt_min"), p.get("rtt"), p.get("rtt_max"))
+          == (45, 82, 140))
+
+
+def test_parser_rtt_absent():
+    # The "device is struggling" signal — field omitted entirely when
+    # all samples timed out. Analyzer reads field-absent as the cue.
+    line = "up=100 agents=5"
+    p = parse_heartbeat(line)
+    check("parser: rtt absent → no rtt keys",
+          "rtt" not in p and "rtt_min" not in p and "rtt_max" not in p)
+
+
 def test_parser_wobble_negative_current():
     # The diagnostic case: bug pushes current outside [min, max].
     # The `<` chain in the source string is visually broken (-300 < 120
@@ -429,6 +446,8 @@ ALL_TESTS = [
     test_parser_with_light,
     test_parser_with_wobble,
     test_parser_wobble_negative_current,
+    test_parser_with_rtt,
+    test_parser_rtt_absent,
     test_parser_err_consumes_rest,
     test_parser_empty,
     test_numeric_metrics,

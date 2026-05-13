@@ -131,13 +131,30 @@ public:
     // < ~1KB). The streaming kv_fetch_stream_ is intentionally excluded —
     // a 1MB OTA fetch would dominate the metric and the user reading the
     // sparkline cares about steady-state heartbeat latency, not OTA
-    // throughput. Heartbeat code calls consume_latency_stats() once per
-    // cycle: returns the triple over the window since the last call and
-    // resets the accumulator. Returns false (stats untouched) when the
-    // window had no samples.
+    // throughput.
+    //
+    // **Failure threshold.** Samples ≥ LATENCY_FAILURE_MS are excluded
+    // from the accumulator — "sufficiently slow is as bad as failed,"
+    // and including timeouts would inflate min/mean/max with values
+    // that aren't real RTT data. Coupled with the socket timeout set
+    // in ensure_connected_ (also LATENCY_FAILURE_MS) so the tel thread
+    // can't block for longer than the threshold on a hung server.
+    static constexpr uint32_t LATENCY_FAILURE_MS = 2000;
+
+    // `consume_latency_stats` reads + resets atomically. Returns
+    // false (stats untouched) when the window had no in-threshold
+    // samples. Used by the latency-sparkline path.
     bool consume_latency_stats(uint32_t* out_min_ms,
                                uint32_t* out_mean_ms,
                                uint32_t* out_max_ms);
+
+    // `peek_latency_stats` reads the current accumulator WITHOUT
+    // resetting it. Used by the heartbeat builder so the sparkline
+    // can still consume + reset afterward without competing.
+    // Same return semantics as consume.
+    bool peek_latency_stats(uint32_t* out_min_ms,
+                            uint32_t* out_mean_ms,
+                            uint32_t* out_max_ms) const;
 
 private:
     static constexpr size_t CACHE_CAP = 32;

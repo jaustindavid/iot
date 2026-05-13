@@ -136,6 +136,14 @@ def _assign(out: dict, key: str, value: str) -> None:
             out["wobble_min"] = a
             out["wobble"] = b
             out["wobble_max"] = c
+        elif key == "rtt":
+            # `rtt=(min<mean<max)ms`. All three are diagnostic — fleet-MAD
+            # works on any of them. Field is omitted from the heartbeat
+            # when no in-threshold samples this window; analyzer can
+            # detect that as `rtt` key absent from the parsed dict.
+            out["rtt_min"] = a
+            out["rtt"] = b
+            out["rtt_max"] = c
         else:
             # Unknown triple — preserve as a tuple under the key so
             # operators can still see it without the parser growing

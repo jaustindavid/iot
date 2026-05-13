@@ -4,46 +4,20 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
-- **Network latency observability — heartbeat stats + optional on-device
-  graph.** Two layered features sharing the same instrumentation. The
-  goal is *deviation from norm* detection, not absolute network
-  performance — operator wants to spot "rico is having a bad
-  afternoon," not measure the internet.
-
-  **Status (2026-05-01):** Step 1 (instrumentation) and step 3 (graph
-  overlay) landed for ESP32 only, simpler shape than the original
-  plan. Stra2usClient accumulates min/mean/max per heartbeat window
-  (publish + small kv_fetch_* contribute samples; kv_fetch_stream_
-  excluded). Bottom-row sparkline gated by `latency_display` int knob
-  (0/1, default off), color map 20→200ms green→dim-green, >200ms red.
-  Mean is hardcoded as the displayed metric.
-
-  Open follow-ups:
-
-  - **Rotation: render to physical bottom, not logical.** Sparkline
-    currently sits at engine `y=GRID_HEIGHT-1` and goes through the
-    sink's rotation path. On `GRID_ROTATION=0` (timmy) that lands on
-    the physical bottom; on 90/180/270 it would land on whichever
-    physical edge maps to the engine's bottom. Want: physical-bottom
-    always, regardless of rotation. Either invert-rotate at
-    set_overlay_row time, or take physical (x,y) coordinates in the
+- **Sparkline-overlay polish (low priority).** Two leftover items
+  from the network-latency work, both aesthetic:
+  - **Rotation: render to physical bottom.** Sparkline goes through
+    the sink's rotation path; on `GRID_ROTATION != 0` it lands on
+    whichever physical edge maps to engine `y=GRID_HEIGHT-1`. One
+    affected device today (ricky_raccoon, `GRID_ROTATION=90`), only
+    visible when `latency_display=1`. Fix: invert-rotate at
+    `set_overlay_row` time, or take physical (x,y) coords in the
     overlay path and skip rotation in show().
-  - **Heartbeat `rtt=(p50<p95<loss%)` field.** Step 2 of the original
-    plan, not done. The accumulator currently only carries
-    min/mean/max — would need a richer ring buffer (32-64 samples)
-    for p50/p95, plus loss tracking (failed-fetch counter). Useful
-    even without the on-device graph, since fleet-wide telemetry
-    answers "which device is degraded" without enabling the overlay.
-  - **Cross-platform: Particle port.** ESP32-only today. Mirror
-    the timing wraps in `hal/particle/src/Stra2usClient.cpp`, the
-    overlay support in `NeoPixelSink.h`, and the heartbeat hook
-    in `critterchron_particle.cpp`. Mostly mechanical from the
-    ESP32 changes.
-  - **Selectable display metric (min|mean|max).** Today mean is
-    hardcoded. Add a knob (e.g. `latency_metric` string or int
-    enum) so an operator can pick which of the three triple values
-    drives the overlay color. Captured-but-unused min/max already
-    in the accumulator.
+  - **Selectable display metric (min|mean|max).** Mean is hardcoded
+    as the sparkline pixel color driver. Add a `latency_metric`
+    string/int-enum knob so operators can pick which value drives
+    the overlay. Data already in the accumulator; one switch in
+    the sparkline path.
 
   Original plan kept below for reference:
 
@@ -225,10 +199,10 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   bundle:
   1. **Name + claim to Particle**: accept `--name ronaldo_raccoon` (or
      whatever), invoke `particle device rename <id> <name>`. No product
-     enrollment — we tried Particle Cloud products + group-based OTA
-     and gave up (see "Particle products, abandoned" below); provisioning
-     is strictly about getting the device bootable and personally
-     claimed.
+     enrollment — that route was abandoned because identity is baked
+     into the binary (see "Externalize device identity" TODO above);
+     provisioning is strictly about getting the device bootable and
+     personally claimed.
   2. **Seed device header** from a template keyed on hardware class
      (Photon / Photon 2 / Argon / P1), injecting name, geometry
      (`--grid 32x8`), pin (`--matrix-pin D0`), and defaults sized to the
@@ -244,19 +218,85 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   with {{name}} markers) so the RAM-class defaults live in one place
   per class.
 
-- **Particle products, abandoned.** Briefly built out Particle Cloud
-  product/group OTA in `tools/particle_release.py` + `fleet.yaml`:
-  canary/production groups, date-encoded versions, reconcile diff. Torn
-  out on 2026-04-24 after realizing grid size is baked into each binary,
-  so "one product per hardware platform" (the shape Particle's model
-  enforces — one binary per product) would need one product per distinct
-  geometry × platform combo. At five-plus geometries across three
-  platforms that's ≥5 products for a handful of devices, with manual
-  grid-aware tagging on top. Push-based `make DEVICE=<x> flash` from a
-  laptop wins until the fleet is large enough to dwarf the setup cost.
-  If we revisit: the pivot point is probably grid-aware binary
-  selection, not the product machinery itself. Prior work lives in
-  git history under the `particle_release.py` / `fleet.yaml` paths.
+- **Externalize device identity from compiled firmware — unblocks
+  per-platform OTA on both Particle and ESP32.** Identity
+  (`STRA2US_CLIENT_ID`, `STRA2US_SECRET_HEX`, `DEVICE_NAME`) is
+  currently baked in at compile time via `creds.h`. Same root cause
+  shows up two ways:
+
+  - **Particle Cloud products** (briefly built 2026-04-24,
+    `tools/particle_release.py` + `fleet.yaml`, torn out same day):
+    Particle's product/group OTA enforces "one binary per product."
+    With identity baked in, that's "one product per device,"
+    multiplied by geometry × platform — unmanageable.
+  - **ESP32 shared-platform fw blobs** (workaround landed 2026-05-11
+    per-device paths `kv:critterchron/<device>/fw`): tried publishing
+    a single `kv:critterchron/public/fw/<platform>` binary, but
+    identity-bake meant any device that fw_poll'd it would clone the
+    publisher's identity. Pivoted to per-device blobs (storage cost
+    O(N_devices) instead of O(N_platforms)).
+
+  Both fix to the same shape: **move identity to runtime persistent
+  storage**, leave the firmware binary identity-agnostic.
+
+  **Design:**
+  - ESP32: `Preferences` (NVS), already used in
+    `critterchron_esp32.ino` for procyon target creds — pattern is
+    established.
+  - Particle: DCT (Device Configuration Table) with an app-defined
+    slot, or Particle.variable/EEPROM-style API. Both work; pick
+    whichever has the least DeviceOS friction.
+
+  **First-boot self-provisioning** is the bootstrap idiom: on every
+  boot, firmware checks the NVS/DCT slot. If populated → use those
+  values. If empty → copy from compile-time defaults (`STRA2US_*`
+  macros from `creds.h`), write to NVS/DCT, reboot. Once any device
+  has booted, NVS owns the truth; the binary itself can carry
+  placeholder/empty defaults on subsequent OTA pushes. Means:
+  - First flash is still device-specific (creds.h has to be correct
+    for that device that one time) — same USB-flash flow as today.
+  - All subsequent OTAs are identity-free binaries. Particle products
+    works again. ESP32 can revert to a single per-platform blob.
+
+  **Geometry stays compile-time** (`GRID_WIDTH`, `GRID_HEIGHT`,
+  `GRID_ROTATION`, `MATRIX_PIN`, `PIXEL_TYPE`). These are genuine
+  hardware-wiring properties; making them runtime would force a
+  separate physical-config provisioning step that has nothing in
+  common with cloud identity. Leave them. After identity is freed,
+  the binary axis is "per platform × geometry" — typically a handful
+  of unique binaries instead of one per device.
+
+  **Once it lands, the existing workarounds become obsolete (but
+  don't HAVE to be rolled back):**
+  - The 2026-05-11 ESP32 per-device fw paths (`<app>/<device>/fw`)
+    can stay, OR can be folded back to `<app>/public/fw/<platform_geometry>`
+    once identity is external. Reverting saves KV storage (N_devices
+    × ~1MB → N_unique_binaries × ~1MB) but is cosmetic at fleet
+    size of low double digits.
+  - The Particle `tools/particle_release.py` work (in git history)
+    could be resurrected, though by then `make DEVICE=<x> flash`
+    may still be the operationally simplest path.
+
+  **Scope of work:**
+  1. Add NVS slot for identity in ESP32 `critterchron_esp32.ino`
+     setup (mirror procyon credential pattern).
+  2. Add DCT slot for identity in Particle `critterchron_particle.cpp`
+     setup.
+  3. Boot path: read slot; if empty, copy from compile-time creds.h
+     macros, write slot, reboot once. Subsequent boots use slot.
+  4. `Stra2usClient` constructor reads from the runtime values
+     (currently uses `STRA2US_CLIENT_ID` / `STRA2US_SECRET_HEX` /
+     `DEVICE_NAME` macros directly at instantiation — line 226-228
+     of the ESP32 ino, similar on Particle). Convert to static
+     buffers populated at boot.
+  5. Test path: first-boot vs subsequent-boot, NVS-corruption
+     recovery, OTA across a provisioned device.
+
+  **Roughly 1-2 focused sessions.** Touches every active device once
+  (forced reboot to populate NVS) but the fleet is small. After this
+  lands, both Particle products AND ESP32 shared blobs become
+  available again as fleet-OTA strategies if the fleet ever grows
+  past the "push-from-laptop" threshold.
 
 - **Guarded `step (dx, dy) if free` opcode.** The current opcode clamps to
   grid edges, but coati's bobbing at the pool is "literally move here, no
@@ -1166,6 +1206,27 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-12 — Network latency `rtt=(min<mean<max)ms` heartbeat field
+  + 2s socket timeout.** Stra2usClient now filters samples
+  ≥ `LATENCY_FAILURE_MS` (=2000) from min/mean/max accumulator
+  ("sufficiently slow is as bad as failed"). Added `peek_latency_stats`
+  (non-resetting read) on both ESP32 and Particle so the heartbeat
+  builder can read stats without competing with the sparkline's
+  consume-and-reset. Both platforms' heartbeat builders emit
+  `rtt=(%lu<%lu<%lu)ms` near `wobble=`/`tz=`; field is OMITTED
+  entirely when zero in-threshold samples landed this window —
+  analyzer reads field-absent as "device is struggling." Socket
+  timeout set to 2s: ESP32 connect-side via 3-arg overload + read
+  via `setTimeout(2000)`; Particle read-side only via `setTimeout`
+  (TCPClient lacks a connect-timeout argument — connect-side
+  remains DeviceOS-default ~20s; residual unbounded window noted
+  in code comment). Analyzer parser special-cases `rtt=` triple
+  → `rtt_min`/`rtt`/`rtt_max` keys, mirrors `wobble=` /`bri=`
+  pattern. Two new parser tests; 59/59 passing. All five platforms
+  build clean. Dropped loss% from the original scoping — outages
+  are a heartbeat-arrival property the analyzer infers from
+  `received_at` deltas, not a payload field.
 
 - **2026-05-12 — Cloud heartbeat (Particle) mirrors the Stra2us heartbeep
   payload.** Extracted `build_heartbeat_report(char* out, size_t cap)`

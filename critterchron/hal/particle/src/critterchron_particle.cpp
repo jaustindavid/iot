@@ -663,6 +663,28 @@ static int build_heartbeat_report(char* out, size_t cap) {
         }
     }
 
+    // Network latency — `rtt=(min<mean<max)us`. peek (not consume) so
+    // the latency sparkline path in telemetry_cycle can still drain
+    // the same window afterward without competing. Field omitted
+    // when no in-threshold samples — field-absent reads as "device
+    // struggling" on the analyzer side.
+    {
+        uint32_t lmin = 0, lmean = 0, lmax = 0;
+        if (g_cfg.peek_latency_stats(&lmin, &lmean, &lmax) &&
+            rlen > 0 && rlen < (int)cap - 1) {
+            int extra = snprintf(out + rlen, cap - rlen,
+                                 " rtt=(%lu<%lu<%lu)ms",
+                                 (unsigned long)lmin,
+                                 (unsigned long)lmean,
+                                 (unsigned long)lmax);
+            if (extra > 0 && rlen + extra < (int)cap) {
+                rlen += extra;
+            } else {
+                out[cap - 1] = '\0';
+            }
+        }
+    }
+
 #if defined(LIGHT_SENSOR_TYPE)
     // Calibration diagnostic. `bri=(min<cur<max)` above only shows the
     // *output* of the sensor-mapping pipeline; when bri goes pathological

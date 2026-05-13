@@ -966,6 +966,29 @@ static int telemetry_cycle() {
         }
     }
 
+    // Network latency — `rtt=(min<mean<max)us`. peek (not consume) so
+    // the latency sparkline path below can still drain the same window
+    // afterward without competing. Field omitted entirely when there
+    // are no in-threshold samples (everything timed out, or no traffic
+    // this window) — the analyzer reads field-absent as "device is
+    // struggling," same as light= being absent on headless devices.
+    {
+        uint32_t lmin = 0, lmean = 0, lmax = 0;
+        if (g_cfg.peek_latency_stats(&lmin, &lmean, &lmax) &&
+            rlen > 0 && rlen < (int)sizeof(report) - 1) {
+            int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                                 " rtt=(%lu<%lu<%lu)ms",
+                                 (unsigned long)lmin,
+                                 (unsigned long)lmean,
+                                 (unsigned long)lmax);
+            if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+                rlen += extra;
+            } else {
+                report[sizeof(report) - 1] = '\0';
+            }
+        }
+    }
+
     // Error-channel drain. One entry per heartbeat (ring is 4 deep).
     // Mirror of telemetry_cycle() in hal/particle/src/critterchron_particle.cpp;
     // mark_sent only on successful publish so a transient network failure

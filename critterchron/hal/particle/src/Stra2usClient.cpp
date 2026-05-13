@@ -67,6 +67,10 @@ float Stra2usClient::get_float(const char* key, float def) const {
 // -------- Telemetry side --------
 
 void Stra2usClient::record_latency_(uint32_t ms) {
+    // Mirror of ESP32 path — samples ≥ LATENCY_FAILURE_MS are excluded
+    // as failure-equivalent. See hal/esp32/src/Stra2usClient.cpp for
+    // the full rationale.
+    if (ms >= LATENCY_FAILURE_MS) return;
     if (ms < latency_min_ms_) latency_min_ms_ = ms;
     if (ms > latency_max_ms_) latency_max_ms_ = ms;
     if (latency_count_ < (1u << 30)) {
@@ -75,14 +79,21 @@ void Stra2usClient::record_latency_(uint32_t ms) {
     }
 }
 
-bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
-                                          uint32_t* out_mean_ms,
-                                          uint32_t* out_max_ms) {
+bool Stra2usClient::peek_latency_stats(uint32_t* out_min_ms,
+                                       uint32_t* out_mean_ms,
+                                       uint32_t* out_max_ms) const {
     if (latency_count_ == 0) return false;
     uint32_t mean = latency_sum_ms_ / latency_count_;
     if (out_min_ms)  *out_min_ms  = latency_min_ms_;
     if (out_mean_ms) *out_mean_ms = mean;
     if (out_max_ms)  *out_max_ms  = latency_max_ms_;
+    return true;
+}
+
+bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
+                                          uint32_t* out_mean_ms,
+                                          uint32_t* out_max_ms) {
+    if (!peek_latency_stats(out_min_ms, out_mean_ms, out_max_ms)) return false;
     latency_min_ms_ = UINT32_MAX;
     latency_max_ms_ = 0;
     latency_sum_ms_ = 0;
@@ -92,7 +103,9 @@ bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
 
 bool Stra2usClient::connect() {
     if (tcp_.connected()) tcp_.stop();
-    return tcp_.connect(host_, port_);
+    bool ok = tcp_.connect(host_, port_);
+    if (ok) tcp_.setTimeout(LATENCY_FAILURE_MS);
+    return ok;
 }
 
 void Stra2usClient::close() {
@@ -128,6 +141,14 @@ bool Stra2usClient::ensure_connected_() {
     bool ok = tcp_.connect(host_, port_);
     diag_connect_ms_ = millis() - t0;
     if (ok) {
+        // Read-side timeout. Particle's TCPClient::connect doesn't
+        // expose a connect-side timeout argument (unlike ESP32's
+        // 3-arg overload), so we only bound the read side here.
+        // In practice the "hung server" case is read-side dominated;
+        // connect-side timeouts default to DeviceOS-internal values
+        // (typically ~20s) which is the residual unbounded window
+        // worth knowing about if a tel-thread stall ever traces here.
+        tcp_.setTimeout(LATENCY_FAILURE_MS);
         // Particle's TCPClient doesn't expose localIP/localPort directly;
         // WiFi.localIP() gives the device's IP on the active interface,
         // which is the diagnostic info we actually want ("is this the

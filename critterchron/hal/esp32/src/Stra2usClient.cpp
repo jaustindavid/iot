@@ -119,6 +119,16 @@ float Stra2usClient::get_float(const char* key, float def) const {
 // -------- Telemetry side --------
 
 void Stra2usClient::record_latency_(uint32_t ms) {
+    // Filter samples ≥ LATENCY_FAILURE_MS — "sufficiently slow is as
+    // bad as failed." Timeouts (which sit at the socket timeout) and
+    // their near-equivalents would otherwise inflate the accumulator
+    // with values that aren't actual RTT. The latency-sparkline used
+    // to want them (they made the row turn red), but the heartbeat
+    // rtt= field is the new primary consumer and wants clean stats.
+    // Effect on the sparkline: timed-out cycles produce no insert,
+    // leaving the previous pixel — strictly more honest than a red
+    // bar drawn from an arbitrary "I gave up" value.
+    if (ms >= LATENCY_FAILURE_MS) return;
     if (ms < latency_min_ms_) latency_min_ms_ = ms;
     if (ms > latency_max_ms_) latency_max_ms_ = ms;
     // Don't let the sum/count grow unboundedly if a consumer never runs.
@@ -131,14 +141,21 @@ void Stra2usClient::record_latency_(uint32_t ms) {
     }
 }
 
-bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
-                                          uint32_t* out_mean_ms,
-                                          uint32_t* out_max_ms) {
+bool Stra2usClient::peek_latency_stats(uint32_t* out_min_ms,
+                                       uint32_t* out_mean_ms,
+                                       uint32_t* out_max_ms) const {
     if (latency_count_ == 0) return false;
     uint32_t mean = latency_sum_ms_ / latency_count_;
     if (out_min_ms)  *out_min_ms  = latency_min_ms_;
     if (out_mean_ms) *out_mean_ms = mean;
     if (out_max_ms)  *out_max_ms  = latency_max_ms_;
+    return true;
+}
+
+bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
+                                          uint32_t* out_mean_ms,
+                                          uint32_t* out_max_ms) {
+    if (!peek_latency_stats(out_min_ms, out_mean_ms, out_max_ms)) return false;
     latency_min_ms_ = UINT32_MAX;
     latency_max_ms_ = 0;
     latency_sum_ms_ = 0;
@@ -148,7 +165,9 @@ bool Stra2usClient::consume_latency_stats(uint32_t* out_min_ms,
 
 bool Stra2usClient::connect() {
     if (tcp_.connected()) tcp_.stop();
-    return tcp_.connect(host_, port_);
+    bool ok = tcp_.connect(host_, port_, LATENCY_FAILURE_MS);
+    if (ok) tcp_.setTimeout(LATENCY_FAILURE_MS);
+    return ok;
 }
 
 void Stra2usClient::close() {
@@ -185,9 +204,20 @@ bool Stra2usClient::ensure_connected_() {
     }
 
     t0 = millis();
-    bool ok = tcp_.connect(host_, port_);
+    // Bounded connect timeout — matches LATENCY_FAILURE_MS so the
+    // tel thread can't block longer than what we'd treat as a failure
+    // sample anyway. arduino-esp32's WiFiClient::connect(host, port,
+    // timeout_ms) is the 3-arg overload; default (no timeout arg) is
+    // ~5s, which is the original "hung server keeps us blocked" path
+    // this fix addresses.
+    bool ok = tcp_.connect(host_, port_, LATENCY_FAILURE_MS);
     diag_connect_ms_ = millis() - t0;
     if (ok) {
+        // Read-side timeout. WiFiClient's setTimeout takes
+        // milliseconds in arduino-esp32 3.x. Pairs with the
+        // connect-side timeout above so total worst-case wait is
+        // bounded.
+        tcp_.setTimeout(LATENCY_FAILURE_MS);
         IPAddress lip = tcp_.localIP();
         snprintf(diag_local_ip_, sizeof(diag_local_ip_),
                  "%u.%u.%u.%u", lip[0], lip[1], lip[2], lip[3]);

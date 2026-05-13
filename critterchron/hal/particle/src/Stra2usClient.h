@@ -175,13 +175,22 @@ public:
     // kv_fetch_str_ paths (single TCP segment, response < ~1KB);
     // streaming OTA fetches are intentionally excluded (n/a here —
     // Particle has no kv_fetch_stream_ — but kept for source parity).
-    // Heartbeat code calls consume_latency_stats() once per cycle:
-    // returns the triple over the window since the last call and
-    // resets the accumulator. Returns false (stats untouched) when
-    // the window had no samples.
+    //
+    // Samples ≥ LATENCY_FAILURE_MS are excluded from the accumulator
+    // ("sufficiently slow is as bad as failed"). Coupled with the
+    // socket timeout in ensure_connected_ at the same value.
+    static constexpr uint32_t LATENCY_FAILURE_MS = 2000;
+
     bool consume_latency_stats(uint32_t* out_min_ms,
                                uint32_t* out_mean_ms,
                                uint32_t* out_max_ms);
+
+    // Non-resetting peek. Used by the heartbeat builder so the
+    // sparkline can still consume + reset afterward without
+    // competing for the same samples.
+    bool peek_latency_stats(uint32_t* out_min_ms,
+                            uint32_t* out_mean_ms,
+                            uint32_t* out_max_ms) const;
 
 private:
     static constexpr size_t CACHE_CAP = 32;
