@@ -654,6 +654,14 @@ static volatile uint32_t g_interp_avg_us = 0;
 static volatile uint32_t g_interp_max_us = 0;
 static volatile uint32_t g_astar_avg_us  = 0;
 static volatile uint32_t g_astar_max_us  = 0;
+
+// Heap-low watermark for the current heartbeat window. Sampled at every
+// physics tick (8 Hz default); emitted as `mem_min=N` in the heartbeat
+// and reset to UINT32_MAX after each emission. Captures sub-window dips
+// that a single snapshot at heartbeat-build time would miss — see the
+// rico.dump Life-2 chaotic-excursions analysis for the failure pattern
+// this catches. UINT32_MAX sentinel means "no samples yet this window."
+static volatile uint32_t g_mem_min = UINT32_MAX;
 #endif
 
 static int local_minute(const CritTimeSource& c) {
@@ -897,14 +905,19 @@ static int telemetry_cycle() {
     // mapped-and-smoothed output the sink is actually using. Together
     // they answer "is the room light what we think it is" (lux) and "is
     // the curve+clamp producing sensible brightness" (bri triplet).
+    // Snapshot + atomic-reset the heartbeat-window heap floor. Race
+    // window between read and reset is ~1 instruction; worst case we
+    // miss one physics-tick's sample (~125 ms). Acceptable.
+    uint32_t mem_min_snapshot = g_mem_min;
+    g_mem_min = UINT32_MAX;
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) lux=%.1f "
+        "up=%lu rssi=%d mem_min=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) lux=%.1f "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
         (unsigned long)(millis() / 1000),
         rssi,
-        (unsigned long)ESP.getFreeHeap(),
+        (unsigned long)mem_min_snapshot,
         (int)esp_reset_reason(),
         APP_VERSION,
         fw_sha_field,
@@ -920,14 +933,17 @@ static int telemetry_cycle() {
         (unsigned long)m.failed_seeks,
         CONFIG_IDF_TARGET);
 #else
+    // mem_min: see comment in the CRIT_HAVE_LIGHT branch above.
+    uint32_t mem_min_snapshot = g_mem_min;
+    g_mem_min = UINT32_MAX;
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d heap=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) "
+        "up=%lu rssi=%d mem_min=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
         (unsigned long)(millis() / 1000),
         rssi,
-        (unsigned long)ESP.getFreeHeap(),
+        (unsigned long)mem_min_snapshot,
         (int)esp_reset_reason(),
         APP_VERSION,
         fw_sha_field,
@@ -1897,6 +1913,14 @@ void loop() {
         diag_astar_total  += astar_dt;
         if (astar_dt > diag_astar_max) diag_astar_max = astar_dt;
 
+        // Sample free heap once per physics tick (8 Hz default). Cheap
+        // — `ESP.getFreeHeap()` is a constant-time counter read on
+        // ESP-IDF. Update the windowed minimum for `mem_min=` in the
+        // heartbeat. Hoisted into a local so snapshot::append below
+        // reads the same value (was calling getFreeHeap twice per tick).
+        uint32_t free_now = ESP.getFreeHeap();
+        if (free_now < g_mem_min) g_mem_min = free_now;
+
         // FAILURE_TRIAGE.md §1: record one ring-buffer frame per physics
         // tick. No-op when `snapshot_buffer_frames` KV is 0 (default).
         // `rend_max_us` arg is 0 in v1 — the per-tick render dt isn't
@@ -1907,7 +1931,7 @@ void loop() {
         critterchron::snapshot::append(
             s_phys_tick_counter, now,
             (uint16_t)g_engine.liveAgentCount(),
-            (uint32_t)ESP.getFreeHeap(),
+            free_now,
             (uint32_t)g_engine.metrics().failed_seeks,
             /*phys_us=*/ dt,
             /*rend_us=*/ 0);

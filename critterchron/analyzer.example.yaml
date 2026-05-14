@@ -34,7 +34,7 @@ alert_dedup_seconds: 60
 # Threshold rules: blunt absolute checks. Cheap to evaluate; useful
 # for hard floors/ceilings that don't depend on the rest of the fleet.
 threshold_rules:
-  - metric: mem
+  - metric: mem_min
     op: "<"
     value: 5000
     name: heap_low

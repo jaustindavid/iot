@@ -306,6 +306,15 @@ static volatile uint32_t g_interp_avg_us   = 0;
 static volatile uint32_t g_interp_max_us   = 0;
 static volatile uint32_t g_astar_avg_us    = 0;
 static volatile uint32_t g_astar_max_us    = 0;
+
+// Heap-low watermark for the current heartbeat window. Sampled at every
+// physics tick (8 Hz default); emitted as `mem_min=N` in the heartbeat
+// and reset to UINT32_MAX after each emission. Catches sub-window dips
+// that a single snapshot at heartbeat-build time would miss — see the
+// rico.dump Life-2 chaotic-excursions analysis for the failure pattern
+// this catches. UINT32_MAX sentinel means "no samples yet this window."
+static volatile uint32_t g_mem_min          = UINT32_MAX;
+
 static Thread*           g_tel_thread      = nullptr;
 
 static unsigned long last_physics_tick = 0;
@@ -618,8 +627,14 @@ static int build_heartbeat_report(char* out, size_t cap) {
     const char* cur_ssid = WiFi.SSID();
     if (!cur_ssid) cur_ssid = "";
 
+    // `mem_min=` is the heap-low watermark observed during this
+    // heartbeat window (sampled at every physics tick). Read here but
+    // NOT reset — both this Stra2us publish AND the cloud failsafe
+    // publish call build_heartbeat_report in the same tel-task
+    // iteration, and both should report the same value. The reset
+    // happens once per iteration at the end of the tel-task loop.
     int rlen = snprintf(out, cap,
-        "up=%lu wall=%lu rssi=%d mem=%lu rst=%d fw=%s script=%s net=%s "
+        "up=%lu wall=%lu rssi=%d mem_min=%lu rst=%d fw=%s script=%s net=%s "
         "bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
@@ -627,7 +642,7 @@ static int build_heartbeat_report(char* out, size_t cap) {
         (unsigned long)System.uptime(),
         (unsigned long)Time.now(),
         rssi,
-        (unsigned long)System.freeMemory(),
+        (unsigned long)g_mem_min,
         (int)System.resetReason(),
         APP_VERSION,
         script_tag,
@@ -1270,6 +1285,14 @@ static void telemetry_worker() {
             last_cloud_ms = now;
         }
 
+        // End-of-iteration reset for the heap-low watermark. Both the
+        // Stra2us heartbeat above AND the cloud failsafe heartbeat
+        // have now consumed `g_mem_min` for this iteration; reset so
+        // the next window starts fresh. Race window between this reset
+        // and a concurrent physics-tick update is ~1 instruction, worst
+        // case we lose one sample (~125 ms of coverage).
+        g_mem_min = UINT32_MAX;
+
         delay(100);
     }
 }
@@ -1764,6 +1787,14 @@ void loop() {
             diag_astar_total  += astar_dt;
             if (astar_dt > diag_astar_max) diag_astar_max = astar_dt;
 
+            // Sample free heap once per physics tick (8 Hz default).
+            // `System.freeMemory()` is a constant-time counter read on
+            // DeviceOS. Update windowed minimum for `mem_min=` in the
+            // heartbeat. Hoisted into a local so snapshot::append below
+            // reads the same value (avoids calling freeMemory twice).
+            uint32_t free_now = System.freeMemory();
+            if (free_now < g_mem_min) g_mem_min = free_now;
+
             // FAILURE_TRIAGE.md §1: ring-buffer frame per physics tick.
             // No-op when feature dormant (frames=0) or compile-elided
             // (NO_SNAPSHOT_BUFFER on rico_raccoon).
@@ -1772,7 +1803,7 @@ void loop() {
             critterchron::snapshot::append(
                 s_phys_tick_counter, now,
                 (uint16_t)g_engine.liveAgentCount(),
-                (uint32_t)System.freeMemory(),
+                free_now,
                 (uint32_t)g_engine.metrics().failed_seeks,
                 /*phys_us=*/ dt,
                 /*rend_us=*/ 0);

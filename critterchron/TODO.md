@@ -4,6 +4,54 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Heartbeat additions for log-mining: `mem_min` + `ticks`.** Now that
+  the Stra2us queue serves as a week-plus retention buffer (rico.dump
+  has 9300 heartbeats / 235 h proving this), worth sneaking in a
+  couple of cheap fields that would have made the rico investigation
+  faster + catch failures the current fields can't.
+
+  **`mem_min=N`** — minimum `System.freeMemory()` observed in the
+  heartbeat window. Reset on each publish. Catches sub-window heap
+  dips that the 5-min `mem=` snapshot misses entirely — Life 2's
+  `mem=960` dip in `rico.dump` only landed because it happened to
+  align with a heartbeat boundary; intermediate dips between
+  heartbeats are currently invisible. Implementation: file-scope
+  `volatile uint32_t g_mem_min`, sampled at every physics tick
+  (8 Hz default → cheap, constant-time `freeMemory()` read on
+  Particle), reset to UINT32_MAX after each heartbeat publish.
+  Heartbeat appends ` mem_min=%lu` next to `mem=`.
+
+  **Plumbing:**
+  - Heartbeat appends in `build_heartbeat_report` (Particle) and
+    the matching snprintf chain in `critterchron_esp32.ino`.
+  - Analyzer parser already handles bare scalar k=v fields → no
+    parser change needed.
+
+  Effort: ~30 min cross-platform + heartbeat test, no analyzer
+  changes required. Format follows existing convention.
+
+- **(low priority) `ticks=N` cumulative physics-tick counter in
+  heartbeat.** Cumulative count of physics ticks since boot.
+  Increments in the same spot as `diag_phys_*` accumulators.
+  Catches partial engine slowdown (running at 4 Hz instead of
+  configured 8 Hz) — a failure mode neither `phys_avg_us` (which
+  measures per-tick cost, unchanged in this scenario) nor the
+  staleness detector (which watches "values not changing", but
+  values would still wobble at half-speed) would catch. Also
+  validates tickrate misconfiguration immediately on boot.
+
+  Honest assessment: real new diagnostic surface but for a class
+  of failure we've never observed. Cheap (~4 bytes static, no
+  hot-path cost). Worth doing **if** we ever hit a "engine seems
+  fine but feels sluggish" report, or if the staleness detector
+  ever needs a cleaner signal than `phys_max_us`. Until then,
+  parked.
+
+  If implemented: same plumbing as `mem_min` (heartbeat appender,
+  no parser changes). The staleness detector could move its
+  default-watched metric from `phys_max_us` to `ticks` for a
+  cleaner "engine alive" check.
+
 - **Sparkline-overlay polish (low priority).** Two leftover items
   from the network-latency work, both aesthetic:
   - **Rotation: render to physical bottom.** Sparkline goes through
@@ -599,16 +647,34 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
   **Dependencies.** None. Natural to bundle with night-markers in a
   v6 bump, but can land independently.
 
-- **Tile-fade RAM clawback for OG Photon.** The fade landing
-  (2026-04-26) added 4 bytes/tile (`age` + `age_max`) plus the
-  hold variant's 1-bit `hold_mode` (free in HAL bitfield slack).
-  Spec §369-374 budgeted "manageable on every platform including
-  OG Photon" — empirically wrong: flashing the new firmware to
-  rico (OG Photon, 8×8 = 256 B added) dirtnapped it on the first
-  boot. Pre-emptively cut the 4K IR_OTA buffer on ronaldo (P1) to
-  keep it alive; rico is currently bricked-in-place pending one
-  of the two remediations below. **Posture:** disabled-OTA route
-  first (no code change), evaluate the knobs after rico is back.
+- **(very low priority — insurance only) Tile-fade RAM clawback
+  for OG Photon.** The fade landing (2026-04-26) added 4 bytes/tile
+  (`age` + `age_max`) plus the hold variant's 1-bit `hold_mode`
+  (free in HAL bitfield slack). On rico's 16×16 grid that's 1024 B
+  of static `.bss`. Original framing of this TODO claimed rico was
+  bricked-in-place by the fade landing; that was stale (rico was
+  alive on swarm-fade already by the 2026-05-13 audit) and the
+  rico.dump analysis revealed the deeper truth: **rico's memory
+  is well-managed**. 7-of-8 lives in the dump ran without panic,
+  including a 57-hour run on swarm-fade. The "leak" we briefly
+  suspected was a startup transient + stable plateau. See memory
+  note `debug_rico_heap_delta_2026-05-13` for the full analysis.
+
+  **Why this TODO still exists** rather than being closed:
+
+  The dump revealed one real trend worth tracking — plateau drops
+  build-over-build as features accumulate (~3200 B baseline lost
+  since May 4 across all the work that's shipped since). Current
+  plateau is ~2648 B free. If a future feature drops it by another
+  ~1000 B, the panic window narrows enough that the rare-event
+  excursions (Life 2's chaotic last samples bottomed at 960 B
+  before crashing) become more dangerous. This TODO is the
+  pre-prepared escape valve for that future.
+
+  **Trigger condition for actually doing the work:** rico's
+  steady-state plateau drops below ~1500 B free heap, OR another
+  rico panic (rst=130) reproduces post the May 2026 stability
+  fixes. Until then, parked.
 
   **Option 1 — `IR_TILE_FADE_ENABLED` compile-out switch.** Defaults
   to 1; a device header sets it to 0 to skip `age` / `age_max` /
@@ -1197,6 +1263,25 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-13 — Rico heap "leak" investigation closed (not a leak).**
+  Started from observed ~1040 B `mem=` delta between swarm and
+  swarm-fade. Agent did full static analysis: only 4 heap-allocating
+  sites in entire device codebase (all A* pf_* vectors, bounded);
+  rest is static or stack. Empirical confirmation via 9303-heartbeat
+  / 235 h `rico.dump`: pattern is **startup transient → stable
+  plateau**, not continuous drift. Five lives in the dump showed
+  bit-identical `mem=` plateaus held for 6–34+ hours. The 57h Life 5
+  on swarm-fade ran flat at mem=3672 for the entire run. One panic
+  (Life 2, May 5 build, predates a bunch of stability fixes) showed
+  chaotic end-of-life excursions (4704→960→5104→2816→panic), not
+  steady drift — likely transient heap pressure from a rare event,
+  plausibly already addressed by post-May-5 fixes (OTA HardFault,
+  publish/sign buffers, WICED reconnect kick, wobble RTC fix). Full
+  analysis in memory note `debug_rico_heap_delta_2026-05-13`. Real
+  trend the data revealed: build-over-build plateau drop (~3200 B
+  baseline lost since May 4 as features land); the fade-clawback
+  TODO would recover ~1024 B of that.
 
 - **2026-05-13 — Public-namespace migration closed.** The structural
   work shipped earlier — heartbeat at `<app>/public/heartbeep`, shared

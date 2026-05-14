@@ -19,7 +19,7 @@ metrics_retention_seconds: 86400
 alert_dedup_seconds: 60
 
 threshold_rules:
-  - metric: mem
+  - metric: mem_min
     op: "<"
     value: 5000
     name: heap_low
