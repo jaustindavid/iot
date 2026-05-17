@@ -726,6 +726,55 @@ static int build_heartbeat_report(char* out, size_t cap) {
     }
 #endif
 
+    // Engine-wedge diagnostic fields. Mirror of the ESP32 block in
+    // critterchron_esp32.ino — kept symmetric so the analyzer parses one
+    // shape across platforms. Added 2026-05-17 after the boober-on-C3 wedge
+    // (timmy/c3b: seeks+astar bit-identical for hours, no other signal).
+    // Particle is currently the "healthy" control group for this script;
+    // these fields here let us verify Particle's stick/sclock advance and
+    // states cycle normally, confirming the bug is ESP32-specific.
+    //   stick=<n>             engine tick counter
+    //   ast=(s1,s2,...)       per-agent state names
+    //   cells=(m=N,x=N)       missing+extra tile counts
+    //   esync_lag=<sec>       seconds since engine last received a time pulse
+    if (rlen > 0 && rlen < (int)cap - 1) {
+        const uint32_t stick    = g_engine.tickCount();
+        const uint16_t n_miss   = g_engine.countTiles("missing");
+        const uint16_t n_extra  = g_engine.countTiles("extra");
+        const time_t   sync_at  = g_engine.lastSyncedUnix();
+        const time_t   wall     = g_clock.wall_now();
+        // -1 sentinel before the engine has ever synced; avoids a garbage
+        // multi-decade value on first post-boot heartbeat.
+        const long     esync_lag = (sync_at == 0) ? -1
+                                 : (long)(wall - sync_at);
+        int extra = snprintf(out + rlen, cap - rlen,
+                             " stick=%lu cells=(m=%u,x=%u) esync_lag=%lds",
+                             (unsigned long)stick,
+                             (unsigned)n_miss,
+                             (unsigned)n_extra,
+                             esync_lag);
+        if (extra > 0 && rlen + extra < (int)cap) {
+            rlen += extra;
+            const uint16_t n_slots = g_engine.agentSlotCount();
+            if (rlen < (int)cap - 5) {
+                int n = snprintf(out + rlen, cap - rlen, " ast=(");
+                if (n > 0) rlen += n;
+                for (uint16_t i = 0; i < n_slots && rlen < (int)cap - 2; ++i) {
+                    n = snprintf(out + rlen, cap - rlen,
+                                 "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
+                    if (n <= 0 || rlen + n >= (int)cap - 2) break;
+                    rlen += n;
+                }
+                if (rlen < (int)cap - 1) {
+                    out[rlen++] = ')';
+                    out[rlen]   = '\0';
+                }
+            }
+        } else {
+            out[cap - 1] = '\0';
+        }
+    }
+
     return rlen;
 }
 

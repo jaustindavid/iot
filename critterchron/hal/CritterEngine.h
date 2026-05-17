@@ -185,6 +185,35 @@ public:
         for (uint16_t i = 0; i < agent_count_; ++i) if (agents_[i].alive) ++n;
         return n;
     }
+    uint16_t             agentSlotCount() const { return agent_count_; }
+
+    // Per-agent state-string name (from `state { ... }` declaration in the
+    // script). Returns "none" for dead/OOB agents or agents whose state_str_id
+    // hasn't been set. Pointer is into the loaded IR string pool — stable
+    // across the lifetime of the loaded blob, do not free.
+    //
+    // Heartbeat builders use this for the `ast=(s1,s2,...)` field; combined
+    // with the seek/astar staleness signature it distinguishes "both agents
+    // wedged in the same state forever" (state machine stuck) from "both
+    // agents legitimately taking the idle branch" (clock-face complete /
+    // missing-cell set empty).
+    const char* agentStateName(uint16_t idx) const;
+
+    // Walk the grid and count tiles matching `kind`. `kind` is anything
+    // tileMatches() accepts: "missing", "extra", "current", or a landmark
+    // name. Returns 0 for unrecognized kinds. O(GRID_WIDTH*GRID_HEIGHT);
+    // cheap on physical-display sizes (~70 cells), do not call from the
+    // engine hot loop. Heartbeat-cycle use only.
+    uint16_t countTiles(const char* kind) const;
+
+    // UTC seconds passed to the most recent syncTimeAt() call, or 0 if
+    // the engine has never synced. The heartbeat builder publishes the
+    // delta (wall - lastSyncedUnix) as `esync_lag=`. Healthy fleet hovers
+    // at <=60s (syncs once per virtual minute on minute-edge). A frozen
+    // engine that's no longer receiving time pulses shows the gap growing
+    // without bound — the discriminator for the "engine time view stuck"
+    // wedge flavor observed on c3b 2026-05-17.
+    time_t lastSyncedUnix() const { return last_synced_unix_; }
 
     // Last-tick timing split, updated at tick() exit. Wrapper reads both to
     // report separate `interp` and `astar` budgets alongside the existing
@@ -308,6 +337,9 @@ private:
     Agent          agents_[MAX_AGENTS];
     uint16_t       agent_count_ = 0;
     uint32_t       tick_count_ = 0;
+    // UTC seconds passed to the most recent syncTimeAt() call. Surfaced via
+    // lastSyncedUnix() for the `esync_lag=` heartbeat field.
+    time_t         last_synced_unix_ = 0;
     // Timing accumulators — reset at tick() start, updated during
     // processAgent/aStarFirstStep, finalized at tick() exit. Exposed via
     // interpUsLastTick()/astarUsLastTick(). Overhead is ~2 micros() calls

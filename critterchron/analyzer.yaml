@@ -53,6 +53,13 @@ fleet_rules:
 # values bit-identical across N samples while up= advances. See
 # debug_frozen_engine_live_heartbeat memory note for the failure-mode
 # signature this is built to catch.
+#
+# Observed 2026-05-17: timmy_tanuki + c3b_tanuki both wedged with
+# seeks_fail / astar bit-identical for 5h and 52h respectively, while
+# phys_max_us continued to vary (physics tick alive, planner quiescent).
+# `phys_max_us` staleness alone would NOT have caught these — agent
+# planning froze upstream of the physics tick. seeks_fail is the
+# tightest detector for this flavor.
 staleness_rules:
   - metric: phys_max_us
     min_unchanged_samples: 5
@@ -63,6 +70,15 @@ staleness_rules:
     min_unchanged_samples: 5
     require_up_advancing: true
     auto_dump: false
+
+  # ~10 min of zero new failed-seek attempts. Low enough to catch real
+  # wedges (the observed events stalled for hours); high enough to
+  # ignore quiet idle periods on small displays where both agents are
+  # legitimately parked. Tune up if false-positives on idle scripts.
+  - metric: seeks_fail
+    min_unchanged_samples: 20
+    require_up_advancing: true
+    auto_dump: true
 
 sinks:
   - type: log

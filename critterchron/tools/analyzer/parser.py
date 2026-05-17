@@ -151,6 +151,45 @@ def _assign(out: dict, key: str, value: str) -> None:
             out[key] = (a, b, c)
         return
 
+    # Engine-wedge diagnostic fields, added 2026-05-17 (see firmware
+    # comment in critterchron_esp32.ino:1008). Shapes don't fit the
+    # generic triple/pair grammar, so each gets a small special-case.
+    #
+    # cells=(m=N,x=N) → cells_missing + cells_extra (numeric, drivable
+    # by staleness rules — e.g. "missing > 0 for an hour but seeks_fail
+    # flat" is the new bug class).
+    if key == "cells" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        for piece in inner.split(","):
+            sub_k, _, sub_v = piece.strip().partition("=")
+            if sub_k == "m":
+                try: out["cells_missing"] = int(sub_v)
+                except ValueError: pass
+            elif sub_k == "x":
+                try: out["cells_extra"] = int(sub_v)
+                except ValueError: pass
+        return
+
+    # ast=(state1,state2,...) → list[str] under `ast` plus an
+    # `ast_uniform` flag (1 = all agents in the same state, the
+    # "everyone stuck in idle" signature). String list survives into
+    # the alert context but is filtered out of numeric_metrics().
+    if key == "ast" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        states = [s.strip() for s in inner.split(",") if s.strip()]
+        out["ast"] = states
+        out["ast_uniform"] = 1 if states and len(set(states)) == 1 else 0
+        return
+
+    # esync_lag=<int>s — seconds since the engine was last time-pulsed.
+    # `-1s` is the "never synced" sentinel from the firmware; pass it
+    # through as -1 so the analyzer can rule-out "boot transient" with
+    # `> N` thresholds (any positive value crosses a -1 threshold).
+    if key == "esync_lag" and value.endswith("s"):
+        try: out["esync_lag"] = int(value[:-1])
+        except ValueError: pass
+        return
+
     m = _PAIR_RE.match(value)
     if m:
         a, b = int(m.group(1)), int(m.group(2))

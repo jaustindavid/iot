@@ -329,6 +329,7 @@ vars:
       - {value: 1, label: "true"}
       - {value: 0, label: "false"}
     default: 0
+    widget: radio
     scope: [app, device]
     help: |
       Show a rolling network-latency graph on the bottom row of the panel.

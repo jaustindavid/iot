@@ -491,6 +491,11 @@ void CritterEngine::syncTime() {
 }
 
 void CritterEngine::syncTimeAt(time_t utc_seconds, float zone_offset_hours) {
+    // Stamp the "engine last knew the time was" value before any of the
+    // grid manipulation below. Heartbeat builders publish (wall_now -
+    // last_synced_unix_) as `esync_lag=`; healthy fleet sits at <=60s
+    // because syncTime() is called once per local-minute edge.
+    last_synced_unix_ = utc_seconds;
     time_t local = utc_seconds + static_cast<time_t>(zone_offset_hours * 3600.0f);
     std::tm tm;
 #if defined(_WIN32)
@@ -723,6 +728,33 @@ bool CritterEngine::checkBoardCondition(const char* kind) const {
         for (int y = 0; y < GRID_HEIGHT; ++y)
             if (tileMatches(x, y, kind)) return true;
     return false;
+}
+
+// Heartbeat-only — see CritterEngine.h header comment. Same grid sweep as
+// checkBoardCondition but counts every match instead of short-circuiting,
+// so the telemetry tells us *how many* missing/extra cells exist, not just
+// whether at least one does. The script's `if missing:` check is the
+// short-circuit form; this is the diagnostic-side mirror.
+uint16_t CritterEngine::countTiles(const char* kind) const {
+    uint16_t n = 0;
+    for (int x = 0; x < GRID_WIDTH; ++x)
+        for (int y = 0; y < GRID_HEIGHT; ++y)
+            if (tileMatches(x, y, kind)) ++n;
+    return n;
+}
+
+// Heartbeat-only — see CritterEngine.h. Mirrors the inline resolution in
+// evaluateIf's `state == X` path (line ~754). Kept here so the heartbeat
+// builder doesn't need to know about state_str_id encoding (0 = "none";
+// otherwise 1-based index into the agent type's states[] table).
+const char* CritterEngine::agentStateName(uint16_t idx) const {
+    if (idx >= agent_count_) return "none";
+    const Agent& a = agents_[idx];
+    if (!a.alive) return "none";
+    if (a.state_str_id == 0) return "none";
+    const auto& type = critter_ir::AGENT_TYPES[a.type_idx];
+    if (a.state_str_id > type.state_count) return "none";
+    return type.states[a.state_str_id - 1];
 }
 
 bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {

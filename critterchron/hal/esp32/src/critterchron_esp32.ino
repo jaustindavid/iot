@@ -1005,6 +1005,61 @@ static int telemetry_cycle() {
         }
     }
 
+    // Engine-wedge diagnostic fields. Added 2026-05-17 after the
+    // boober-on-C3 wedge investigation (timmy_tanuki 5h, c3b_tanuki 52h),
+    // where heartbeats kept flowing but seeks_fail+astar were bit-identical
+    // for hours. These four fields together discriminate the candidate
+    // hypotheses without needing to fire a snapshot:
+    //   stick=<n>             engine tick counter (frozen = interpreter wedged)
+    //   ast=(s1,s2,...)       per-agent state names (all idle = no-work path)
+    //   cells=(m=N,x=N)       missing+extra tile counts (m=0 with active clock
+    //                         = engine time view stuck)
+    //   esync_lag=<sec>       seconds since engine last received a time pulse
+    //                         (large = clock_->wall_now() frozen, or sync
+    //                         callsite not being reached)
+    // Cost: ~50 bytes on the wire + one grid sweep (counts run twice; ~70
+    // cells on physical displays, microseconds). Outside the engine hot
+    // loop — heartbeat builder only.
+    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
+        const uint32_t stick    = g_engine.tickCount();
+        const uint16_t n_miss   = g_engine.countTiles("missing");
+        const uint16_t n_extra  = g_engine.countTiles("extra");
+        const time_t   sync_at  = g_engine.lastSyncedUnix();
+        const time_t   wall     = g_clock.wall_now();
+        // Saturate at -1 if engine has never synced (sync_at==0). Avoids a
+        // bogus multi-decade lag value on first heartbeat post-boot.
+        const long     esync_lag = (sync_at == 0) ? -1
+                                 : (long)(wall - sync_at);
+        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+                             " stick=%lu cells=(m=%u,x=%u) esync_lag=%lds",
+                             (unsigned long)stick,
+                             (unsigned)n_miss,
+                             (unsigned)n_extra,
+                             esync_lag);
+        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            rlen += extra;
+            // Append ast=(s1,s2,...). Separate snprintf so the loop bound is
+            // explicit and we can early-out cleanly if the buffer runs short.
+            const uint16_t n_slots = g_engine.agentSlotCount();
+            if (rlen < (int)sizeof(report) - 5) {
+                int n = snprintf(report + rlen, sizeof(report) - rlen, " ast=(");
+                if (n > 0) rlen += n;
+                for (uint16_t i = 0; i < n_slots && rlen < (int)sizeof(report) - 2; ++i) {
+                    n = snprintf(report + rlen, sizeof(report) - rlen,
+                                 "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
+                    if (n <= 0 || rlen + n >= (int)sizeof(report) - 2) break;
+                    rlen += n;
+                }
+                if (rlen < (int)sizeof(report) - 1) {
+                    report[rlen++] = ')';
+                    report[rlen]   = '\0';
+                }
+            }
+        } else {
+            report[sizeof(report) - 1] = '\0';
+        }
+    }
+
     // Error-channel drain. One entry per heartbeat (ring is 4 deep).
     // Mirror of telemetry_cycle() in hal/particle/src/critterchron_particle.cpp;
     // mark_sent only on successful publish so a transient network failure
