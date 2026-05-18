@@ -123,6 +123,16 @@
 #define STRA2US_TRACE_TOPIC STRA2US_APP "/trace/" DEVICE_NAME
 #endif
 
+// Error-stream publish topic — sibling of heartbeep. ErrLog entries
+// were inline-appended as ` err=cat:msg` to the heartbeat until the
+// heartbeep stream got overloaded with telemetry growth; now each
+// ErrLog entry is its own message on this topic. Singular `error`
+// (not `errors`); the server-side queue is already permitted for
+// devices. Mirror of hal/particle/src/critterchron_particle.cpp.
+#ifndef STRA2US_ERROR_TOPIC
+#define STRA2US_ERROR_TOPIC STRA2US_APP "/public/error"
+#endif
+
 // Per-device default for the runtime ring depth. 0 = feature dormant
 // even if compiled in (no append() cost). Staging fleet device headers
 // override to 32 (4 seconds at the default 8Hz physics tick); prod
@@ -239,7 +249,7 @@ static LightSensorBH1750    g_light(g_cfg, LIGHT_SENSOR_ADDR);
 #endif
 // Base clock: real SNTP-synced time if WiFi compiled in, else a fixed
 // mock. WobblyTimeSource wraps whichever we picked — the engine and
-// the local_minute helper read `g_clock`, which is always the wobbled
+// the local_minute_of_day helper read `g_clock`, which is always the wobbled
 // decorator. Construction order matters (g_cfg above, g_real_clock,
 // then g_clock) — WobblyTimeSource holds references to both and the
 // compiler initializes globals top-to-bottom within this TU.
@@ -664,11 +674,22 @@ static volatile uint32_t g_astar_max_us  = 0;
 static volatile uint32_t g_mem_min = UINT32_MAX;
 #endif
 
-static int local_minute(const CritTimeSource& c) {
+// Minute-of-day (0..1439) under the wobbled clock. Used by the syncTime
+// gate to repaint the displayed HH:MM whenever it changes. Encoding both
+// hour AND minute into a single comparable int means any displayed-digit
+// change fires a paint, including hour-only transitions that wobble might
+// produce as a multi-minute jump landing on the same `tm_min`-modulo
+// (e.g. 10:23 → 11:23). Returning just `tm_min` (the older shape of this
+// helper) silently dropped those.
+//
+// Caller polls at physics-tick cadence (~125ms on ESP32), so a transition
+// is caught within one tick — well under any human-perceptible lag on the
+// panel. Cost per call: one gmtime_r + a multiply-add.
+static int local_minute_of_day(const CritTimeSource& c) {
     time_t local = c.wall_now() + (time_t)(c.zone_offset_hours() * 3600.0f);
     struct tm tm;
     gmtime_r(&local, &tm);
-    return tm.tm_min;
+    return tm.tm_hour * 60 + tm.tm_min;
 }
 
 // ---------- Time-of-day brightness schedule ----------
@@ -867,11 +888,13 @@ static int telemetry_cycle() {
         snprintf(script_tag, sizeof(script_tag), "default");
     }
 
-    // Report buffer bumped to 384 to hold the full parity-with-Particle
-    // field set. Current typical length is ~280 chars with script= in
-    // the mix; 384 leaves slack for future additions without another
-    // resize.
+    // Report buffer at 384 holds the full parity-with-Particle field set
+    // (typical ~280 chars with script= in the mix). Heartbeat body is
+    // pure status now — ErrLog entries publish to STRA2US_ERROR_TOPIC
+    // as their own messages (see the drain after publish below). Kept
+    // at 384 deliberately: the drain reuses this buffer.
     char report[384];
+    constexpr size_t safe_cap = sizeof(report);
     int  rssi = WiFi.isConnected() ? WiFi.RSSI() : -127;
 
     // Schedule marker — see Particle shim for rationale. `sched` =
@@ -911,14 +934,13 @@ static int telemetry_cycle() {
     uint32_t mem_min_snapshot = g_mem_min;
     g_mem_min = UINT32_MAX;
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d mem_min=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) lux=%.1f "
+        "up=%lu rssi=%d mem_min=%lu fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) lux=%.1f "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
         (unsigned long)(millis() / 1000),
         rssi,
         (unsigned long)mem_min_snapshot,
-        (int)esp_reset_reason(),
         APP_VERSION,
         fw_sha_field,
         script_tag,
@@ -937,14 +959,13 @@ static int telemetry_cycle() {
     uint32_t mem_min_snapshot = g_mem_min;
     g_mem_min = UINT32_MAX;
     int rlen = snprintf(report, sizeof(report),
-        "up=%lu rssi=%d mem_min=%lu rst=%d fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) "
+        "up=%lu rssi=%d mem_min=%lu fw=%s%s script=%s net=%s bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
         "agents=%u seeks_fail=%lu chip=%s",
         (unsigned long)(millis() / 1000),
         rssi,
         (unsigned long)mem_min_snapshot,
-        (int)esp_reset_reason(),
         APP_VERSION,
         fw_sha_field,
         script_tag,
@@ -968,17 +989,17 @@ static int telemetry_cycle() {
     // `tz=%.1f` shows the effective offset (post-DST math). Operators
     // can verify on the wire that timezone_offset_hours + dst_enabled
     // produced the expected value, no serial-log spelunking.
-    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+    if (rlen > 0 && rlen < (int)safe_cap - 1) {
+        int extra = snprintf(report + rlen, safe_cap - rlen,
                              " wobble=(%d<%d<%d)s tz=%.1f",
                              g_clock.wobble_min_s(),
                              g_clock.wobble_offset_s(),
                              g_clock.wobble_max_s(),
                              (double)g_clock.zone_offset_hours());
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+        if (extra > 0 && rlen + extra < (int)safe_cap) {
             rlen += extra;
         } else {
-            report[sizeof(report) - 1] = '\0';
+            report[rlen] = '\0';
         }
     }
 
@@ -991,16 +1012,16 @@ static int telemetry_cycle() {
     {
         uint32_t lmin = 0, lmean = 0, lmax = 0;
         if (g_cfg.peek_latency_stats(&lmin, &lmean, &lmax) &&
-            rlen > 0 && rlen < (int)sizeof(report) - 1) {
-            int extra = snprintf(report + rlen, sizeof(report) - rlen,
+            rlen > 0 && rlen < (int)safe_cap - 1) {
+            int extra = snprintf(report + rlen, safe_cap - rlen,
                                  " rtt=(%lu<%lu<%lu)ms",
                                  (unsigned long)lmin,
                                  (unsigned long)lmean,
                                  (unsigned long)lmax);
-            if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+            if (extra > 0 && rlen + extra < (int)safe_cap) {
                 rlen += extra;
             } else {
-                report[sizeof(report) - 1] = '\0';
+                report[rlen] = '\0';
             }
         }
     }
@@ -1020,7 +1041,7 @@ static int telemetry_cycle() {
     // Cost: ~50 bytes on the wire + one grid sweep (counts run twice; ~70
     // cells on physical displays, microseconds). Outside the engine hot
     // loop — heartbeat builder only.
-    if (rlen > 0 && rlen < (int)sizeof(report) - 1) {
+    if (rlen > 0 && rlen < (int)safe_cap - 1) {
         const uint32_t stick    = g_engine.tickCount();
         const uint16_t n_miss   = g_engine.countTiles("missing");
         const uint16_t n_extra  = g_engine.countTiles("extra");
@@ -1030,61 +1051,85 @@ static int telemetry_cycle() {
         // bogus multi-decade lag value on first heartbeat post-boot.
         const long     esync_lag = (sync_at == 0) ? -1
                                  : (long)(wall - sync_at);
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
+        int extra = snprintf(report + rlen, safe_cap - rlen,
                              " stick=%lu cells=(m=%u,x=%u) esync_lag=%lds",
                              (unsigned long)stick,
                              (unsigned)n_miss,
                              (unsigned)n_extra,
                              esync_lag);
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
+        if (extra > 0 && rlen + extra < (int)safe_cap) {
             rlen += extra;
-            // Append ast=(s1,s2,...). Separate snprintf so the loop bound is
-            // explicit and we can early-out cleanly if the buffer runs short.
+            // ast=. Two formats:
+            //   compact `ast=Nx<state>` when ALL slots share one state
+            //   verbose `ast=(s1,s2,...)` otherwise
+            // Compact form halves+ the per-agent footprint on stateless
+            // scripts (swarm-fade etc., where every agent is `none`).
+            // Parser distinguishes by the leading `(` vs digit.
             const uint16_t n_slots = g_engine.agentSlotCount();
-            if (rlen < (int)sizeof(report) - 5) {
-                int n = snprintf(report + rlen, sizeof(report) - rlen, " ast=(");
-                if (n > 0) rlen += n;
-                for (uint16_t i = 0; i < n_slots && rlen < (int)sizeof(report) - 2; ++i) {
-                    n = snprintf(report + rlen, sizeof(report) - rlen,
-                                 "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
-                    if (n <= 0 || rlen + n >= (int)sizeof(report) - 2) break;
-                    rlen += n;
+            if (rlen < (int)safe_cap - 8 && n_slots > 0) {
+                bool uniform = true;
+                const char* first = g_engine.agentStateName(0);
+                for (uint16_t i = 1; i < n_slots; ++i) {
+                    if (strcmp(g_engine.agentStateName(i), first) != 0) {
+                        uniform = false; break;
+                    }
                 }
-                if (rlen < (int)sizeof(report) - 1) {
-                    report[rlen++] = ')';
-                    report[rlen]   = '\0';
+                if (uniform) {
+                    int n = snprintf(report + rlen, safe_cap - rlen,
+                                     " ast=%ux%s", (unsigned)n_slots, first);
+                    if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+                    else report[rlen] = '\0';
+                } else {
+                    int n = snprintf(report + rlen, safe_cap - rlen, " ast=(");
+                    if (n > 0) rlen += n;
+                    for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 2; ++i) {
+                        n = snprintf(report + rlen, safe_cap - rlen,
+                                     "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
+                        if (n <= 0 || rlen + n >= (int)safe_cap - 2) break;
+                        rlen += n;
+                    }
+                    if (rlen < (int)safe_cap - 1) {
+                        report[rlen++] = ')';
+                        report[rlen]   = '\0';
+                    }
                 }
             }
         } else {
-            report[sizeof(report) - 1] = '\0';
-        }
-    }
-
-    // Error-channel drain. One entry per heartbeat (ring is 4 deep).
-    // Mirror of telemetry_cycle() in hal/particle/src/critterchron_particle.cpp;
-    // mark_sent only on successful publish so a transient network failure
-    // requeues the entry for next cycle. See hal/ErrLog.h.
-    critterchron::ErrEntry pending_err;
-    bool have_err = critterchron::g_errlog.peek_oldest_unsent(pending_err);
-    if (have_err && rlen > 0 && rlen < (int)sizeof(report) - 8) {
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
-                             " err=%s:%s",
-                             critterchron::err_cat_tag(pending_err.cat),
-                             pending_err.msg);
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
-            rlen += extra;
-        } else {
-            report[sizeof(report) - 1] = '\0';
-            have_err = false;
+            report[rlen] = '\0';
         }
     }
 
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, report);
     Serial.printf("[tel] publish=%d %s\n", pub_status, report);
-    if (have_err && pub_status == 200) {
-        critterchron::g_errlog.mark_sent(pending_err.seq);
+
+    // Error-stream drain. Mirror of telemetry_cycle() in
+    // hal/particle/src/critterchron_particle.cpp. One publish per pending
+    // ErrLog entry on the keep-alive socket from the heartbeat publish
+    // above (no extra connect()/close()). Break on non-200 so a transient
+    // failure leaves the remainder queued for the next cycle (same retry
+    // contract as the old inline trailer). Ring depth is 4 and tel cadence
+    // is floor-10s, so peak publish rate is bounded without an explicit
+    // timer. Buffer is the heartbeat report[], dead after the publish and
+    // log line above — reuse, no new static.
+    critterchron::ErrEntry e;
+    while (critterchron::g_errlog.peek_oldest_unsent(e)) {
+        int n = snprintf(report, sizeof(report),
+                         "device=%s cat=%s seq=%lu up=%lu wall=%lu msg=%s",
+                         DEVICE_NAME,
+                         critterchron::err_cat_tag(e.cat),
+                         (unsigned long)e.seq,
+                         (unsigned long)(millis() / 1000UL),
+                         (unsigned long)time(nullptr),
+                         e.msg);
+        if (n <= 0 || n >= (int)sizeof(report)) break;
+        int s = g_cfg.publish(STRA2US_ERROR_TOPIC, report);
+        Serial.printf("[err] publish=%d cat=%s seq=%lu\n",
+                      s, critterchron::err_cat_tag(e.cat), (unsigned long)e.seq);
+        if (s != 200) break;
+        critterchron::g_errlog.mark_sent(e.seq);
     }
+
     g_cfg.poll_all();
     g_cfg.close();
 
@@ -1489,11 +1534,24 @@ void setup() {
     // reason is latched at poweron and cleared on the next boot, so
     // reading it here gives the previous boot's exit status.
     esp_reset_reason_t reset_reason = esp_reset_reason();
+
+    // Always log the boot cause via the err= channel so the analyzer
+    // sees how every boot transitioned (manual cycle, OTA, panic, etc.)
+    // without needing `rst=` as a constant noise field in every
+    // heartbeat. Drains one per heartbeat — naturally appears in the
+    // first 1–2 heartbeats after a reboot, then quiet until next boot.
+    // Mirror of the Particle path in critterchron_particle.cpp setup().
+    critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                                  "rst=%d", (int)reset_reason);
+
     if (is_crash_reset(reset_reason)) {
         g_rescue_mode     = true;
         g_rescue_start_ms = millis();
         Serial.printf("[crit] rescue hold: reset_reason=%d, holding %lums for OTA\n",
                       (int)reset_reason, (unsigned long)RESCUE_HOLD_MS);
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                                      "rescue hold wait=%lums",
+                                      (unsigned long)RESCUE_HOLD_MS);
     } else {
         Serial.printf("[crit] clean boot: reset_reason=%d\n", (int)reset_reason);
     }
@@ -1950,9 +2008,12 @@ void loop() {
     if (now - last_physics_tick >= physics_tick_ms()) {
         last_physics_tick = now;
 
-        int m = local_minute(g_clock);
-        if (m != last_sync_minute) {
-            last_sync_minute = m;
+        // Catch any change in the displayed HH:MM. Polling cadence is
+        // physics-tick (~125ms); see local_minute_of_day() commentary for
+        // why minute-of-day (not just tm_min) is the right key here.
+        int mod = local_minute_of_day(g_clock);
+        if (mod != last_sync_minute) {
+            last_sync_minute = mod;
             g_engine.syncTime();
         }
         uint32_t t0 = micros();

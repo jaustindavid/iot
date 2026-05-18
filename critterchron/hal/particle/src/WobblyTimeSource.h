@@ -92,12 +92,25 @@ public:
             return (time_t)virt_epoch_s_;
         }
 
+        int min_s = cfg_.get_int("wobble_min_seconds", 120);
         int max_s = cfg_.get_int("wobble_max_seconds", 300);
 
         // If the real clock jumped (cloud resync after a long offline spell),
         // chasing the drift would take minutes. Snap to a fresh target.
+        //
+        // "Way outside the configured range" = twice the larger-magnitude
+        // bound. std::abs on both bounds keeps the gate symmetric across
+        // positive-only ("fast clock"), negative-only ("slow clock"), and
+        // mixed ("drift around real") configurations. The previous form
+        // `max_s * 2.0` assumed max_s was the largest-magnitude bound —
+        // broke for negative bounds (e.g. max_s=-5 gave threshold -10,
+        // which |offset| trivially exceeds → reseed every call → wobble
+        // can never converge).
         double offset = virt_epoch_s_ - (double)real_now;
-        if (std::abs(offset) > (double)max_s * 2.0) {
+        double abs_min = std::abs((double)min_s);
+        double abs_max = std::abs((double)max_s);
+        double jump_threshold = 2.0 * (abs_min > abs_max ? abs_min : abs_max);
+        if (std::abs(offset) > jump_threshold) {
             seed_(real_now);
             return (time_t)virt_epoch_s_;
         }
@@ -105,7 +118,7 @@ public:
         // Elapsed since last call, RTC-based. See header comment re:
         // millis() drift on OG Photon. Negative elapsed (RTC stepped
         // backward, e.g. minor cloud-NTP adjustment) clamps to 0;
-        // large jumps caught by the |offset| > max_s*2 reseed gate.
+        // large jumps caught by the jump_threshold reseed gate above.
         time_t real_s = real_now;
         double elapsed = (double)(real_s - last_real_s_);
         if (elapsed < 0) elapsed = 0;

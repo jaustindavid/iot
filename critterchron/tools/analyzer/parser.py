@@ -170,16 +170,38 @@ def _assign(out: dict, key: str, value: str) -> None:
                 except ValueError: pass
         return
 
-    # ast=(state1,state2,...) → list[str] under `ast` plus an
-    # `ast_uniform` flag (1 = all agents in the same state, the
-    # "everyone stuck in idle" signature). String list survives into
-    # the alert context but is filtered out of numeric_metrics().
+    # ast= → list[str] under `ast` plus an `ast_uniform` flag (1 = all
+    # agents in the same state, the "everyone stuck in idle" signature).
+    # String list survives into the alert context but is filtered out of
+    # numeric_metrics(). Two wire formats:
+    #   verbose: ast=(s1,s2,...)   one entry per agent slot
+    #   compact: ast=Nxstate        all N slots in the same state
+    # Compact form is emitted by stateless scripts (swarm-fade etc.,
+    # 16 agents of `none`) to save ~70 bytes on the wire — critical
+    # given Particle's 384-byte heartbeat buffer. Parser distinguishes
+    # by the leading `(` vs digit.
     if key == "ast" and value.startswith("(") and value.endswith(")"):
         inner = value[1:-1]
         states = [s.strip() for s in inner.split(",") if s.strip()]
         out["ast"] = states
         out["ast_uniform"] = 1 if states and len(set(states)) == 1 else 0
         return
+    if key == "ast" and value and value[0].isdigit():
+        # `Nxstate` compact form. Split on the first 'x' — N is the
+        # integer count, the rest is the state name (which can itself
+        # contain letters but not digits before the 'x').
+        x_idx = value.find("x")
+        if x_idx > 0:
+            try:
+                n = int(value[:x_idx])
+                state = value[x_idx + 1:]
+                if n > 0 and state:
+                    out["ast"] = [state] * n
+                    out["ast_uniform"] = 1
+                    return
+            except ValueError:
+                pass
+        # Fall through to default scalar handling if shape didn't match.
 
     # esync_lag=<int>s — seconds since the engine was last time-pulsed.
     # `-1s` is the "never synced" sentinel from the firmware; pass it

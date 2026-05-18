@@ -60,6 +60,16 @@ SYSTEM_THREAD(ENABLED);
 #define STRA2US_TRACE_TOPIC STRA2US_APP "/trace/" DEVICE_NAME
 #endif
 
+// Error-stream publish topic — sibling of heartbeep. ErrLog entries
+// were inline-appended as ` err=cat:msg` to the heartbeat until the
+// heartbeep stream got overloaded with telemetry growth; now each
+// ErrLog entry is its own message on this topic. Singular `error`
+// (not `errors`); the server-side queue is already permitted for
+// devices. Mirror of hal/esp32/src/critterchron_esp32.ino.
+#ifndef STRA2US_ERROR_TOPIC
+#define STRA2US_ERROR_TOPIC STRA2US_APP "/public/error"
+#endif
+
 // Per-device default for the runtime ring depth. 0 = feature dormant
 // even if compiled in. Staging device headers override; OG Photon
 // (rico_raccoon.h) defines NO_SNAPSHOT_BUFFER instead, eliding the
@@ -342,14 +352,18 @@ static unsigned long g_cloud_wait_start_ms = 0;
 
 static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-// Local wall-clock minute from a CritTimeSource. The shim uses this to detect
-// minute rollovers — must read the same (wobbled) clock the engine writes
-// from, or the display lags behind the virtual time by up to a minute.
-static int local_minute(const CritTimeSource& c) {
+// Minute-of-day (0..1439) under the wobbled clock. Used by the syncTime
+// gate to repaint the displayed HH:MM on any change. Encoding both hour
+// AND minute as a single comparable int catches displayed-digit changes
+// that a tm_min-only gate would miss (e.g. wobble jumping 10:23 → 11:23
+// — same `tm_min`, different display). Must read the same wobbled clock
+// the engine writes from, or the panel lags virtual time by up to a
+// minute. Cost per call: one gmtime_r + multiply-add.
+static int local_minute_of_day(const CritTimeSource& c) {
     time_t local = c.wall_now() + (time_t)(c.zone_offset_hours() * 3600.0f);
     struct tm tm;
     gmtime_r(&local, &tm);
-    return tm.tm_min;
+    return tm.tm_hour * 60 + tm.tm_min;
 }
 
 static bool is_crash_reset(int reason) {
@@ -573,20 +587,25 @@ static int schedule_match_max_bri(uint16_t now_min, int* out_min_bri = nullptr) 
 // Returns the HTTP status of the publish (or <=0 on TCP/network failure,
 // 0 if we punted because time isn't synced yet). The worker inspects the
 // status to decide the next attempt cadence.
-// Build the heartbeat body — everything except the ErrLog drain, which
-// is coupled to mark_sent-on-publish-success and so stays inline in
-// telemetry_cycle. Returns bytes written (NOT including any trailing
-// NUL). The caller can append further fields if `rlen < cap - 1`.
+// Build the heartbeat body. Returns bytes written (NOT including any
+// trailing NUL). The caller can append further fields if
+// `rlen < cap - 1`.
 //
 // Pulled out of telemetry_cycle so the Particle Cloud failsafe path can
 // publish the same payload: observability via the cloud event stream
 // stays meaningful when Stra2us is unreachable, instead of just
 // `up=N s2s=STATUS url=...` and nothing else.
+//
+// Heartbeat body is pure status — ErrLog entries publish to
+// STRA2US_ERROR_TOPIC as their own messages now (see telemetry_cycle's
+// post-publish drain). The buffer therefore has no end-of-line err=
+// tail to reserve for; optional fields can fill the buffer.
 static int build_heartbeat_report(char* out, size_t cap) {
     if (!Time.isValid()) {
         if (cap > 0) out[0] = '\0';
         return 0;
     }
+    const size_t safe_cap = cap;
     int  rssi = -127;
     if (WiFi.ready()) {
         WiFiSignal sig = WiFi.RSSI();
@@ -634,7 +653,7 @@ static int build_heartbeat_report(char* out, size_t cap) {
     // iteration, and both should report the same value. The reset
     // happens once per iteration at the end of the tel-task loop.
     int rlen = snprintf(out, cap,
-        "up=%lu wall=%lu rssi=%d mem_min=%lu rst=%d fw=%s script=%s net=%s "
+        "up=%lu wall=%lu rssi=%d mem_min=%lu fw=%s script=%s net=%s "
         "bri=(%u<%u<%u%s) "
         "phys=(%lu<%lu<%lu)us rend=(%lu<%lu<%lu)us "
         "interp=(%lu<%lu)us astar=(%lu<%lu)us "
@@ -643,7 +662,6 @@ static int build_heartbeat_report(char* out, size_t cap) {
         (unsigned long)Time.now(),
         rssi,
         (unsigned long)g_mem_min,
-        (int)System.resetReason(),
         APP_VERSION,
         script_tag,
         cur_ssid,
@@ -664,17 +682,17 @@ static int build_heartbeat_report(char* out, size_t cap) {
     // `tz=%.1f` shows the effective offset (post-DST math) so operators
     // can verify timezone_offset_hours + dst_enabled produced the
     // expected value on the wire, no serial-log spelunking.
-    if (rlen > 0 && rlen < (int)cap - 1) {
-        int extra = snprintf(out + rlen, cap - rlen,
+    if (rlen > 0 && rlen < (int)safe_cap - 1) {
+        int extra = snprintf(out + rlen, safe_cap - rlen,
                              " wobble=(%d<%d<%d)s tz=%.1f",
                              g_clock.wobble_min_s(),
                              g_clock.wobble_offset_s(),
                              g_clock.wobble_max_s(),
                              (double)g_clock.zone_offset_hours());
-        if (extra > 0 && rlen + extra < (int)cap) {
+        if (extra > 0 && rlen + extra < (int)safe_cap) {
             rlen += extra;
         } else {
-            out[cap - 1] = '\0';
+            out[rlen] = '\0';
         }
     }
 
@@ -686,16 +704,16 @@ static int build_heartbeat_report(char* out, size_t cap) {
     {
         uint32_t lmin = 0, lmean = 0, lmax = 0;
         if (g_cfg.peek_latency_stats(&lmin, &lmean, &lmax) &&
-            rlen > 0 && rlen < (int)cap - 1) {
-            int extra = snprintf(out + rlen, cap - rlen,
+            rlen > 0 && rlen < (int)safe_cap - 1) {
+            int extra = snprintf(out + rlen, safe_cap - rlen,
                                  " rtt=(%lu<%lu<%lu)ms",
                                  (unsigned long)lmin,
                                  (unsigned long)lmean,
                                  (unsigned long)lmax);
-            if (extra > 0 && rlen + extra < (int)cap) {
+            if (extra > 0 && rlen + extra < (int)safe_cap) {
                 rlen += extra;
             } else {
-                out[cap - 1] = '\0';
+                out[rlen] = '\0';
             }
         }
     }
@@ -712,16 +730,16 @@ static int build_heartbeat_report(char* out, size_t cap) {
     // glance tells you whether raw is outside the learned range (numeric
     // ordering of the `<` symbols breaks — widen incoming) or inside it
     // (ordering holds — mapping is doing what it was told).
-    if (rlen > 0 && rlen < (int)cap - 1) {
-        int extra = snprintf(out + rlen, cap - rlen,
+    if (rlen > 0 && rlen < (int)safe_cap - 1) {
+        int extra = snprintf(out + rlen, safe_cap - rlen,
                              " light=(%d<%d<%d)",
                              g_light.cal_bright,
                              g_light.last_raw,
                              g_light.cal_dark);
-        if (extra > 0 && rlen + extra < (int)cap) {
+        if (extra > 0 && rlen + extra < (int)safe_cap) {
             rlen += extra;
         } else {
-            out[cap - 1] = '\0';
+            out[rlen] = '\0';
         }
     }
 #endif
@@ -737,7 +755,7 @@ static int build_heartbeat_report(char* out, size_t cap) {
     //   ast=(s1,s2,...)       per-agent state names
     //   cells=(m=N,x=N)       missing+extra tile counts
     //   esync_lag=<sec>       seconds since engine last received a time pulse
-    if (rlen > 0 && rlen < (int)cap - 1) {
+    if (rlen > 0 && rlen < (int)safe_cap - 1) {
         const uint32_t stick    = g_engine.tickCount();
         const uint16_t n_miss   = g_engine.countTiles("missing");
         const uint16_t n_extra  = g_engine.countTiles("extra");
@@ -747,31 +765,56 @@ static int build_heartbeat_report(char* out, size_t cap) {
         // multi-decade value on first post-boot heartbeat.
         const long     esync_lag = (sync_at == 0) ? -1
                                  : (long)(wall - sync_at);
-        int extra = snprintf(out + rlen, cap - rlen,
+        int extra = snprintf(out + rlen, safe_cap - rlen,
                              " stick=%lu cells=(m=%u,x=%u) esync_lag=%lds",
                              (unsigned long)stick,
                              (unsigned)n_miss,
                              (unsigned)n_extra,
                              esync_lag);
-        if (extra > 0 && rlen + extra < (int)cap) {
+        if (extra > 0 && rlen + extra < (int)safe_cap) {
             rlen += extra;
+            // ast=. Two formats:
+            //   verbose: `ast=(s1,s2,...)` — one entry per agent slot.
+            //   compact: `ast=Nx<state>` — when ALL slots share the same
+            //   state. Stateless scripts (swarm-fade, etc., 16 agents of
+            //   `none`) compress from ~85 bytes to ~12 — critical on
+            //   Particle's 384-byte buffer to leave room for err=.
+            //   Stateful scripts (boober) almost always have at least
+            //   one differing state, fall through to verbose form.
+            //
+            // Parser distinguishes by the leading `(`: paren = verbose,
+            // digit = compact.
             const uint16_t n_slots = g_engine.agentSlotCount();
-            if (rlen < (int)cap - 5) {
-                int n = snprintf(out + rlen, cap - rlen, " ast=(");
-                if (n > 0) rlen += n;
-                for (uint16_t i = 0; i < n_slots && rlen < (int)cap - 2; ++i) {
-                    n = snprintf(out + rlen, cap - rlen,
-                                 "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
-                    if (n <= 0 || rlen + n >= (int)cap - 2) break;
-                    rlen += n;
+            if (rlen < (int)safe_cap - 8 && n_slots > 0) {
+                bool uniform = true;
+                const char* first = g_engine.agentStateName(0);
+                for (uint16_t i = 1; i < n_slots; ++i) {
+                    if (strcmp(g_engine.agentStateName(i), first) != 0) {
+                        uniform = false; break;
+                    }
                 }
-                if (rlen < (int)cap - 1) {
-                    out[rlen++] = ')';
-                    out[rlen]   = '\0';
+                if (uniform) {
+                    int n = snprintf(out + rlen, safe_cap - rlen,
+                                     " ast=%ux%s", (unsigned)n_slots, first);
+                    if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+                    else out[rlen] = '\0';
+                } else {
+                    int n = snprintf(out + rlen, safe_cap - rlen, " ast=(");
+                    if (n > 0) rlen += n;
+                    for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 2; ++i) {
+                        n = snprintf(out + rlen, safe_cap - rlen,
+                                     "%s%s", (i ? "," : ""), g_engine.agentStateName(i));
+                        if (n <= 0 || rlen + n >= (int)safe_cap - 2) break;
+                        rlen += n;
+                    }
+                    if (rlen < (int)safe_cap - 1) {
+                        out[rlen++] = ')';
+                        out[rlen]   = '\0';
+                    }
                 }
             }
         } else {
-            out[cap - 1] = '\0';
+            out[rlen] = '\0';
         }
     }
 
@@ -780,56 +823,52 @@ static int build_heartbeat_report(char* out, size_t cap) {
 
 
 // Stra2us heartbeat cycle. Builds the rich heartbeat body via the
-// shared helper, drains one ErrLog entry (mark_sent-on-success
-// coupled to the Stra2us publish — NOT shared with the cloud path),
-// publishes to STRA2US_TELEMETRY_TOPIC.
+// shared helper, publishes to STRA2US_TELEMETRY_TOPIC, then drains any
+// pending ErrLog entries to STRA2US_ERROR_TOPIC on the same keep-alive
+// socket before closing.
 static int telemetry_cycle() {
     if (!Time.isValid()) return 0;
 
     // 256 bytes was snug before the light-sensor diagnostic fragment widened
-    // the payload (320 in 2026-04-22), and 320 stayed snug after the OTA
-    // error-channel fragment landed (`err=<cat>:<msg>`, up to ~70 bytes per
-    // heartbeat — see ErrLog.h). 384 leaves headroom on either fragment;
-    // truncation is still handled by the final NUL-terminate at the bottom,
-    // but headroom matters because both `light=(...)` and `err=...` are
-    // observability features — silent truncation would defeat the point.
+    // the payload (320 in 2026-04-22), and 320 stayed snug after engine-wedge
+    // diagnostics (stick=/ast=/cells=/esync_lag=) landed. 384 leaves
+    // headroom for further growth; truncation is still handled by the final
+    // NUL-terminate at the bottom. Kept at 384 deliberately — the ErrLog
+    // drain below reuses this buffer after the heartbeat publish.
     char report[384];
     int rlen = build_heartbeat_report(report, sizeof(report));
     if (rlen == 0) return 0;
 
-    // Error-channel drain. One entry per heartbeat (ring is 4 deep, so
-    // a burst clears in 4 cycles = ~40s at 10s heartbeats — fast enough
-    // to track an OTA failure cluster, slow enough not to flood). Mark
-    // sent ONLY on successful publish; a network blip leaves the entry
-    // queued for retry on the next cycle.
-    //
-    // Stays inline (not in the shared builder) because the cloud
-    // failsafe path uses the same builder but MUST NOT consume errors
-    // — those need to stay on the Stra2us delivery channel so a
-    // cloud-only success doesn't silently drain them.
-    critterchron::ErrEntry pending_err;
-    bool have_err = critterchron::g_errlog.peek_oldest_unsent(pending_err);
-    if (have_err && rlen > 0 && rlen < (int)sizeof(report) - 8) {
-        int extra = snprintf(report + rlen, sizeof(report) - rlen,
-                             " err=%s:%s",
-                             critterchron::err_cat_tag(pending_err.cat),
-                             pending_err.msg);
-        if (extra > 0 && rlen + extra < (int)sizeof(report)) {
-            rlen += extra;
-        } else {
-            // Truncated — don't claim this error was published, leave
-            // it queued for a later heartbeat that has more headroom.
-            report[sizeof(report) - 1] = '\0';
-            have_err = false;
-        }
-    }
-
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, report);
     Log.info("telemetry: publish=%d %s", pub_status, report);
-    if (have_err && pub_status == 200) {
-        critterchron::g_errlog.mark_sent(pending_err.seq);
+
+    // Error-stream drain. One publish per pending ErrLog entry on the
+    // keep-alive socket from the heartbeat publish above (no extra
+    // connect()/close()). Break on non-200 so a transient failure leaves
+    // the remainder queued for the next cycle (same retry contract as
+    // the old inline trailer). Ring depth is 4 and tel cadence is
+    // floor-10s, so peak publish rate is bounded without an explicit
+    // timer. Buffer is the heartbeat report[], dead after the publish
+    // and log line above — reuse, no new static.
+    critterchron::ErrEntry e;
+    while (critterchron::g_errlog.peek_oldest_unsent(e)) {
+        int n = snprintf(report, sizeof(report),
+                         "device=%s cat=%s seq=%lu up=%lu wall=%lu msg=%s",
+                         DEVICE_NAME,
+                         critterchron::err_cat_tag(e.cat),
+                         (unsigned long)e.seq,
+                         (unsigned long)System.uptime(),
+                         (unsigned long)Time.now(),
+                         e.msg);
+        if (n <= 0 || n >= (int)sizeof(report)) break;
+        int s = g_cfg.publish(STRA2US_ERROR_TOPIC, report);
+        Log.info("err publish=%d cat=%s seq=%lu",
+                 s, critterchron::err_cat_tag(e.cat), (unsigned long)e.seq);
+        if (s != 200) break;
+        critterchron::g_errlog.mark_sent(e.seq);
     }
+
     g_cfg.poll_all();
     g_cfg.close();
 
@@ -1036,6 +1075,29 @@ static void telemetry_worker() {
     // ever succeeds.
     unsigned long last_reconnect_kick_ms = thread_start_ms;
 
+    // Liveness-based recovery ladder. The WiFi.ready() kick above protects
+    // against "radio off and not coming back" — the easy case. The harder
+    // case observed on rico 2026-05-17 is "WiFi.ready()==true, but no TCP
+    // bytes flow" (OG Photon WICED zombie-radio state): heartbeats time
+    // out indefinitely, the ready-flag stays true, the kick above never
+    // fires, the only recovery is a manual power-cycle. 332h of dump data
+    // showed zero `err=net:reconnect_kick` entries — that path simply
+    // doesn't catch this failure mode.
+    //
+    // Below: count consecutive heartbeat publish failures (transport-level
+    // — anything not 2xx-or-4xx; 4xx still indicates a working link, just
+    // a server-side reject). Escalate at fixed multiples of the heartbeep
+    // interval so the cadence is proportional to whatever the operator
+    // configured: at hb=30s a level-1 kick fires after 60s of silence;
+    // at hb=300s after 10min. See the per-level comments inline for what
+    // each escalation actually does.
+    //
+    // Multipliers (2 / 5 / 10 / 20) deliberately not a KV knob — the
+    // intent is to fix the underlying wedge, not to make the recovery
+    // ladder configurable forever. If L4 ever fires in the field, treat
+    // it as an open action item to investigate why L2/L3 didn't recover.
+    unsigned int consecutive_publish_failures = 0;
+
     while (true) {
         if (millis() - thread_start_ms < startup_delay_ms) { delay(100); continue; }
         unsigned long now = millis();
@@ -1222,20 +1284,25 @@ static void telemetry_worker() {
         // loop has captured its first BOOT_LIGHT_SAMPLES raw readings.
         // Purpose is distributed-console observability of the post-drain
         // settling curve — "is the cap-discharge hypothesis right?" becomes
-        // answerable from telemetry alone. Format is free-form, matches the
-        // heartbeat's grep-friendly k=v style. Not gated on telemetry_cycle
-        // success: if the regular heartbeat failed, this cycle will retry
-        // both next time — connect/close are per-block.
+        // answerable from telemetry alone. Published to STRA2US_ERROR_TOPIC
+        // alongside ErrLog entries (it's an event-worth-knowing, not part
+        // of the steady-state heartbeat); shape matches the error-entry
+        // k=v format with `cat=boot_light` as the discriminator. Not gated
+        // on telemetry_cycle success: if the regular heartbeat failed,
+        // this cycle will retry both next time — connect/close are
+        // per-block.
         if (g_boot_light_ready && !g_boot_light_sent) {
             // Static, not stack: the tel worker has a modest stack and 512B
             // of locals plus the snprintf frames was enough to SOS on the
             // Photon 2. Safe to reuse as static since this block is
-            // one-shot per boot (gated by g_boot_light_sent).
+            // one-shot per boot (gated by g_boot_light_sent). `n=` dropped
+            // (redundant with the raws= count).
             static char msg[512];
             int n = snprintf(msg, sizeof(msg),
-                             "boot_light up=%lu n=%d raws=",
+                             "device=%s cat=boot_light up=%lu wall=%lu raws=",
+                             DEVICE_NAME,
                              (unsigned long)System.uptime(),
-                             BOOT_LIGHT_SAMPLES);
+                             (unsigned long)Time.now());
             for (int i = 0; i < BOOT_LIGHT_SAMPLES && n < (int)sizeof(msg) - 8; ++i) {
                 n += snprintf(msg + n, sizeof(msg) - n,
                               "%s%u", i ? "," : "",
@@ -1243,7 +1310,7 @@ static void telemetry_worker() {
             }
             msg[sizeof(msg) - 1] = '\0';
             g_cfg.connect();
-            int bs = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, msg);
+            int bs = g_cfg.publish(STRA2US_ERROR_TOPIC, msg);
             g_cfg.close();
             Log.info("boot_light publish=%d %s", bs, msg);
             g_boot_light_sent = true;
@@ -1266,6 +1333,74 @@ static void telemetry_worker() {
             // Transient failure — exponential backoff, capped at hb.
             next_interval_ms = backoff_ms;
             backoff_ms = (backoff_ms * 2 < hb_ms) ? backoff_ms * 2 : hb_ms;
+        }
+
+        // Liveness ladder. See the comment near consecutive_publish_failures
+        // declaration above for design rationale. Liveness = anything 2xx-or-4xx
+        // (4xx means the link is alive; the server just rejected the payload —
+        // not a network problem). Anything else (5xx, negative sentinels,
+        // timeouts) is treated as a transport-level failure.
+        const bool link_alive = (status >= 200 && status < 500);
+        if (link_alive) {
+            consecutive_publish_failures = 0;
+        } else {
+            consecutive_publish_failures += 1;
+            const unsigned int fails = consecutive_publish_failures;
+            // Each level fires *exactly* at its boundary (==, not >=) so that
+            // we don't escalate further on the next loop iteration — fails
+            // will be N+1, not N, and won't match any other boundary either.
+            // The intentional gap (e.g. 5..9 between L2 and L3) is the
+            // "give the recovery action a chance to take effect" window. At
+            // hb=60s that's 5*60s = 5 minutes between L2 and L3.
+            if (fails == 20) {
+                // L4 — last resort. The errlog write is RAM-only and won't
+                // survive the reset; log to serial too so the local console
+                // gets the breadcrumb. Post-reset rst=130 (USER) lets the
+                // analyzer correlate boots back to this cause.
+                Log.error("net: recovery L4 (System.reset) after %u failed publishes",
+                          fails);
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "recover_l4 fails=%u", fails);
+                delay(50);  // flush serial
+                System.reset();
+                // Unreachable.
+            } else if (fails == 10) {
+                // L3 — radio power cycle. Clears driver-level wedge that
+                // survives a re-association (rare, but the OG Photon's
+                // WICED stack has been observed to need this in pathological
+                // cases). Blocking ~500ms while the radio cycles.
+                Log.warn("net: recovery L3 (WiFi.off/on) after %u failed publishes",
+                         fails);
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "recover_l3 fails=%u", fails);
+                WiFi.off();
+                delay(500);
+                WiFi.on();
+                WiFi.connect();
+            } else if (fails == 5) {
+                // L2 — force a fresh association without dropping the radio.
+                // Clears the "associated but no TCP throughput" zombie state
+                // that's the leading hypothesis for rico's symptom.
+                Log.warn("net: recovery L2 (WiFi.disconnect+connect) after %u failed publishes",
+                         fails);
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "recover_l2 fails=%u", fails);
+                WiFi.disconnect();
+                WiFi.connect();
+            } else if (fails == 2) {
+                // L1 — gentle kick. Same call shape as the WiFi.ready()
+                // kick path above, but reached via a different signal
+                // (publish failures, not WiFi state). Deliberately drops
+                // the !WiFi.connecting() guard the upper kick has: by the
+                // time we're here we've already established that DeviceOS's
+                // view of the link disagrees with reality, so its
+                // connecting-state flag isn't a signal we can trust.
+                Log.warn("net: recovery L1 (WiFi.connect) after %u failed publishes",
+                         fails);
+                critterchron::g_errlog.record(critterchron::ErrCat::Net,
+                                              "recover_l1 fails=%u", fails);
+                WiFi.connect();
+            }
         }
 
 #ifndef NO_IR_OTA
@@ -1392,13 +1527,34 @@ void setup() {
     delay(200);                                // divider settles
 #endif
 
-    int reason = System.resetReason();
+    int      reason      = System.resetReason();
+    uint32_t reason_data = System.resetReasonData();
+
+    // Always log the boot cause via the err= channel so the analyzer
+    // sees how every boot transitioned (manual cycle, OTA, panic, L4
+    // recovery, etc.) without needing `rst=` as a constant noise field
+    // in every heartbeat. The errlog drains one entry per heartbeat,
+    // so this Boot record naturally appears in the first 1–2 heartbeats
+    // after a reboot, then never again until the next boot.
+    //
+    // Panic boots (rst=120) carry the extended reason data — bottom
+    // byte is panic ID, top is address class. See Particle docs for
+    // panic-code lookup. Non-panic boots omit it (always 0).
+    if (reason == RESET_REASON_PANIC) {
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                 "rst=%d panic=0x%08lx",
+                 reason, (unsigned long)reason_data);
+    } else {
+        critterchron::g_errlog.record(critterchron::ErrCat::Boot,
+                 "rst=%d", reason);
+    }
+
     if (is_crash_reset(reason)) {
         g_rescue_mode     = true;
         g_rescue_start_ms = millis();
         critterchron::g_errlog.record(critterchron::ErrCat::Boot,
-                 "rescue hold rst=%d wait=%lums",
-                 reason, (unsigned long)RESCUE_HOLD_MS);
+                 "rescue hold wait=%lums",
+                 (unsigned long)RESCUE_HOLD_MS);
     }
 
     Time.zone(TIMEZONE_OFFSET_HOURS);
@@ -1815,13 +1971,16 @@ void loop() {
         last_physics_tick = now;
 
         if (g_clock.valid()) {
-            // Re-sync the intended/clock layer once per virtual minute.
-            int m = local_minute(g_clock);
-            if (m != last_sync_minute) {
+            // Re-sync the intended/clock layer whenever the displayed
+            // HH:MM changes. Polled at physics-tick cadence (~125ms); see
+            // local_minute_of_day() commentary for why the key is
+            // minute-of-day, not minute-of-hour.
+            int mod = local_minute_of_day(g_clock);
+            if (mod != last_sync_minute) {
                 int prev = last_sync_minute;
-                last_sync_minute = m;
+                last_sync_minute = mod;
                 g_engine.syncTime();
-                Log.info("syncTime: minute %d -> %d", prev, m);
+                Log.info("syncTime: minute-of-day %d -> %d", prev, mod);
             }
             uint32_t t0 = micros();
             g_engine.tick();

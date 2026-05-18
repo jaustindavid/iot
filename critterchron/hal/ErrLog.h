@@ -20,9 +20,14 @@
 //   * Sized for ~256 B RAM total (4 entries × 64 B). Fits even on the
 //     P1 with NO_IR_OTA — see the heartbeat ricardo/rico note in
 //     TODO.md Completed for the RAM budget context.
-//   * Wire format: ` err=<cat>:<msg>` appended to the heartbeat k=v
-//     payload. One error per heartbeat (rate-limit; 10s heartbeats
-//     drain a full ring in 40s, plenty fast for the use cases below).
+//   * Wire format: one k=v message per ErrLog entry, published to
+//     STRA2US_ERROR_TOPIC (`<app>/public/error`):
+//       `device=<name> cat=<tag> seq=<n> up=<s> wall=<unix> msg=<text>`
+//     The drain loop in telemetry_cycle publishes the whole pending
+//     ring per cycle (capped at N=4), reusing the heartbeat socket.
+//     Was originally appended as ` err=cat:msg` to the heartbeat
+//     itself; split out 2026-05-18 because the heartbeep stream was
+//     overloaded with telemetry growth.
 //
 // Threading: a single mutex guards the ring. Producers and consumers
 // can race (telemetry thread writes ir_poll errors AND consumes the
