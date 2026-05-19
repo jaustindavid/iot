@@ -5,6 +5,7 @@
 #   make DEVICE=rachel_raccoon thyme flash           # encode + compile + flash
 #   make DEVICE=rachel_raccoon flash                 # re-flash last IR
 #   make DEVICE=rachel_raccoon PLATFORM=host thyme   # run under host harness
+#   make host                                        # cheap sanity gate via host harness
 #   make DEVICE=rachel_raccoon clean
 #   make list                                        # show devices + scripts
 #
@@ -18,6 +19,15 @@
 
 DEVICE   ?= rachel_raccoon
 PYTHON   ?= python3
+
+# `make host` — cheapest sanity gate. Builds + runs the cross-platform
+# engine on the host harness at the default device's geometry. Useful
+# as a quick "did I break the engine" check after HAL edits without
+# needing flash hardware. Override DEVICE or HOST_SCRIPT to point at
+# a different combo; for ad-hoc one-offs, the explicit
+# `make PLATFORM=host DEVICE=<dev> <script>` form works through the
+# same catch-all path.
+HOST_SCRIPT ?= thyme
 
 DEVICES_DIR  := devices
 AGENTS_DIR   := ../agents
@@ -33,7 +43,7 @@ DEVICE_HEADER := $(DEVICES_DIR)/$(DEVICE).h
 # (e.g. `PLATFORM=host`) wins.
 PLATFORM ?= $(shell test -f $(DEVICE_HEADER) && grep DEVICE_PLATFORM $(DEVICE_HEADER) | cut -d'"' -f2)
 
-.PHONY: default list check-device check-platform
+.PHONY: default list check-device check-platform host
 
 default: list
 
@@ -42,6 +52,13 @@ list:
 	@echo ""
 	@echo "  devices: $(DEVICES)"
 	@echo "  scripts: $(SCRIPTS)"
+
+# Explicit rule so the catch-all below doesn't try to forward `host` to
+# the platform Makefile (which has no such target). Recursive invocation
+# overrides PLATFORM so the catch-all routes to hal/host/Makefile via
+# the standard dispatch path.
+host:
+	@$(MAKE) PLATFORM=host DEVICE=$(DEVICE) $(HOST_SCRIPT)
 
 check-device:
 	@if [ ! -f $(DEVICE_HEADER) ]; then \

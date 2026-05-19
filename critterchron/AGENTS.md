@@ -156,6 +156,10 @@ the same spirit. WHAT is in the identifiers; WHY is in the comment.
 - [PROCYON.md](PROCYON.md) — captive-WiFi rescue mode.
 - [MARKERS_SPEC.md](MARKERS_SPEC.md) — visual markers in `.crit`.
 - [TODO.md](TODO.md) — live punch list (rots fast; check date).
+- [dispatch/](dispatch/) — per-task briefs + closing handoffs from
+  prior cuttlefish work. Before touching an area, scan for a related
+  brief/handoff pair — they carry rationale, surprises, and
+  open follow-ups that a fresh agent would otherwise re-discover.
 - [handoff.md](handoff.md) — last project-wide status snapshot
   (dated; check before relying on details).
 - `hal/devices/<name>.h` — per-device config; read the one(s) your task

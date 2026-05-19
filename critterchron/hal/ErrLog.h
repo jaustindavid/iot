@@ -28,6 +28,13 @@
 //     Was originally appended as ` err=cat:msg` to the heartbeat
 //     itself; split out 2026-05-18 because the heartbeep stream was
 //     overloaded with telemetry growth.
+//   * Topic-sharing convention: STRA2US_ERROR_TOPIC also carries
+//     non-ErrLog one-shot diagnostic events. Those use `event=<name>`
+//     instead of `cat=<name>`; `cat=` on this topic is reserved for
+//     `err_cat_tag(ErrCat)`-derived values so a consumer can rely on
+//     that constraint. Today's only non-ErrLog publisher is
+//     boot_light (Particle-only, `LIGHT_SENSOR_TYPE`-gated); future
+//     one-shots follow the same `event=` convention.
 //
 // Threading: a single mutex guards the ring. Producers and consumers
 // can race (telemetry thread writes ir_poll errors AND consumes the

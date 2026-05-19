@@ -4,6 +4,41 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Server-side consumer for `critterchron/public/error`.** Topic exists
+  and devices publish to it (since 2026-05-19), but nothing consumes
+  it yet — errors are visible only by tailing the queue manually. Need
+  a real consumer + dashboard panel, ideally one that surfaces
+  per-device rolling error rates alongside the existing heartbeep
+  dashboards.
+
+  Wire format on the topic carries two disjoint discriminator fields;
+  the consumer branches on which is present:
+
+  - `cat=<errcat_tag>` — ErrLog drain. Enum-bound:
+    `cat ∈ {other, ota_fetch, ota_apply, boot, sensor, net}` via
+    `critterchron::err_cat_tag(ErrCat)` in `hal/ErrLog.h`. Carries
+    `seq=`, `up=`, `wall=`, `msg=`.
+  - `event=<name>` — non-ErrLog one-shot diagnostic event. Free-form
+    today; only value in use is `event=boot_light` (Particle-only,
+    `LIGHT_SENSOR_TYPE`-gated post-boot diagnostic, carries
+    `raws=<v1,v2,...,v30>`).
+
+  Context + rationale: `dispatch/error-stream-split.md` (initial
+  split off heartbeep), `dispatch/error-stream-event-field.md` (the
+  `cat=` vs `event=` decision). Open across both handoffs.
+
+- **Factor `emit_error_event(name, fmt, ...)` helper when the second
+  non-ErrLog one-shot lands.** Today's only `event=` publisher is
+  boot_light (one `snprintf` site in `critterchron_particle.cpp`),
+  and a helper for one caller is YAGNI — convention lives in
+  `hal/ErrLog.h`'s doc-comment instead. When a *second* non-ErrLog
+  one-shot needs the topic (candidates: procyon-rescue activation,
+  OTA-started markers, wifi-cred-apply success), factor a helper at
+  that moment and route boot_light through it too. The trigger is
+  the second caller, not a scheduled date. Rationale in
+  `dispatch/error-stream-event-field.md` ("Why we're not factoring
+  a helper").
+
 - **Heartbeat additions for log-mining: `mem_min` + `ticks`.** Now that
   the Stra2us queue serves as a week-plus retention buffer (rico.dump
   has 9300 heartbeats / 235 h proving this), worth sneaking in a
@@ -346,10 +381,13 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
      the cloud-wait window before any sim runs; `draw_ota_streamer`
      (5s of green vertical streamers) covers the post-boot OTA swap
      window. Both in `critterchron_particle.cpp:754, 778`.
-  2. **Error messages remote** ✅ — heartbeat error channel landed
-     2026-04-25. OTA fetch/apply failures (oversized, malformed, sha
-     mismatch, parse-fail, reinit-fail) all surface as
-     `err=<cat>:<msg>` in the next heartbeat. See `hal/ErrLog.{h,cpp}`.
+  2. **Error messages remote** ✅ — error channel landed 2026-04-25.
+     OTA fetch/apply failures (oversized, malformed, sha mismatch,
+     parse-fail, reinit-fail) all surface to the operator remotely.
+     Originally appended as `err=<cat>:<msg>` to the next heartbeat;
+     split to a dedicated `critterchron/public/error` topic 2026-05-19
+     (see `dispatch/error-stream-split.md`). Wire format and
+     producer/consumer contract in `hal/ErrLog.{h,cpp}`.
   3. **Guarding the swap** ✅ — `g_ota_loading` state pauses physics
      and renders the streamer for `OTA_LOADING_MS=5000` before
      applying, so a swap is never silent or sudden.
@@ -1263,6 +1301,49 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 - ~~**Phase 6 — ESP32 port.**~~ Closed 2026-04-24; see Completed.
 
 # Completed
+
+- **2026-05-19 — `make -C hal host` top-level convenience target.**
+  The `error-stream-split` dispatch's handoff flagged that the brief's
+  assumed `make -C hal host` invocation didn't exist — the working
+  form was `make -C hal/host DEVICE=<dev> <script>` or
+  `make -C hal PLATFORM=host DEVICE=<dev> <script>`. Added a thin
+  `host:` target in `hal/Makefile` that defaults to
+  `DEVICE=rachel_raccoon HOST_SCRIPT=thyme` and recursively invokes
+  the existing catch-all dispatch with `PLATFORM=host` — same path as
+  the explicit form, just sugar. Override either knob for ad-hoc
+  combos. Verified: `make -C hal host` builds + runs clean; override
+  via `make -C hal host DEVICE=ricky_raccoon HOST_SCRIPT=ants` also
+  works; existing `make list` regression-clean. AGENTS.md "host build
+  is the cheapest gate" line can now be taken literally.
+
+- **2026-05-19 — Error stream split off heartbeep.** Heartbeep stream
+  was overloaded with telemetry + error trailers as the project's
+  observability surface grew. ErrLog drains and one-shot diagnostic
+  events (boot_light) moved off `critterchron/public/heartbeep` onto
+  a sibling `critterchron/public/error` topic. Heartbeat builders no
+  longer reserve / append the `err=<cat>:<msg>` trailer; the drain
+  loop runs after the heartbeat publish on the same keep-alive socket
+  and reuses the heartbeat's stack-local `report[384]` (zero new
+  statics — load-bearing for OG Photon's RAM budget). Symmetric
+  edits across `hal/particle/src/critterchron_particle.cpp` and
+  `hal/esp32/src/critterchron_esp32.ino`. boot_light relocation was
+  bundled in mid-session at the operator's request. Full brief +
+  handoff: `dispatch/error-stream-split{,-handoff}.md`. Open
+  follow-ups (server-side consumer, helper factoring) carried
+  forward into Near-term.
+
+- **2026-05-19 — `cat=` vs `event=` convention on
+  `critterchron/public/error`.** When boot_light was bundled into the
+  error stream split (above), its publish used `cat=boot_light`,
+  overloading a field that elsewhere on the topic is `ErrCat`-bound.
+  Resolved by reserving `cat=` for ErrLog drains (enum-bound:
+  `other / ota_fetch / ota_apply / boot / sensor / net`) and
+  introducing `event=` for non-ErrLog one-shots. boot_light's
+  payload swapped from `cat=boot_light` to `event=boot_light` (only
+  Particle entry point — ESP32 has no boot_light). Convention
+  documented in `hal/ErrLog.h`'s doc-comment so it surfaces from the
+  natural starting point. No helper yet (YAGNI; one caller). Full
+  brief + handoff: `dispatch/error-stream-event-field{,-handoff}.md`.
 
 - **2026-05-13 — Rico heap "leak" investigation closed (not a leak).**
   Started from observed ~1040 B `mem=` delta between swarm and

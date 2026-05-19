@@ -1287,10 +1287,16 @@ static void telemetry_worker() {
         // answerable from telemetry alone. Published to STRA2US_ERROR_TOPIC
         // alongside ErrLog entries (it's an event-worth-knowing, not part
         // of the steady-state heartbeat); shape matches the error-entry
-        // k=v format with `cat=boot_light` as the discriminator. Not gated
-        // on telemetry_cycle success: if the regular heartbeat failed,
-        // this cycle will retry both next time — connect/close are
-        // per-block.
+        // k=v format but uses `event=boot_light` as the discriminator.
+        // `cat=` on this topic is reserved for ErrLog drains
+        // (`err_cat_tag(ErrCat)`-derived values); non-ErrLog one-shots
+        // like this one use `event=<name>` so a consumer can branch
+        // cleanly on which field is present without overloading the
+        // enum-bound value space. See
+        // dispatch/error-stream-event-field.md for the rationale. Not
+        // gated on telemetry_cycle success: if the regular heartbeat
+        // failed, this cycle will retry both next time — connect/close
+        // are per-block.
         if (g_boot_light_ready && !g_boot_light_sent) {
             // Static, not stack: the tel worker has a modest stack and 512B
             // of locals plus the snprintf frames was enough to SOS on the
@@ -1299,7 +1305,7 @@ static void telemetry_worker() {
             // (redundant with the raws= count).
             static char msg[512];
             int n = snprintf(msg, sizeof(msg),
-                             "device=%s cat=boot_light up=%lu wall=%lu raws=",
+                             "device=%s event=boot_light up=%lu wall=%lu raws=",
                              DEVICE_NAME,
                              (unsigned long)System.uptime(),
                              (unsigned long)Time.now());
