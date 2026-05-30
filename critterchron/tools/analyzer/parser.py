@@ -212,6 +212,110 @@ def _assign(out: dict, key: str, value: str) -> None:
         except ValueError: pass
         return
 
+    # WEDGE_DIAG opt-in field. `agid=(t<N>/s<M>,...)` — per-agent raw
+    # type_idx and state_str_id. Exposes the bytes that drive `ast=`;
+    # added 2026-05-20 to localize boober-on-C3 wedge corruption.
+    # Parsed into a list of (type, state) tuples under `agid`. Filtered
+    # out of numeric_metrics().
+    if key == "agid" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        pairs = []
+        for piece in inner.split(","):
+            piece = piece.strip()
+            if not piece: continue
+            m = re.match(r"t(\d+)/s(\d+)", piece)
+            if m:
+                pairs.append((int(m.group(1)), int(m.group(2))))
+        out["agid"] = pairs
+        return
+
+    # WEDGE_DIAG follow-ons (2026-05-23):
+    #   irst=<16hex>  — first 2 bytes of each of 4 state strings of
+    #                   AGENT_TYPES[0]. Hex; healthy boober reads as
+    #                   "id"/"ca"/"re"/"st" → "6964636172657374".
+    #   canary=ok | canary=BAD/<hex> — Agent struct trailing canary
+    #                   check. "ok" = all alive agents have intact
+    #                   0xDEADBEEF; else value of first corrupted one.
+    # Both useful at-a-glance: ast=() empty + irst contains 0000 = IR
+    # string memory corrupted. ast=() empty + irst healthy = corruption
+    # elsewhere. Either + canary=BAD = adjacent struct memory hit too.
+    if key == "irst":
+        out["irst"] = value  # keep raw hex; analyzer can compare to baseline
+        # Convenience flag: ir_strings_zero=1 if any 2-byte slot is "0000"
+        chunks = [value[i:i+4] for i in range(0, len(value), 4)]
+        out["ir_strings_zero"] = 1 if any(c == "0000" for c in chunks if len(c) == 4) else 0
+        return
+    if key == "canary":
+        out["canary"] = value
+        out["canary_ok"] = 1 if value == "ok" else 0
+        return
+
+    # apos=(x,y;x,y;...) — per-agent grid positions. Semicolon-separated
+    # so commas inside (x,y) pairs don't ambiguate. Parsed into list of
+    # (x, y) tuples under `apos`. Filtered out of numeric_metrics().
+    if key == "apos" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        pairs = []
+        for piece in inner.split(";"):
+            piece = piece.strip()
+            if not piece: continue
+            xy = piece.split(",")
+            if len(xy) == 2:
+                try: pairs.append((int(xy[0]), int(xy[1])))
+                except ValueError: pass
+        out["apos"] = pairs
+        return
+
+    # apc=(N,N,...) — per-agent script PC. Parsed into list[int].
+    if key == "apc" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        pcs = []
+        for piece in inner.split(","):
+            piece = piece.strip()
+            if not piece: continue
+            try: pcs.append(int(piece))
+            except ValueError: pass
+        out["apc"] = pcs
+        return
+
+    # aglitch=(0,1,...) — per-agent glitched flag (1 = benched by the
+    # runaway-opcode guard). Parsed to list[int] under `aglitch`, plus
+    # `aglitch_any` = 1 if any agent is glitched. The engine-wide
+    # `glitches=N` counter is handled by the generic scalar path below
+    # (lands as out["glitches"]); a nonzero glitches with a frozen
+    # agid/apos snapshot is the confirmed wedge.
+    if key == "aglitch" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        flags = []
+        for piece in inner.split(","):
+            piece = piece.strip()
+            if not piece: continue
+            try: flags.append(int(piece))
+            except ValueError: pass
+        out["aglitch"] = flags
+        out["aglitch_any"] = 1 if any(f for f in flags) else 0
+        return
+
+    # pileheap=(N,N,...) — heap-marker count at each boober "piles" cell.
+    # Wedge hypothesis (2026-05-29): all cells >= 1 at wedge → deposit
+    # seek `< 1` has no candidate → returning agent livelocks. Parsed to
+    # list[int] under `pileheap`, plus convenience flags:
+    #   pileheap_min — smallest count (0 refutes the hypothesis)
+    #   pileheap_all_ge1 — 1 if every cell >= 1 (the predicted wedge state)
+    if key == "pileheap" and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        counts = []
+        for piece in inner.split(","):
+            piece = piece.strip()
+            if not piece: continue
+            try: counts.append(int(piece))
+            except ValueError: pass
+        out["pileheap"] = counts
+        if counts:
+            out["pileheap_min"] = min(counts)
+            out["pileheap_all_ge1"] = 1 if min(counts) >= 1 else 0
+        return
+
     m = _PAIR_RE.match(value)
     if m:
         a, b = int(m.group(1)), int(m.group(2))

@@ -888,12 +888,15 @@ static int telemetry_cycle() {
         snprintf(script_tag, sizeof(script_tag), "default");
     }
 
-    // Report buffer at 384 holds the full parity-with-Particle field set
-    // (typical ~280 chars with script= in the mix). Heartbeat body is
-    // pure status now — ErrLog entries publish to STRA2US_ERROR_TOPIC
-    // as their own messages (see the drain after publish below). Kept
-    // at 384 deliberately: the drain reuses this buffer.
-    char report[384];
+    // Report buffer bumped from 384 → 512 on 2026-05-23 when WEDGE_DIAG
+    // additions (stick/cells/esync_lag/ast/agid + irst/canary) pushed
+    // typical heartbeats past the prior 384-byte ceiling — first-boot
+    // and rtt-present heartbeats were silently truncating the trailing
+    // fields. 512 leaves comfortable headroom for the diag fields while
+    // staying well under the err-publish 1024-byte buffer Stra2usClient
+    // can handle. ErrLog entries publish separately to
+    // STRA2US_ERROR_TOPIC; this buffer is heartbeat-only.
+    char report[512];
     constexpr size_t safe_cap = sizeof(report);
     int  rssi = WiFi.isConnected() ? WiFi.RSSI() : -127;
 
@@ -1098,6 +1101,179 @@ static int telemetry_cycle() {
             report[rlen] = '\0';
         }
     }
+
+#ifdef WEDGE_DIAG
+    // Per-agent raw identifiers — diagnostic-only. Exposes the underlying
+    // bytes that drive `ast=` so we can localize the corruption that
+    // surfaces as `ast=()` empty. Format: `agid=(t<N>/s<M>,...)` where
+    // N is type_idx, M is state_str_id. Both raw — bypasses agentStateName's
+    // fallback-to-"none" so we see actual values, including 255 / 65535
+    // if either has gone out of band.
+    //
+    // Opt-in per device via `#define WEDGE_DIAG` in the device header
+    // (hal/devices/<name>.h). Default off — the bytes are useful only
+    // while chasing the boober-on-C3 wedge (debug_2026-05-17 onward).
+    // ~25 bytes per heartbeat at 2 agents; bigger scripts proportional.
+    if (rlen > 0 && rlen < (int)safe_cap - 10) {
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0) {
+            int n = snprintf(report + rlen, safe_cap - rlen, " agid=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 2; ++i) {
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             "%st%u/s%u",
+                             (i ? "," : ""),
+                             (unsigned)g_engine.agentTypeIdxRaw(i),
+                             (unsigned)g_engine.agentStateIdRaw(i));
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    report[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) {
+                report[rlen++] = ')';
+                report[rlen]   = '\0';
+            }
+        }
+    }
+
+    // apos=(x,y;x,y;...) per-agent grid positions.
+    // apc=(N,N,...)      per-agent script program counter.
+    // sseek=N            total seek-opcode entries (vs failed_seeks
+    //                    which only counts failures). Diff gives us
+    //                    successful seeks. If sseek climbs while
+    //                    failed_seeks is flat → agents reach seek
+    //                    opcode but always succeed trivially. If
+    //                    both are flat while state cycles → agents
+    //                    never reach a seek opcode at all.
+    // Added 2026-05-29 to chase the ricky_raccoon wedge where
+    // irst=healthy ruled out IR-buffer corruption.
+    if (rlen > 0 && rlen < (int)safe_cap - 10) {
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0) {
+            int n = snprintf(report + rlen, safe_cap - rlen, " apos=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 4; ++i) {
+                critterchron::Point p = g_engine.agentPos(i);
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             "%s%d,%d",
+                             (i ? ";" : ""), (int)p.x, (int)p.y);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    report[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { report[rlen++] = ')'; report[rlen] = '\0'; }
+        }
+        if (rlen < (int)safe_cap - 6 && n_slots > 0) {
+            int n = snprintf(report + rlen, safe_cap - rlen, " apc=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 4; ++i) {
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             "%s%d", (i ? "," : ""), (int)g_engine.agentPc(i));
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    report[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { report[rlen++] = ')'; report[rlen] = '\0'; }
+        }
+        if (rlen < (int)safe_cap - 16) {
+            int n = snprintf(report + rlen, safe_cap - rlen,
+                             " sseek=%lu", (unsigned long)g_engine.metrics().total_seeks);
+            if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+            else report[rlen] = '\0';
+        }
+    }
+
+    // glitches=N + aglitch=(0,1,...) — THE wedge signal. `glitches` is the
+    // engine-wide runaway-opcode counter (metrics().glitches); it jumps
+    // from 0 the instant an agent trips the 100-opcode guard and gets
+    // permanently benched. `aglitch` flags which agent slots are dead.
+    // A heartbeat with glitches>0 + a frozen agid/apos/apc snapshot is the
+    // confirmed wedge. This is the field we wish we'd had weeks ago.
+    if (rlen > 0 && rlen < (int)safe_cap - 16) {
+        int n = snprintf(report + rlen, safe_cap - rlen,
+                         " glitches=%lu grecov=%lu",
+                         (unsigned long)g_engine.metrics().glitches,
+                         (unsigned long)g_engine.metrics().glitch_recoveries);
+        if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+        else report[rlen] = '\0';
+
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0 && rlen < (int)safe_cap - 12) {
+            n = snprintf(report + rlen, safe_cap - rlen, " aglitch=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 3; ++i) {
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             "%s%d", (i ? "," : ""), g_engine.agentGlitched(i) ? 1 : 0);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) { report[rlen] = '\0'; break; }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { report[rlen++] = ')'; report[rlen] = '\0'; }
+        }
+    }
+
+    // pileheap=(N,N,...) — heap-marker count at each "piles" landmark cell.
+    // Tests the 2026-05-29 wedge hypothesis: a `returning` agent deposits
+    // via `seek highest heap < 1 on landmark piles`, which needs a cell
+    // with count==0. If every pile cell is >=1, the deposit seek has no
+    // candidate → agent livelocks. Prediction at wedge: all cells >=1
+    // (likely all at the ~5 cap). Any 0 refutes. boober-specific names;
+    // emits nothing on scripts without a "piles" landmark + "heap" marker.
+    if (rlen > 0 && rlen < (int)safe_cap - 12) {
+        uint8_t pc_[16];
+        uint16_t np = g_engine.landmarkMarkerCounts("piles", "heap", pc_, sizeof(pc_));
+        if (np > 0) {
+            int n = snprintf(report + rlen, safe_cap - rlen, " pileheap=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < np && rlen < (int)safe_cap - 4; ++i) {
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             "%s%u", (i ? "," : ""), (unsigned)pc_[i]);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) { report[rlen] = '\0'; break; }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { report[rlen++] = ')'; report[rlen] = '\0'; }
+        }
+    }
+
+    // irst=<16hex> — first 2 bytes of each of the first 4 state strings of
+    // AGENT_TYPES[0]. The corruption signature observed 2026-05-23 is
+    // that state-name pointers stay valid but the bytes at the pointed
+    // addresses get zeroed. Healthy boober reads as the ASCII of "id",
+    // "ca", "re", "st" (0x69 0x64 0x63 0x61 0x72 0x65 0x73 0x74). Any
+    // zero byte in this field is a corruption signature.
+    //
+    // canary=ok | canary=BAD/<hex> — first non-DEADBEEF Agent canary, or
+    // "ok" if all alive agents have intact canaries. See firstBadCanary()
+    // for semantics. Cheap walk over the agent array, microseconds.
+    // Threshold relaxed to safe_cap - 10 (was -30) so irst= will at least
+    // partially appear under buffer pressure; snprintf truncates cleanly
+    // in the inner writes if any individual one doesn't fit. Combined with
+    // the larger buffer above this should be belt-and-suspenders.
+    if (rlen > 0 && rlen < (int)safe_cap - 10) {
+        uint8_t b[2];
+        int n = snprintf(report + rlen, safe_cap - rlen, " irst=");
+        if (n > 0) rlen += n;
+        for (uint16_t s = 0; s < 4 && rlen < (int)safe_cap - 4; ++s) {
+            g_engine.irStateNameBytes(0, s, b, sizeof(b));
+            n = snprintf(report + rlen, safe_cap - rlen, "%02x%02x", b[0], b[1]);
+            if (n <= 0) { report[rlen] = '\0'; break; }
+            rlen += n;
+        }
+        const uint32_t cv = g_engine.firstBadCanary();
+        if (rlen < (int)safe_cap - 24) {
+            if (cv == 0xDEADBEEFu) {
+                n = snprintf(report + rlen, safe_cap - rlen, " canary=ok");
+            } else {
+                n = snprintf(report + rlen, safe_cap - rlen,
+                             " canary=BAD/%08lx", (unsigned long)cv);
+            }
+            if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+            else report[rlen] = '\0';
+        }
+    }
+#endif  // WEDGE_DIAG
 
     g_cfg.connect();
     int pub_status = g_cfg.publish(STRA2US_TELEMETRY_TOPIC, report);

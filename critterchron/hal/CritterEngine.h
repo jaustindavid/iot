@@ -102,6 +102,20 @@ struct Tile {
 #define MAX_AGENTS 80
 #endif
 
+// Ticks a glitched agent stays benched before the tick loop auto-rearms
+// it (clears `glitched`, restarts its behavior at pc=0). Recovery exists
+// so a transient runaway self-heals instead of bricking the clock until
+// reboot — but it does NOT mask the bug: every glitch still bumps
+// metrics_.glitches and every rearm bumps metrics_.glitch_recoveries, so
+// a persistent cause shows up as a visible flap in telemetry rather than
+// a silent freeze. ~256 ticks ≈ 25s at a 100ms tick, ~100s at 400ms.
+// Reuses the agent's `remaining_ticks` field as the countdown (unused
+// while benched) — deliberately NOT a new Agent field; growing the
+// struct crashloops the ESP32-C3 (see 2026-05-23 canary investigation).
+#ifndef GLITCH_RECOVERY_TICKS
+#define GLITCH_RECOVERY_TICKS 256
+#endif
+
 struct Agent {
     int16_t  id;
     uint16_t type_idx;           // index into critter_ir::AGENT_TYPES
@@ -148,6 +162,17 @@ struct Agent {
                               // by construction (see stepTowardTarget)
     uint8_t     plan_len;
     uint8_t     plan_cursor;
+
+    // NOTE: WEDGE_DIAG canary used to live here as a trailing field. On
+    // ESP32-C3 the 4-byte struct-size bump caused a boot crashloop (root
+    // cause not nailed down — see investigation notes 2026-05-23). Moved
+    // out to a sibling static array `g_agent_canaries[MAX_AGENTS]` in
+    // CritterEngine.cpp to keep this struct's layout invariant across
+    // diag-on/diag-off builds. Diagnostic value is slightly reduced —
+    // catches writes into the array region but not within-struct
+    // overflows past plan[PLAN_MAX] — but irst= has exonerated the
+    // IR-buffer-corruption theory the canary was primarily built for, so
+    // the remaining "did the array region get hit" use is still useful.
 };
 
 struct HealthMetrics {
@@ -155,6 +180,21 @@ struct HealthMetrics {
     uint32_t glitches = 0;
     uint32_t step_contests = 0;
     uint32_t failed_seeks = 0;
+    // Counts every seek opcode entry (both classic and gradient forms),
+    // success or fail. Diagnostic-only — paired with failed_seeks lets the
+    // analyzer compute successful_seeks = total - failed and spot the
+    // "agent is reaching seek opcodes but always succeeding trivially"
+    // case (state machine cycles, seeks count climbs, but failed_seeks
+    // flat) vs the "agent never even gets to a seek opcode" case (both
+    // counters frozen while state cycles). The wedge ricky_raccoon hit
+    // 2026-05-29 looks like the former; this field disambiguates.
+    uint32_t total_seeks = 0;
+    // Count of auto-rearm events (a benched/glitched agent restored to
+    // active after GLITCH_RECOVERY_TICKS). Paired with `glitches`: if both
+    // climb together over time, an agent is repeatedly glitching and
+    // self-healing — a persistent corruption cause flapping, not a
+    // one-shot. Surfaced as `grecov=` in the WEDGE_DIAG heartbeat.
+    uint32_t glitch_recoveries = 0;
     uint32_t total_intended = 0;
     uint32_t total_lit_intended = 0;
 };
@@ -198,6 +238,65 @@ public:
     // agents legitimately taking the idle branch" (clock-face complete /
     // missing-cell set empty).
     const char* agentStateName(uint16_t idx) const;
+
+    // Raw per-agent identifiers. Used by the WEDGE_DIAG heartbeat field
+    // (`agid=(t<N>/s<N>,...)`) to expose the underlying byte values so we
+    // can localize the corruption that surfaces as empty `ast=()`. These
+    // bypass agentStateName's fallback-to-"none" guards — operators want
+    // the raw value, not a sanitized one. Returns 0xFFFF / 0xFF for
+    // OOB/dead agents (UINT_MAX sentinels distinguish "no agent here"
+    // from "agent here with id 0").
+    uint16_t agentTypeIdxRaw(uint16_t idx) const;
+    uint8_t  agentStateIdRaw(uint16_t idx) const;
+
+    // Walk all alive agents' canaries; returns the value of the first one
+    // that's NOT 0xDEADBEEF, or 0xDEADBEEF if all intact. 0 if no agents.
+    // Heartbeat builder emits `canary=ok` or `canary=BAD/<hex>` based on
+    // this. Reads from the sibling `g_agent_canaries[]` static array in
+    // CritterEngine.cpp (see comment in Agent struct re: why it's not
+    // inside Agent anymore). Returns 0xDEADBEEF on non-WEDGE_DIAG builds.
+    uint32_t firstBadCanary() const;
+
+    // Per-agent position + script PC, used by the WEDGE_DIAG heartbeat
+    // fields `apos=` and `apc=`. Together they tell us: are the agents
+    // physically moving on the grid? Are they sitting at a specific
+    // script PC indefinitely (suggesting a stuck control-flow branch)?
+    // Returns {0, 0} / 0 for OOB/dead slots — caller distinguishes "no
+    // agent" from "agent at origin" via the agid= field.
+    Point   agentPos(uint16_t idx) const;
+    int16_t agentPc (uint16_t idx) const;
+
+    // Per-agent glitched flag. An agent trips this when processAgent runs
+    // away past the 100-opcode guard; once set it's NEVER cleared at
+    // runtime and the tick loop skips the agent permanently (CritterEngine
+    // .cpp:626). This is the wedge mechanism we chased for weeks — the
+    // engine-wide count is in metrics().glitches, but per-agent visibility
+    // tells the analyzer WHICH slot died and lets us correlate with the
+    // frozen agid=/apos=/apc= snapshot. Returns false for OOB/dead slots.
+    bool agentGlitched(uint16_t idx) const;
+
+    // Fill `out` with the `marker` count at each point of the named
+    // `landmark`, in landmark-point order, up to `out_max` entries.
+    // Returns the number written (0 if landmark or marker is unknown, or
+    // the build has IR_MAX_MARKERS=0). WEDGE_DIAG heartbeat dumps the
+    // boober "piles" landmark's "heap" counts as `pileheap=(N,N,...)`.
+    // The 2026-05-29 wedge hypothesis predicts ALL counts >= 1 at the
+    // moment of wedge — the return-deposit seek `< 1` then has no
+    // candidate, so a `returning` agent can never deposit and the system
+    // livelocks. A snapshot showing every cell >= 1 (especially all == cap)
+    // confirms it; any cell == 0 refutes it.
+    uint16_t landmarkMarkerCounts(const char* landmark, const char* marker,
+                                  uint8_t* out, uint16_t out_max) const;
+
+    // Copy `out_len` bytes from the IR-string-pool memory pointed to by
+    // the first state name of AGENT_TYPES[0]. Heartbeat dumps these as
+    // hex so we can spot zero-byte corruption in the IR text buffer.
+    // Caller passes a buffer of at least `out_len` bytes; we copy from
+    // the underlying string region, NOT from any sanitized representation.
+    // Reads up to NUL or out_len, padded with zeros — the corruption
+    // signature is precisely the first-byte-is-zero case we want to spot.
+    void irStateNameBytes(uint16_t type_idx, uint16_t state_slot,
+                          uint8_t* out, size_t out_len) const;
 
     // Walk the grid and count tiles matching `kind`. `kind` is anything
     // tileMatches() accepts: "missing", "extra", "current", or a landmark

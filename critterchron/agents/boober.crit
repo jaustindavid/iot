@@ -135,7 +135,7 @@ boober:
   # --- returning: drop the brick on a pile cell with room ---
   if state == returning:
     set color = bright_y
-    seek bottom
+    # seek bottom
     seek highest heap < 1 on landmark piles timeout 20
     if on landmark piles:
       incr heap

@@ -477,6 +477,10 @@ bool CritterEngine::reinit() {
                 }
             }
         }
+
+#ifdef WEDGE_DIAG
+        g_agent_canaries[agent_count_ - 1] = 0xDEADBEEFu;
+#endif
     }
     return true;
 }
@@ -598,6 +602,10 @@ void CritterEngine::applySpawnRules() {
         a.color_idx = (ci < 0) ? 0 : static_cast<uint8_t>(ci);
         a.color_phase = (uint16_t)(rng_() & 0xFFFF);
         a.alive = true;
+
+#ifdef WEDGE_DIAG
+        g_agent_canaries[agent_count_ - 1] = 0xDEADBEEFu;
+#endif
     }
 }
 
@@ -615,7 +623,25 @@ void CritterEngine::tick() {
 
     for (uint16_t i = 0; i < agent_count_; ++i) {
         Agent& a = agents_[i];
-        if (!a.alive || a.glitched) continue;
+        if (!a.alive) continue;
+
+        // Glitched (benched) agents auto-recover instead of staying dead
+        // until reboot. While benched, remaining_ticks counts the cooldown
+        // down (armed to GLITCH_RECOVERY_TICKS at the glitch site); at 0 we
+        // rearm: clear the flag, restart behavior cleanly at pc=0, drop any
+        // stale plan, and count the recovery. A persistent cause just
+        // re-glitches next pass → glitches/glitch_recoveries both climb,
+        // giving a loud flap signal rather than a silent permanent freeze.
+        if (a.glitched) {
+            if (a.remaining_ticks > 0) { --a.remaining_ticks; continue; }
+            a.glitched      = false;
+            a.pc            = 0;
+            a.plan_len      = 0;
+            a.plan_cursor   = 0;
+            a.seek_ticks    = 0;
+            ++metrics_.glitch_recoveries;
+            // fall through and process this tick
+        }
 
         if (a.remaining_ticks > 0) {
             --a.remaining_ticks;
@@ -755,6 +781,117 @@ const char* CritterEngine::agentStateName(uint16_t idx) const {
     const auto& type = critter_ir::AGENT_TYPES[a.type_idx];
     if (a.state_str_id > type.state_count) return "none";
     return type.states[a.state_str_id - 1];
+}
+
+// Raw accessors for the WEDGE_DIAG heartbeat field — see header.
+// Intentionally bypass the "return 'none'" sanitizing of agentStateName;
+// caller wants to see the actual bytes (which may be corrupt).
+uint16_t CritterEngine::agentTypeIdxRaw(uint16_t idx) const {
+    if (idx >= agent_count_) return UINT16_MAX;
+    if (!agents_[idx].alive)  return UINT16_MAX;
+    return agents_[idx].type_idx;
+}
+uint8_t CritterEngine::agentStateIdRaw(uint16_t idx) const {
+    if (idx >= agent_count_) return UINT8_MAX;
+    if (!agents_[idx].alive)  return UINT8_MAX;
+    return agents_[idx].state_str_id;
+}
+
+#ifdef WEDGE_DIAG
+// Sibling canary array — see comment in Agent struct re: why it lives
+// here instead of inside Agent. Indexed in parallel with agents_[]:
+// agents_[i] has its canary at g_agent_canaries[i]. Initialized to
+// 0xDEADBEEF at spawn; checked at heartbeat time via firstBadCanary.
+static uint32_t g_agent_canaries[MAX_AGENTS] = {0};
+#endif
+
+// Walk alive agents; return the first canary value that isn't 0xDEADBEEF.
+// On builds without WEDGE_DIAG, returns the healthy sentinel
+// unconditionally — caller's heartbeat code emits `canary=ok` and we're
+// done. See header for usage semantics.
+uint32_t CritterEngine::firstBadCanary() const {
+#ifdef WEDGE_DIAG
+    for (uint16_t i = 0; i < agent_count_; ++i) {
+        if (!agents_[i].alive) continue;
+        if (g_agent_canaries[i] != 0xDEADBEEFu) return g_agent_canaries[i];
+    }
+#endif
+    return 0xDEADBEEFu;
+}
+
+// Per-agent position. Wedge-diagnostic only — heartbeat builder emits
+// `apos=(x,y;x,y;...)` so we can see whether agents are physically
+// moving on the grid during a wedge. Returns {0, 0} for OOB/dead slots.
+Point CritterEngine::agentPos(uint16_t idx) const {
+    if (idx >= agent_count_) return Point{0, 0};
+    if (!agents_[idx].alive)  return Point{0, 0};
+    return agents_[idx].pos;
+}
+
+// Per-agent script program counter. Heartbeat emits `apc=(N,N,...)`.
+// Wedged-but-cycling agents should show pc oscillating across a small
+// range; wedged-in-one-place agents should show pc stuck at one value.
+// Returns 0 for OOB/dead slots.
+int16_t CritterEngine::agentPc(uint16_t idx) const {
+    if (idx >= agent_count_) return 0;
+    if (!agents_[idx].alive)  return 0;
+    return agents_[idx].pc;
+}
+
+// Per-agent glitched flag — see header. Note: deliberately does NOT gate
+// on alive, because a glitched agent is exactly the failure we want to
+// surface and the tick-loop compaction leaves glitched-but-alive agents
+// in place. Gates only on slot bounds.
+bool CritterEngine::agentGlitched(uint16_t idx) const {
+    if (idx >= agent_count_) return false;
+    return agents_[idx].glitched;
+}
+
+// Dump a landmark's per-point marker counts. See header for the wedge
+// hypothesis this confirms/refutes. Returns 0 (writes nothing) when the
+// landmark/marker is unknown or markers are compiled out.
+uint16_t CritterEngine::landmarkMarkerCounts(const char* landmark,
+                                             const char* marker,
+                                             uint8_t* out,
+                                             uint16_t out_max) const {
+    if (!out || out_max == 0) return 0;
+    int lm = landmarkIndex(landmark);
+    if (lm < 0) return 0;
+    int slot = markerSlot(marker);
+    if (slot < 0) return 0;
+#if IR_MAX_MARKERS > 0
+    const auto& L = critter_ir::LANDMARKS[lm];
+    uint16_t n = 0;
+    for (uint16_t k = 0; k < L.point_count && n < out_max; ++k) {
+        int x = L.points[k].x, y = L.points[k].y;
+        if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) continue;
+        out[n++] = grid_[x][y].count[slot];
+    }
+    return n;
+#else
+    return 0;
+#endif
+}
+
+// Copy bytes from AGENT_TYPES[type_idx].states[state_slot] into `out`.
+// Reads up to NUL or `out_len`, padding remainder with zeros. The whole
+// point is to make a zeroed-out string visible — caller renders these
+// bytes as hex in the heartbeat. Returns silently with `out` zeroed if
+// type_idx/state_slot is out of range or the underlying pointer is null.
+void CritterEngine::irStateNameBytes(uint16_t type_idx, uint16_t state_slot,
+                                     uint8_t* out, size_t out_len) const {
+    if (!out || out_len == 0) return;
+    std::memset(out, 0, out_len);
+    if (type_idx >= critter_ir::AGENT_TYPE_COUNT) return;
+    const auto& type = critter_ir::AGENT_TYPES[type_idx];
+    if (state_slot >= type.state_count) return;
+    const char* s = type.states[state_slot];
+    if (!s) return;
+    for (size_t i = 0; i < out_len; ++i) {
+        uint8_t c = (uint8_t)s[i];
+        out[i] = c;
+        if (c == 0) break;  // copied the NUL, the rest stays 0 from memset
+    }
 }
 
 bool CritterEngine::evaluateIf(const Agent& a, const char* body) const {
@@ -1439,6 +1576,11 @@ void CritterEngine::processAgent(Agent& a) {
     while (pc < n) {
         if (executed > 100) {
             a.glitched = true;
+            // Arm the auto-recovery countdown. Reuses remaining_ticks (no
+            // new Agent field — struct growth crashloops the C3). The tick
+            // loop decrements this while benched and rearms at 0. See
+            // GLITCH_RECOVERY_TICKS in CritterEngine.h.
+            a.remaining_ticks = (int16_t)GLITCH_RECOVERY_TICKS;
             ++metrics_.glitches;
             return;
         }
@@ -1725,6 +1867,12 @@ void CritterEngine::processAgent(Agent& a) {
         //                                        [on landmark <l>]
         //                                        [timeout N]
         if (startsWith(inst, "seek")) {
+            // Total seek-opcode entries — paired with failed_seeks
+            // to disambiguate "agent never reaches seek" from "agent
+            // reaches seek but it succeeds trivially." See HealthMetrics
+            // doc comment. Bumped once per opcode entry regardless of
+            // which seek form (classic vs gradient) takes the branch below.
+            ++metrics_.total_seeks;
             char buf[128];
             std::strncpy(buf, inst, sizeof(buf) - 1);
             buf[sizeof(buf) - 1] = 0;

@@ -818,6 +818,145 @@ static int build_heartbeat_report(char* out, size_t cap) {
         }
     }
 
+#ifdef WEDGE_DIAG
+    // Per-agent raw identifiers — see ESP32 mirror at
+    // critterchron_esp32.ino. Format: `agid=(t<N>/s<M>,...)`. Default
+    // off; opt-in via `#define WEDGE_DIAG` in the device header.
+    if (rlen > 0 && rlen < (int)safe_cap - 10) {
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0) {
+            int n = snprintf(out + rlen, safe_cap - rlen, " agid=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 2; ++i) {
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             "%st%u/s%u",
+                             (i ? "," : ""),
+                             (unsigned)g_engine.agentTypeIdxRaw(i),
+                             (unsigned)g_engine.agentStateIdRaw(i));
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    out[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) {
+                out[rlen++] = ')';
+                out[rlen]   = '\0';
+            }
+        }
+    }
+
+    // apos= / apc= / sseek=. See ESP32 mirror in critterchron_esp32.ino
+    // for diagnostic rationale (added 2026-05-29 to disambiguate the
+    // ricky_raccoon wedge: agents reaching seek opcodes vs not).
+    if (rlen > 0 && rlen < (int)safe_cap - 10) {
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0) {
+            int n = snprintf(out + rlen, safe_cap - rlen, " apos=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 4; ++i) {
+                critterchron::Point p = g_engine.agentPos(i);
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             "%s%d,%d",
+                             (i ? ";" : ""), (int)p.x, (int)p.y);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    out[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { out[rlen++] = ')'; out[rlen] = '\0'; }
+        }
+        if (rlen < (int)safe_cap - 6 && n_slots > 0) {
+            int n = snprintf(out + rlen, safe_cap - rlen, " apc=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 4; ++i) {
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             "%s%d", (i ? "," : ""), (int)g_engine.agentPc(i));
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) {
+                    out[rlen] = '\0'; break;
+                }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { out[rlen++] = ')'; out[rlen] = '\0'; }
+        }
+        if (rlen < (int)safe_cap - 16) {
+            int n = snprintf(out + rlen, safe_cap - rlen,
+                             " sseek=%lu", (unsigned long)g_engine.metrics().total_seeks);
+            if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+            else out[rlen] = '\0';
+        }
+    }
+
+    // glitches=N + aglitch=(0,1,...) — THE wedge signal. See ESP32 mirror
+    // for full rationale. `glitches` (engine runaway-opcode counter) jumps
+    // from 0 when an agent trips the 100-opcode guard and is benched;
+    // `aglitch` flags which slots died.
+    if (rlen > 0 && rlen < (int)safe_cap - 16) {
+        int n = snprintf(out + rlen, safe_cap - rlen,
+                         " glitches=%lu grecov=%lu",
+                         (unsigned long)g_engine.metrics().glitches,
+                         (unsigned long)g_engine.metrics().glitch_recoveries);
+        if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+        else out[rlen] = '\0';
+
+        const uint16_t n_slots = g_engine.agentSlotCount();
+        if (n_slots > 0 && rlen < (int)safe_cap - 12) {
+            n = snprintf(out + rlen, safe_cap - rlen, " aglitch=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < n_slots && rlen < (int)safe_cap - 3; ++i) {
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             "%s%d", (i ? "," : ""), g_engine.agentGlitched(i) ? 1 : 0);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) { out[rlen] = '\0'; break; }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { out[rlen++] = ')'; out[rlen] = '\0'; }
+        }
+    }
+
+    // pileheap=(N,N,...) — see ESP32 mirror for the wedge hypothesis this
+    // confirms/refutes. boober-specific landmark/marker names; emits
+    // nothing on other scripts.
+    if (rlen > 0 && rlen < (int)safe_cap - 12) {
+        uint8_t pc_[16];
+        uint16_t np = g_engine.landmarkMarkerCounts("piles", "heap", pc_, sizeof(pc_));
+        if (np > 0) {
+            int n = snprintf(out + rlen, safe_cap - rlen, " pileheap=(");
+            if (n > 0) rlen += n;
+            for (uint16_t i = 0; i < np && rlen < (int)safe_cap - 4; ++i) {
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             "%s%u", (i ? "," : ""), (unsigned)pc_[i]);
+                if (n <= 0 || rlen + n >= (int)safe_cap - 2) { out[rlen] = '\0'; break; }
+                rlen += n;
+            }
+            if (rlen < (int)safe_cap - 1) { out[rlen++] = ')'; out[rlen] = '\0'; }
+        }
+    }
+
+    // irst=<16hex> + canary=<status>. See ESP32 mirror at
+    // critterchron_esp32.ino — same fields, same diagnostic intent.
+    if (rlen > 0 && rlen < (int)safe_cap - 30) {
+        uint8_t b[2];
+        int n = snprintf(out + rlen, safe_cap - rlen, " irst=");
+        if (n > 0) rlen += n;
+        for (uint16_t s = 0; s < 4 && rlen < (int)safe_cap - 4; ++s) {
+            g_engine.irStateNameBytes(0, s, b, sizeof(b));
+            n = snprintf(out + rlen, safe_cap - rlen, "%02x%02x", b[0], b[1]);
+            if (n <= 0) { out[rlen] = '\0'; break; }
+            rlen += n;
+        }
+        const uint32_t cv = g_engine.firstBadCanary();
+        if (rlen < (int)safe_cap - 24) {
+            if (cv == 0xDEADBEEFu) {
+                n = snprintf(out + rlen, safe_cap - rlen, " canary=ok");
+            } else {
+                n = snprintf(out + rlen, safe_cap - rlen,
+                             " canary=BAD/%08lx", (unsigned long)cv);
+            }
+            if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+            else out[rlen] = '\0';
+        }
+    }
+#endif  // WEDGE_DIAG
+
     return rlen;
 }
 
