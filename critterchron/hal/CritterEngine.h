@@ -275,6 +275,30 @@ public:
     // frozen agid=/apos=/apc= snapshot. Returns false for OOB/dead slots.
     bool agentGlitched(uint16_t idx) const;
 
+    // Pack the grid's `intended` and `state` (lit) bits into two
+    // bitmaps, one bit per cell, index = y*GRID_WIDTH + x. Each needs
+    // ceil(GRID_WIDTH*GRID_HEIGHT / 8) bytes (32 on a 32x8 grid). The
+    // WEDGE_DIAG heartbeat hex-encodes these as `gint=`/`glit=` so we can
+    // SEE the actual board at a wedge — missing = intended & !state,
+    // extra = state & !intended — and settle whether the agents' "no
+    // work" world-view matches reality or `cells=` is misreporting.
+    // Reads the live grid; nbytes must be >= the per-bitmap size or the
+    // call no-ops (leaves buffers zeroed).
+    void gridBitmaps(uint8_t* intended_out, uint8_t* state_out,
+                     size_t nbytes) const;
+
+    // Within-tick board counts (wedge diagnostic). `pre` = missing/extra
+    // as the agents saw them this tick (captured before processAgent);
+    // `post` = after all post-agent grid mutation (fade-expiry, decay).
+    // Divergence between pre/post — or between pre and the tel thread's
+    // `cells=` — localizes whether the grid changes mid-tick or across
+    // threads. Surfaced as `bpre=`/`bpost=` in the heartbeat and the
+    // "dbg" object in dumpStateJsonl.
+    uint16_t dbgBoardMissPre()  const { return dbg_miss_pre_;  }
+    uint16_t dbgBoardExtraPre() const { return dbg_extra_pre_; }
+    uint16_t dbgBoardMissPost() const { return dbg_miss_post_; }
+    uint16_t dbgBoardExtraPost()const { return dbg_extra_post_;}
+
     // Fill `out` with the `marker` count at each point of the named
     // `landmark`, in landmark-point order, up to `out_max` entries.
     // Returns the number written (0 if landmark or marker is unknown, or
@@ -439,6 +463,12 @@ private:
     // UTC seconds passed to the most recent syncTimeAt() call. Surfaced via
     // lastSyncedUnix() for the `esync_lag=` heartbeat field.
     time_t         last_synced_unix_ = 0;
+    // Within-tick board-count diagnostics (see dbgBoard*() getters). Stamped
+    // in tick(): *_pre_ before processAgent, *_post_ after fade-expiry.
+    uint16_t       dbg_miss_pre_  = 0;
+    uint16_t       dbg_extra_pre_ = 0;
+    uint16_t       dbg_miss_post_ = 0;
+    uint16_t       dbg_extra_post_= 0;
     // Timing accumulators — reset at tick() start, updated during
     // processAgent/aStarFirstStep, finalized at tick() exit. Exposed via
     // interpUsLastTick()/astarUsLastTick(). Overhead is ~2 micros() calls

@@ -250,6 +250,36 @@ def _assign(out: dict, key: str, value: str) -> None:
         out["canary_ok"] = 1 if value == "ok" else 0
         return
 
+    # gint=/glit= — grid bitmaps (hex, one bit per cell, idx = y*W+x).
+    # Decode to popcounts and derive missing/extra straight from the
+    # board the device actually saw. bm_missing = popcount(intended &
+    # ~state); bm_extra = popcount(state & ~intended). Cross-check
+    # against cells= (cells_missing/cells_extra): they SHOULD match (both
+    # read the same grid on the tel thread); a mismatch means a torn read.
+    # When they match, bm_* IS the ground truth at the wedge, and the
+    # raw hex lets an operator map exactly which (x,y) cells are missing.
+    if key in ("gint", "glit"):
+        try:
+            raw = bytes.fromhex(value)
+        except ValueError:
+            out[key] = value
+            return
+        out[key] = value          # keep raw hex for coordinate decode
+        out[key + "_popcount"] = sum(bin(b).count("1") for b in raw)
+        # If both bitmaps are present, derive missing/extra. Order-
+        # independent: stash bytes, compute when the second arrives.
+        stash = out.setdefault("_gbits", {})
+        stash[key] = raw
+        if "gint" in stash and "glit" in stash:
+            gi, gl = stash["gint"], stash["glit"]
+            n = min(len(gi), len(gl))
+            miss = sum(bin(gi[i] & ~gl[i] & 0xFF).count("1") for i in range(n))
+            extra = sum(bin(gl[i] & ~gi[i] & 0xFF).count("1") for i in range(n))
+            out["bm_missing"] = miss
+            out["bm_extra"] = extra
+            out.pop("_gbits", None)   # internal accumulator, not output
+        return
+
     # apos=(x,y;x,y;...) — per-agent grid positions. Semicolon-separated
     # so commas inside (x,y) pairs don't ambiguate. Parsed into list of
     # (x, y) tuples under `apos`. Filtered out of numeric_metrics().
@@ -294,6 +324,23 @@ def _assign(out: dict, key: str, value: str) -> None:
             except ValueError: pass
         out["aglitch"] = flags
         out["aglitch_any"] = 1 if any(f for f in flags) else 0
+        return
+
+    # bpre=(m,x) / bpost=(m,x) — engine-side within-tick board counts
+    # (missing,extra) captured before agents ran / after post-agent
+    # mutation. The decisive cross-check: bpre vs the tel-thread cells=.
+    # If bpre_missing != cells_missing in the same heartbeat, the engine
+    # and tel threads see different boards. If bpre != bpost, the grid
+    # mutates mid-tick after the agents acted.
+    if key in ("bpre", "bpost") and value.startswith("(") and value.endswith(")"):
+        inner = value[1:-1]
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) == 2:
+            try:
+                out[key + "_missing"] = int(parts[0])
+                out[key + "_extra"] = int(parts[1])
+            except ValueError:
+                out[key] = value
         return
 
     # pileheap=(N,N,...) — heap-marker count at each boober "piles" cell.

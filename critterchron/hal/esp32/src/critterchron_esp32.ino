@@ -116,6 +116,15 @@
 #define STRA2US_SNAPSHOT_TOPIC STRA2US_APP "/public/snapshots"
 #endif
 
+// WEDGE_DIAG full-state dump topic. On a dump_now trigger we also publish
+// engine.dumpStateJsonl() — the complete board (state+intended per cell),
+// per-agent full struct, markers, and within-tick board diag — in the
+// SAME JSONL format the host harness emits, so a device-wedge dump can be
+// diffed directly against a host sim run.
+#ifndef STRA2US_STATE_TOPIC
+#define STRA2US_STATE_TOPIC STRA2US_APP "/public/state"
+#endif
+
 // Per-device trace topic (FAILURE_TRIAGE.md §2). Different prefix from
 // snapshots: trace is hands-on debugging, not customer-aggregate, so
 // keep it out of /public/. DEVICE_NAME comes from creds.h.
@@ -896,7 +905,9 @@ static int telemetry_cycle() {
     // staying well under the err-publish 1024-byte buffer Stra2usClient
     // can handle. ErrLog entries publish separately to
     // STRA2US_ERROR_TOPIC; this buffer is heartbeat-only.
-    char report[512];
+    char report[640];   // bumped from 512 for the WEDGE_DIAG grid bitmaps
+                        // (gint=/glit=, ~140 chars). Still well under the
+                        // publish path's capacity; tel-task stack is 8KB.
     constexpr size_t safe_cap = sizeof(report);
     int  rssi = WiFi.isConnected() ? WiFi.RSSI() : -127;
 
@@ -1214,6 +1225,21 @@ static int telemetry_cycle() {
         }
     }
 
+    // bpre=(m,x) bpost=(m,x) — within-tick board counts captured ENGINE-side
+    // (bpre before the agents ran, bpost after post-agent mutation). Compare
+    // to the tel-thread cells= above: if bpre disagrees with cells=, the
+    // engine and tel threads see different boards (the crux of the wedge).
+    if (rlen > 0 && rlen < (int)safe_cap - 32) {
+        int n = snprintf(report + rlen, safe_cap - rlen,
+                         " bpre=(%u,%u) bpost=(%u,%u)",
+                         (unsigned)g_engine.dbgBoardMissPre(),
+                         (unsigned)g_engine.dbgBoardExtraPre(),
+                         (unsigned)g_engine.dbgBoardMissPost(),
+                         (unsigned)g_engine.dbgBoardExtraPost());
+        if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+        else report[rlen] = '\0';
+    }
+
     // pileheap=(N,N,...) — heap-marker count at each "piles" landmark cell.
     // Tests the 2026-05-29 wedge hypothesis: a `returning` agent deposits
     // via `seek highest heap < 1 on landmark piles`, which needs a cell
@@ -1272,6 +1298,30 @@ static int telemetry_cycle() {
             if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
             else report[rlen] = '\0';
         }
+    }
+
+    // gint=/glit= — the actual board. intended + state(lit) bitmaps, one
+    // bit per cell (idx = y*W+x), hex-encoded. At a wedge: missing =
+    // gint & ~glit, extra = glit & ~gint. Lets us SEE whether the agents'
+    // "no work" view matches reality or cells= is lying. 64 hex/bitmap on
+    // a 32x8 grid.
+    if (rlen > 0 && rlen < (int)safe_cap - 140) {
+        constexpr size_t NB = (GRID_WIDTH * GRID_HEIGHT + 7) / 8;
+        uint8_t gint[NB], glit[NB];
+        g_engine.gridBitmaps(gint, glit, NB);
+        int n = snprintf(report + rlen, safe_cap - rlen, " gint=");
+        if (n > 0) rlen += n;
+        for (size_t i = 0; i < NB && rlen < (int)safe_cap - 3; ++i) {
+            n = snprintf(report + rlen, safe_cap - rlen, "%02x", gint[i]);
+            if (n <= 0) break; rlen += n;
+        }
+        n = snprintf(report + rlen, safe_cap - rlen, " glit=");
+        if (n > 0) rlen += n;
+        for (size_t i = 0; i < NB && rlen < (int)safe_cap - 3; ++i) {
+            n = snprintf(report + rlen, safe_cap - rlen, "%02x", glit[i]);
+            if (n <= 0) break; rlen += n;
+        }
+        report[rlen] = '\0';
     }
 #endif  // WEDGE_DIAG
 
@@ -1644,6 +1694,16 @@ static void telemetry_task(void*) {
                         "snap publish=%d", pub);
                 }
             }
+#ifdef WEDGE_DIAG
+            // Full engine state alongside the ring dump — the complete
+            // board + per-agent struct that cracks the world-view paradox.
+            {
+                std::string js = g_engine.dumpStateJsonl();
+                int spub = g_cfg.publish(STRA2US_STATE_TOPIC, js.c_str());
+                Serial.printf("[state] publish=%d bytes=%u\n",
+                              spub, (unsigned)js.size());
+            }
+#endif
         }
 
         // Read heartbeep AFTER the cycle so a newly-fetched override

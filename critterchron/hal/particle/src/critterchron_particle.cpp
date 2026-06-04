@@ -54,6 +54,12 @@ SYSTEM_THREAD(ENABLED);
 #define STRA2US_SNAPSHOT_TOPIC STRA2US_APP "/public/snapshots"
 #endif
 
+// WEDGE_DIAG full-state dump topic — see ESP32 mirror. dumpStateJsonl()
+// published here on a dump_now trigger; same format as host --dump-state.
+#ifndef STRA2US_STATE_TOPIC
+#define STRA2US_STATE_TOPIC STRA2US_APP "/public/state"
+#endif
+
 // Per-device trace topic (FAILURE_TRIAGE.md §2). Out of /public/ —
 // trace is hands-on debug, not customer-aggregate.
 #ifndef STRA2US_TRACE_TOPIC
@@ -912,6 +918,20 @@ static int build_heartbeat_report(char* out, size_t cap) {
         }
     }
 
+    // bpre=(m,x) bpost=(m,x) — engine-side within-tick board counts. See
+    // ESP32 mirror. Compare bpre to the tel-thread cells= for cross-thread
+    // grid divergence.
+    if (rlen > 0 && rlen < (int)safe_cap - 32) {
+        int n = snprintf(out + rlen, safe_cap - rlen,
+                         " bpre=(%u,%u) bpost=(%u,%u)",
+                         (unsigned)g_engine.dbgBoardMissPre(),
+                         (unsigned)g_engine.dbgBoardExtraPre(),
+                         (unsigned)g_engine.dbgBoardMissPost(),
+                         (unsigned)g_engine.dbgBoardExtraPost());
+        if (n > 0 && rlen + n < (int)safe_cap) rlen += n;
+        else out[rlen] = '\0';
+    }
+
     // pileheap=(N,N,...) — see ESP32 mirror for the wedge hypothesis this
     // confirms/refutes. boober-specific landmark/marker names; emits
     // nothing on other scripts.
@@ -955,6 +975,27 @@ static int build_heartbeat_report(char* out, size_t cap) {
             else out[rlen] = '\0';
         }
     }
+
+    // gint=/glit= — actual board bitmaps. See ESP32 mirror for decode
+    // (missing = gint & ~glit, extra = glit & ~gint).
+    if (rlen > 0 && rlen < (int)safe_cap - 140) {
+        constexpr size_t NB = (GRID_WIDTH * GRID_HEIGHT + 7) / 8;
+        uint8_t gint[NB], glit[NB];
+        g_engine.gridBitmaps(gint, glit, NB);
+        int n = snprintf(out + rlen, safe_cap - rlen, " gint=");
+        if (n > 0) rlen += n;
+        for (size_t i = 0; i < NB && rlen < (int)safe_cap - 3; ++i) {
+            n = snprintf(out + rlen, safe_cap - rlen, "%02x", gint[i]);
+            if (n <= 0) break; rlen += n;
+        }
+        n = snprintf(out + rlen, safe_cap - rlen, " glit=");
+        if (n > 0) rlen += n;
+        for (size_t i = 0; i < NB && rlen < (int)safe_cap - 3; ++i) {
+            n = snprintf(out + rlen, safe_cap - rlen, "%02x", glit[i]);
+            if (n <= 0) break; rlen += n;
+        }
+        out[rlen] = '\0';
+    }
 #endif  // WEDGE_DIAG
 
     return rlen;
@@ -974,7 +1015,8 @@ static int telemetry_cycle() {
     // headroom for further growth; truncation is still handled by the final
     // NUL-terminate at the bottom. Kept at 384 deliberately — the ErrLog
     // drain below reuses this buffer after the heartbeat publish.
-    char report[384];
+    char report[640];   // bumped from 384 for the WEDGE_DIAG grid bitmaps
+                        // (gint=/glit=); ErrLog drain below reuses it.
     int rlen = build_heartbeat_report(report, sizeof(report));
     if (rlen == 0) return 0;
 
@@ -1415,6 +1457,15 @@ static void telemetry_worker() {
                         "snap publish=%d", pub);
                 }
             }
+#ifdef WEDGE_DIAG
+            {
+                std::string js = g_engine.dumpStateJsonl();
+                g_cfg.connect();
+                int spub = g_cfg.publish(STRA2US_STATE_TOPIC, js.c_str());
+                g_cfg.close();
+                Log.info("state publish=%d bytes=%u", spub, (unsigned)js.size());
+            }
+#endif
         }
 #endif  // !NO_SNAPSHOT_BUFFER
 

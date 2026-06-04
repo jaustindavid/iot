@@ -24,7 +24,17 @@
 static void usage(const char* argv0) {
     std::fprintf(stderr,
         "Usage: %s [--ticks N] [--seed N] [--dump-fake-time YYYY-MM-DDTHH:MM] "
-        "[--dump-state PATH] [--night]\n", argv0);
+        "[--dump-state PATH] [--night]\n"
+        "       %s --soak [--soak-ticks N] [--tick-ms M] [--seed N] "
+        "[--start-time YYYY-MM-DDTHH:MM] [--stuck-ticks W]\n"
+        "\n"
+        "  --soak        Fast-forward sim: advance the virtual clock M ms per\n"
+        "                tick (so minutes actually roll), run up to --soak-ticks\n"
+        "                ticks as fast as the CPU allows, and auto-detect the\n"
+        "                clock-transition livelock (work exists but agents stop\n"
+        "                seeking/moving) or a glitch. On detection, dumps the\n"
+        "                grid + per-agent state and the tick it happened.\n",
+        argv0, argv0);
 }
 
 static time_t parse_fake_time(const char* s) {
@@ -47,6 +57,11 @@ int main(int argc, char** argv) {
     const char* fake_time_str = nullptr;
     const char* dump_path = nullptr;
     bool night = false;
+    bool soak = false;
+    long soak_ticks = 5000000;   // ~926h of virtual clock at 400ms/tick
+    uint32_t tick_ms = 0;        // 0 → use critter_ir::RUNTIME_TICK_MS
+    const char* start_time_str = nullptr;
+    long stuck_window = 900;     // ticks of no-progress-with-work → livelock
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--ticks") && i+1 < argc) {
@@ -60,6 +75,16 @@ int main(int argc, char** argv) {
             dump_path = argv[++i];
         } else if (!std::strcmp(argv[i], "--night")) {
             night = true;
+        } else if (!std::strcmp(argv[i], "--soak")) {
+            soak = true;
+        } else if (!std::strcmp(argv[i], "--soak-ticks") && i+1 < argc) {
+            soak_ticks = std::strtol(argv[++i], nullptr, 10);
+        } else if (!std::strcmp(argv[i], "--tick-ms") && i+1 < argc) {
+            tick_ms = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
+        } else if (!std::strcmp(argv[i], "--start-time") && i+1 < argc) {
+            start_time_str = argv[++i];
+        } else if (!std::strcmp(argv[i], "--stuck-ticks") && i+1 < argc) {
+            stuck_window = std::strtol(argv[++i], nullptr, 10);
         } else {
             usage(argv[0]);
             return 2;
@@ -84,6 +109,97 @@ int main(int argc, char** argv) {
     }
     if (have_seed) engine.seedRng(seed);
     engine.setNightMode(night);
+
+    // ---- Soak / fast-forward mode -------------------------------------
+    // Advances the virtual clock so minutes actually roll (the regime the
+    // clock-transition livelock lives in — the frozen-clock parity loop
+    // below can NEVER reproduce it). Runs as fast as the CPU allows and
+    // auto-detects the wedge: a window of `stuck_window` ticks during which
+    // work exists (missing+extra > 0) but no agent issues a seek or moves.
+    // Also reports a glitch (benched agent) distinctly. On detection it
+    // prints the tick + a grid/agent snapshot and exits non-zero so a seed
+    // sweep can `||` over it.
+    if (soak) {
+        uint32_t step_ms = tick_ms ? tick_ms : (uint32_t)critter_ir::RUNTIME_TICK_MS;
+        if (step_ms == 0) step_ms = 400;
+        if (start_time_str) clock.set_now(parse_fake_time(start_time_str));
+
+        long  stuck = 0;
+        long  max_stuck = 0;          // high-water mark of the no-progress streak
+        long  max_work  = 0;          // most missing+extra seen at once
+        long  ticks_work_no_seek = 0; // ticks where work>0 AND no seek this tick
+        uint32_t last_seeks = engine.metrics().total_seeks;
+        uint32_t last_glitches = engine.metrics().glitches;
+        // Snapshot agent positions to detect "no movement."
+        auto positions_signature = [&]() -> uint64_t {
+            uint64_t h = 1469598103934665603ull; // FNV-ish, just a change-detector
+            for (uint16_t k = 0; k < engine.agentSlotCount(); ++k) {
+                critterchron::Point p = engine.agentPos(k);
+                h = (h ^ (uint64_t)(uint8_t)p.x) * 1099511628211ull;
+                h = (h ^ (uint64_t)(uint8_t)p.y) * 1099511628211ull;
+            }
+            return h;
+        };
+        uint64_t last_pos_sig = positions_signature();
+
+        auto report = [&](const char* what, long tick) {
+            std::printf("\n*** SOAK DETECTED: %s at tick %ld "
+                        "(virtual wall=%ld) ***\n", what, tick, (long)clock.wall_now());
+            std::printf("  missing=%u extra=%u current=%u  total_seeks=%u "
+                        "failed_seeks=%u glitches=%u grecov=%u\n",
+                        (unsigned)engine.countTiles("missing"),
+                        (unsigned)engine.countTiles("extra"),
+                        (unsigned)engine.countTiles("current"),
+                        (unsigned)engine.metrics().total_seeks,
+                        (unsigned)engine.metrics().failed_seeks,
+                        (unsigned)engine.metrics().glitches,
+                        (unsigned)engine.metrics().glitch_recoveries);
+            for (uint16_t k = 0; k < engine.agentSlotCount(); ++k) {
+                critterchron::Point p = engine.agentPos(k);
+                std::printf("  agent[%u] pos=(%d,%d) pc=%d glitched=%d\n",
+                            k, (int)p.x, (int)p.y, (int)engine.agentPc(k),
+                            engine.agentGlitched(k) ? 1 : 0);
+            }
+            std::printf("  --- grid dumpStateJsonl ---\n%s\n",
+                        engine.dumpStateJsonl().c_str());
+        };
+
+        for (long i = 0; i < soak_ticks; ++i) {
+            clock.advance_ms(step_ms);
+            engine.syncTime();
+            engine.tick();
+
+            uint32_t seeks    = engine.metrics().total_seeks;
+            uint32_t glitches = engine.metrics().glitches;
+            uint64_t pos_sig  = positions_signature();
+            uint16_t work     = engine.countTiles("missing") + engine.countTiles("extra");
+
+            if (glitches != last_glitches) {
+                report("GLITCH (agent benched)", i);
+                return 3;
+            }
+            if (work > (uint16_t)max_work) max_work = work;
+            if (work > 0 && seeks == last_seeks) ++ticks_work_no_seek;
+            bool no_progress = (seeks == last_seeks) && (pos_sig == last_pos_sig);
+            if (work > 0 && no_progress) {
+                if (++stuck > max_stuck) max_stuck = stuck;
+                if (stuck >= stuck_window) { report("LIVELOCK (work ignored)", i); return 4; }
+            } else {
+                stuck = 0;
+            }
+            last_seeks = seeks;
+            last_glitches = glitches;
+            last_pos_sig = pos_sig;
+        }
+        std::printf("soak: completed %ld ticks, no wedge detected "
+                    "(virtual wall advanced %ld s)\n"
+                    "  high-water: max_stuck_streak=%ld (threshold=%ld)  "
+                    "max_work=%ld  ticks_work_no_seek=%ld/%ld\n",
+                    soak_ticks, (long)(clock.wall_now()),
+                    max_stuck, stuck_window, max_work,
+                    ticks_work_no_seek, soak_ticks);
+        return 0;
+    }
 
     std::ofstream dump;
     if (dump_path) {

@@ -112,9 +112,35 @@ When an agent begins seeking a missing/extra tile, it sets `claimant_id` on the 
 2. Spawning: each spawn rule fires if `tick_count % interval == 0` and condition holds.
 3. For each agent (in list order — lower ids first after the initial sort):
    - If `remaining_ticks > 0`, decrement and possibly skip.
-   - Else run `_process_agent_behavior` from `agent.pc` until an instruction yields (`pause`/`wander`/`seek` move/`done`) or the 100-instruction safety cap trips (sets `glitched`, agent enters rainbow state).
+   - Else run `_process_agent_behavior` from `agent.pc` until an instruction yields (`pause`/`wander`/`seek` move/`done`) or the 100-instruction safety cap trips (sets `glitched`). On hardware a glitched agent is benched, then **auto-recovered** after `GLITCH_RECOVERY_TICKS` (~256) so a transient runaway self-heals instead of bricking the clock until reboot; every glitch/recovery is counted (see `glitches`/`grecov` below).
 4. Sort agents by id (deterministic conflict resolution — lower id wins).
 5. Convergence check: compare `_effective_state` to `intended` across the grid.
+
+## Diagnostics & telemetry (hardware)
+
+Devices publish an ASCII `k=v` heartbeat to Stra2us (`<app>/public/heartbeep`) every `heartbeep` seconds. Baseline fields (always on): `up`, `rssi`, `mem_min`, `fw`/`fw_sha`, `script`, `net`, `bri`, `lux`, `phys`/`rend`/`interp`/`astar` timing triples, `agents`, `seeks_fail`, `chip`, `wobble`, `tz`, `rtt`. Reset cause is reported once per boot on the error stream as `err=boot:rst=N` rather than a steady heartbeat field.
+
+**`WEDGE_DIAG` (opt-in, per-device `#define WEDGE_DIAG 1`)** adds the engine-introspection fields used to chase the rare agent-livelock class:
+
+| field | meaning |
+|---|---|
+| `stick` | engine tick counter (frozen ⇒ interpreter wedged) |
+| `cells=(m,x)` | missing + extra tile counts (tel-thread `countTiles`) |
+| `bpre=(m,x)`/`bpost=(m,x)` | engine-side board counts captured before agents ran / after post-agent mutation — compare to `cells` for cross-thread or mid-tick grid divergence |
+| `esync_lag` | seconds since the engine last ran `syncTime` (grows if the engine clock stalls) |
+| `ast`/`agid` | per-agent state name / raw `type_idx`,`state_str_id` |
+| `apos`/`apc` | per-agent position / script PC |
+| `sseek` | total seek-opcode entries (vs `seeks_fail` = failures only) |
+| `glitches`/`grecov`/`aglitch` | runaway-opcode bench counter / auto-recovery counter / per-agent benched flags |
+| `irst`/`canary` | first bytes of the IR state-name strings / Agent-region canary (corruption checks) |
+| `pileheap=(…)` | heap-marker count at each `piles` landmark cell (boober-specific) |
+| `gint`/`glit` | full `intended` / `state` grid as hex bitmaps (1 bit/cell) |
+
+`tools/analyzer/parser.py` decodes all of these (including computing `bm_missing`/`bm_extra` from the bitmaps and cross-checking against `cells`).
+
+**On-demand state dump.** Set `kv:<app>/<device>/dump_now <unix-ts>` (e.g. `stra2us set <device> dump_now $(date +%s)`) to trigger a §1 ring-buffer snapshot (`…/public/snapshots`). Under `WEDGE_DIAG` the device *also* publishes `engine.dumpStateJsonl()` to `…/public/state` — the complete board (`state`+`intended` per cell), full per-agent struct (pc, state, `beh_idx`, plan cache, …), marker counts, and a within-tick `dbg` block. It's the **same JSONL the host sim emits**, so a device-wedge dump diffs directly against a sim run.
+
+**Fast-forward soak harness** (`hal/host`): `make DEVICE=<dev> <script> ARGS="--soak --soak-ticks N --seed S"` advances the virtual clock per tick (minutes actually roll) and runs ~5 virtual hours/wall-second, auto-detecting a livelock (work exists but agents stop seeking/moving) or a glitch and dumping the offending state. Closes the gap that the frozen-clock parity harness can't exercise.
 
 ## Gotchas / limitations
 
@@ -126,6 +152,7 @@ When an agent begins seeking a missing/extra tile, it sets `claimant_id` on the 
 - **`step_contests` metric is never incremented.** Dead field in the health report.
 - **Unknown `wander` modifiers are silent no-ops** (e.g. `wander prefering current` behaves as plain `wander`).
 - **`step (dx, dy)` is unguarded.** Clamps to grid bounds but doesn't check occupancy — the caller (e.g. coati bobbing at the pool) owns the fragility. See `TODO.md`.
+- **A `glitched` (runaway-opcode) agent is benched, not killed.** On hardware it auto-recovers after `GLITCH_RECOVERY_TICKS`; if `glitches`/`grecov` climb together in telemetry, an agent is repeatedly tripping the 100-opcode cap and self-healing (a loud signal, not a silent freeze). The Python sim does not auto-recover.
 
 ## Example agents
 

@@ -614,6 +614,16 @@ void CritterEngine::tick() {
     clearClaims();
     applySpawnRules();
 
+    // Wedge diagnostic: capture the board's missing/extra counts BEFORE
+    // the agents run (≈ what each agent's `if missing`/`if extra` will
+    // see this tick) vs AFTER everything (fade-expiry, marker decay) at
+    // tick exit (≈ what the tel thread's `cells=` later reads). If pre
+    // and post diverge, something mutates the grid mid-tick after the
+    // agents acted — the "missing mutator" we've been hunting. Both are
+    // O(W*H) sweeps, microseconds. See dbgBoard*() getters.
+    dbg_miss_pre_  = countTiles("missing");
+    dbg_extra_pre_ = countTiles("extra");
+
     // Reset timing accumulators. astar_us_ is added to inside processAgent
     // at each aStarFirstStep call site; interp_us_ captures total
     // processAgent time and gets astar subtracted out at the end so the
@@ -704,6 +714,10 @@ void CritterEngine::tick() {
             if (--t.age == 0) t.state = 0;
         }
     }
+
+    // Post-agent board counts — see the pre-capture at tick() top.
+    dbg_miss_post_  = countTiles("missing");
+    dbg_extra_post_ = countTiles("extra");
 
     computeConvergence();
 }
@@ -845,6 +859,23 @@ int16_t CritterEngine::agentPc(uint16_t idx) const {
 bool CritterEngine::agentGlitched(uint16_t idx) const {
     if (idx >= agent_count_) return false;
     return agents_[idx].glitched;
+}
+
+// Pack intended/state bits, one bit per cell (idx = y*GRID_WIDTH + x).
+// See header. No-ops if the caller's buffers are too small.
+void CritterEngine::gridBitmaps(uint8_t* intended_out, uint8_t* state_out,
+                                size_t nbytes) const {
+    const size_t need = (GRID_WIDTH * GRID_HEIGHT + 7) / 8;
+    if (!intended_out || !state_out || nbytes < need) return;
+    for (size_t i = 0; i < need; ++i) { intended_out[i] = 0; state_out[i] = 0; }
+    for (int x = 0; x < GRID_WIDTH; ++x) {
+        for (int y = 0; y < GRID_HEIGHT; ++y) {
+            size_t idx = (size_t)y * GRID_WIDTH + (size_t)x;
+            const Tile& t = grid_[x][y];
+            if (t.intended) intended_out[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+            if (t.state)    state_out[idx >> 3]    |= (uint8_t)(1u << (idx & 7));
+        }
+    }
 }
 
 // Dump a landmark's per-point marker counts. See header for the wedge
@@ -2376,7 +2407,8 @@ void CritterEngine::render(float blend) {
 std::string CritterEngine::dumpStateJsonl() const {
     std::string out;
     out.reserve(4096);
-    char buf[128];
+    char buf[320];   // widened: per-agent record now carries the full
+                     // struct (pc/state/beh_idx/plan/...) for wedge diag
 
     std::snprintf(buf, sizeof(buf), "{\"tick\":%u,\"w\":%d,\"h\":%d,\"state\":[",
                   tick_count_, GRID_WIDTH, GRID_HEIGHT);
@@ -2413,12 +2445,22 @@ std::string CritterEngine::dumpStateJsonl() const {
         first = false;
         uint8_t ar, ag, ab;
         resolveColor(a.color_idx, tick_count_ + a.color_phase, ar, ag, ab);
+        const auto& type = critter_ir::AGENT_TYPES[a.type_idx];
+        const char* st = (a.state_str_id == 0) ? "none"
+            : (a.state_str_id <= type.state_count ? type.states[a.state_str_id - 1] : "none");
         std::snprintf(buf, sizeof(buf),
                       "{\"id\":%d,\"name\":\"%s\",\"pos\":[%d,%d],"
-                      "\"color\":[%u,%u,%u],\"glitched\":%s}",
-                      a.id, critter_ir::AGENT_TYPES[a.type_idx].name,
+                      "\"color\":[%u,%u,%u],\"glitched\":%s,"
+                      "\"state\":\"%s\",\"pc\":%d,\"type_idx\":%u,"
+                      "\"beh_idx\":%u,\"rem_ticks\":%d,\"seek_ticks\":%d,"
+                      "\"plan_len\":%u,\"plan_cursor\":%u}",
+                      a.id, type.name,
                       a.pos.x, a.pos.y, ar, ag, ab,
-                      a.glitched ? "true" : "false");
+                      a.glitched ? "true" : "false",
+                      st, (int)a.pc, (unsigned)a.type_idx,
+                      (unsigned)a.beh_idx, (int)a.remaining_ticks,
+                      (int)a.seek_ticks, (unsigned)a.plan_len,
+                      (unsigned)a.plan_cursor);
         out += buf;
     }
     out += "]";
@@ -2457,14 +2499,27 @@ std::string CritterEngine::dumpStateJsonl() const {
     }
 #endif
 
-    char bigbuf[256];
+    char bigbuf[512];
     std::snprintf(bigbuf, sizeof(bigbuf),
                   ",\"metrics\":{\"convergences\":%u,\"glitches\":%u,"
                   "\"step_contests\":%u,\"failed_seeks\":%u,"
-                  "\"total_intended\":%u,\"total_lit_intended\":%u}}\n",
+                  "\"total_seeks\":%u,\"glitch_recoveries\":%u,"
+                  "\"total_intended\":%u,\"total_lit_intended\":%u},"
+                  // Within-tick board diagnostic — see dbgBoard*() / tick().
+                  // miss_pre/extra_pre = what agents saw this tick;
+                  // miss_post/extra_post = after post-agent mutation.
+                  "\"dbg\":{\"miss_pre\":%u,\"extra_pre\":%u,"
+                  "\"miss_post\":%u,\"extra_post\":%u,"
+                  "\"cells_now_miss\":%u,\"cells_now_extra\":%u}}\n",
                   metrics_.convergences, metrics_.glitches,
                   metrics_.step_contests, metrics_.failed_seeks,
-                  metrics_.total_intended, metrics_.total_lit_intended);
+                  metrics_.total_seeks, metrics_.glitch_recoveries,
+                  metrics_.total_intended, metrics_.total_lit_intended,
+                  (unsigned)dbg_miss_pre_, (unsigned)dbg_extra_pre_,
+                  (unsigned)dbg_miss_post_, (unsigned)dbg_extra_post_,
+                  // Fresh count at dump time (tel/caller thread) — compare
+                  // to miss_pre/post to spot cross-thread grid divergence.
+                  (unsigned)countTiles("missing"), (unsigned)countTiles("extra"));
     out += bigbuf;
     return out;
 }
