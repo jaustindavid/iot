@@ -4,6 +4,26 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Smoked/ND layer in the 3D-printed light pipes (sub-floor dimming, HW).**
+  The dimmest *steady* the WS2812 silicon does is value-1; in a dark room
+  that's still too bright. This is an optics problem, not software — add a
+  neutral-smoke attenuation layer where the light pipes already shape each
+  pixel. Print the pipe/cap in neutral-smoke translucent filament (grey,
+  not colored — avoid hue shift); tune the "stops" by wall thickness /
+  layer count. Bonus: deepens black level + softens LED dots. Tradeoff:
+  caps the bright end (bump `max_brightness` to recover; there's headroom).
+  Test: print one pipe at a couple thicknesses, compare in a dark room.
+
+  RULED OUT (2026-06, do not re-attempt): software temporal dimming below
+  the value-1 floor. Both flavors fail at the ≤130 Hz WS2812 transmission
+  ceiling (256 px) because sub-1 brightness = sub-every-frame on-events =
+  sub-flicker-fusion. (a) Whole-panel black-frame insertion → unified
+  strobe. (b) Per-pixel sigma-delta dithering → per-pixel sparkle on the
+  dimmest pixels (and the floor-preserve guarantee is lost). The
+  `dim_duty_n` / `dither_subfloor` probes that proved this were removed
+  (768 B/device of accumulator wasn't worth keeping a dead end on the P1).
+  See git history + README "Gotchas."
+
 - **Server-side consumer for `critterchron/public/error`.** Topic exists
   and devices publish to it (since 2026-05-19), but nothing consumes
   it yet — errors are visible only by tailing the queue manually. Need

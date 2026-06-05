@@ -153,6 +153,7 @@ Devices publish an ASCII `k=v` heartbeat to Stra2us (`<app>/public/heartbeep`) e
 - **Unknown `wander` modifiers are silent no-ops** (e.g. `wander prefering current` behaves as plain `wander`).
 - **`step (dx, dy)` is unguarded.** Clamps to grid bounds but doesn't check occupancy — the caller (e.g. coati bobbing at the pool) owns the fragility. See `TODO.md`.
 - **A `glitched` (runaway-opcode) agent is benched, not killed.** On hardware it auto-recovers after `GLITCH_RECOVERY_TICKS`; if `glitches`/`grecov` climb together in telemetry, an agent is repeatedly tripping the 100-opcode cap and self-healing (a loud signal, not a silent freeze). The Python sim does not auto-recover.
+- **WS2812 value-1 is the hard dim floor — you can't go below it *steadily* in software.** `scale_ch`'s floor-preserve keeps a nonzero channel at ≥1 on purpose (dim pixels stay visible, identical across platforms). Going dimmer than value-1 means lighting a pixel *less than every frame*, which at the ≤130 Hz WS2812 transmission ceiling (256 px) is below flicker fusion → visible artifacts. Both temporal approaches were tried and rejected (2026-06): whole-panel black-frame insertion strobes the whole face; per-pixel sigma-delta dithering sparkles on the dimmest pixels. **Sub-floor dimming is an optics problem, not software** — attenuate physically (a smoked/ND layer in the light pipes). Do not re-add software temporal dimming; this is a settled dead end.
 
 ## Example agents
 
