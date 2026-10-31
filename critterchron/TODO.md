@@ -4,6 +4,37 @@ Items actively tracked. Completed items move to the bottom with a timestamp.
 
 ## Near-term
 
+- **Catch the rare VM wedge in the field.** boober runs *days* clean, then
+  rarely hard-freezes (both agents idle, `apos` frozen, work remains). NOT
+  brick starvation (see below — that's chronic, not rare) and NOT memory
+  corruption (two cuttlefish static audits ruled out the A* plan-buffer and
+  OOB-pos paths for boober: no spawns, in-bounds initials, clamped movement).
+  Working theory: a rare, state-specific VM logic path that leaves both
+  agents gated/parked and unresponsive across minute rolls. Not reproduced in
+  200k-tick host soaks. The engine now self-detects this class via a
+  **position-freeze detector** in `CritterEngine::tick()` (2026-06-06): folds
+  live-agent positions into a signature, latches `frozen:…` if static for
+  `STALE_WEDGE_TICKS` while `missing+extra>0`, then auto-dumps
+  `dumpStateJsonl` to `…/public/state`. Keyed on position, not seek-count
+  (a stuck seek pumps `total_seeks`) or board-progress (false-alarms on
+  starvation). Plus the validity guard + bracket canaries for the corruption
+  case. **Action: re-flash rachel** — her current build has the *old*
+  total_seeks-frozen detector, which is blind to this (seeks keep climbing).
+  Then read the first real `frozen:` dump to see the exact gated state and
+  trace which control-flow path produced it.
+
+- **boober brick starvation (separate, chronic).** Confirmed + reproduced
+  2026-06-06: boober mints a conserved 66-brick supply (33×2; #34 commented
+  out at `boober.crit:110`, `heap` decay 0/1), but the peak minute needs ~75
+  lit pixels (the header comment even says 75). ~67% of minutes can't fully
+  converge → board chronically incomplete, agents idle on tiles they can't
+  fill. Repro: `boober --ticks 4000 --dump-fake-time 2026-04-19T05:55` →
+  convergence 0.0%. This is a *display-coverage* bug, distinct from the rare
+  hard wedge above. Fix: mint enough bricks to cover the worst minute for the
+  deployed geometry (geometry-dependent: 32×8 ≠ 16×16) + margin, or make the
+  stand-in actually paint. Same arithmetic in boober2. Decide the brick count
+  deliberately (compute peak demand per geometry) rather than eyeballing.
+
 - **Smoked/ND layer in the 3D-printed light pipes (sub-floor dimming, HW).**
   The dimmest *steady* the WS2812 silicon does is value-1; in a dark room
   that's still too bright. This is an optics problem, not software — add a

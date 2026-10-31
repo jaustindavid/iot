@@ -146,6 +146,12 @@ constexpr const char* SEEKS_FAIL_SPIKE  = "seeks_fail_spike";
 constexpr const char* HEAP_LOW          = "heap_low";
 constexpr const char* AGENT_COUNT_DROP  = "agent_count_drop";
 constexpr const char* ASSERTION         = "assertion";
+// Engine self-reported wedge (corrupt agent pc/remaining_ticks, clobbered
+// bracket canary, or staleness detector trip). Fired by the tel loop when
+// g_engine.wedgePending() is set — the only realistic way to capture the
+// frozen-engine state, since wedges happen at random times no human can
+// catch with dump_now.
+constexpr const char* WEDGE             = "wedge";
 // FAILURE_TRIAGE.md §2: continuous trace-mode dumps. Same frame format
 // as event-driven dumps; platform code checks this label after
 // dump_pending() to decide whether to publish to the per-device trace

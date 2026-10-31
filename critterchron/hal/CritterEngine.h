@@ -116,6 +116,21 @@ struct Tile {
 #define GLITCH_RECOVERY_TICKS 256
 #endif
 
+// Upper bound on a sane `remaining_ticks`. The longest legitimate pause is
+// `pause 75-112` plus step_rate slack; anything beyond this is corruption.
+// Generous so we never false-trip on a real pause.
+#ifndef AGENT_REMAINING_MAX
+#define AGENT_REMAINING_MAX 2000
+#endif
+
+// Staleness wedge trigger: if no new seek opcode is reached for this many
+// ticks while the board still has work (missing+extra > 0), the engine
+// flags a wedge for auto-dump. ~750 ticks ≈ 5 min at 400ms — well past any
+// legitimate idle/stand-in, short enough to catch the wedge promptly.
+#ifndef STALE_WEDGE_TICKS
+#define STALE_WEDGE_TICKS 750
+#endif
+
 struct Agent {
     int16_t  id;
     uint16_t type_idx;           // index into critter_ir::AGENT_TYPES
@@ -299,6 +314,36 @@ public:
     uint16_t dbgBoardMissPost() const { return dbg_miss_post_; }
     uint16_t dbgBoardExtraPost()const { return dbg_extra_post_;}
 
+    // Wedge auto-detect. Set by the tick() validity guard (corrupt
+    // pc/remaining_ticks/beh_idx), the bracket-canary check, or the
+    // staleness detector. The platform polls this each heartbeat: if true,
+    // emit wedgeReason() on the err channel, fire one auto-dump, then call
+    // clearWedge(). Latched once per episode — clearWedge() also resets the
+    // staleness counter so a still-wedged engine re-arms only after fresh
+    // progress, not every heartbeat.
+    bool        wedgePending() const { return wedge_pending_; }
+    const char* wedgeReason()  const { return wedge_reason_; }
+
+#ifdef CRIT_TEST_HOOKS
+    // Fault-injection for the host harness only — compiled out of every
+    // device build (no production code path can reach agent internals).
+    // Lets the soak test corrupt an agent's pc/remaining_ticks and confirm
+    // the tick() validity guard catches + self-heals it.
+    void dbgCorruptAgent(uint16_t idx, int16_t pc, int16_t rem) {
+        if (idx < agent_count_) { agents_[idx].pc = pc; agents_[idx].remaining_ticks = rem; }
+    }
+#endif
+    void        clearWedge() {
+        wedge_pending_ = false;
+        wedge_reason_[0] = '\0';
+        // Reset the freeze counter so a still-frozen engine re-arms from 0
+        // and reports once per STALE_WEDGE_TICKS window rather than every
+        // tick. The signature itself is left intact: if the engine is still
+        // frozen the next tick's signature matches and the counter climbs
+        // again; if it has moved on, the signature differs and we reset.
+        stale_ticks_ = 0;
+    }
+
     // Fill `out` with the `marker` count at each point of the named
     // `landmark`, in landmark-point order, up to `out_max` entries.
     // Returns the number written (0 if landmark or marker is unknown, or
@@ -453,13 +498,56 @@ private:
 
     void despawn(Agent& a);
 
+    // Latch a wedge for auto-report. No-op if one is already pending (first
+    // detection wins, so the err line names the root cause, not a downstream
+    // symptom). Truncates safely into wedge_reason_.
+    void flagWedge(const char* reason);
+
+    // Tick-loop validity guard. Returns false (and self-heals `a` to pc=0,
+    // remaining_ticks=1, no plan) when the agent's beh_idx / pc /
+    // remaining_ticks are out of range — the corrupt-pc=92 wedge signature.
+    // Latches a wedge with the offending values. `idx` is the agents_[]
+    // slot, for the report. Called before the remaining_ticks gate so a
+    // corrupt huge remaining_ticks can't keep processAgent from ever running.
+    bool checkAgentValid(Agent& a, uint16_t idx);
+
     // ---------- state ----------
     LedSink&       sink_;
     CritTimeSource&    clock_;
     Tile           grid_[GRID_WIDTH][GRID_HEIGHT];
+    // Canaries bracketing agents_[] (declaration order == memory order, so
+    // these sit immediately before/after the array). Set to 0xDEADBEEF at
+    // begin()/reinit() and checked every tick(): a write past either end of
+    // agents_[] (the leading suspect for the corrupt-pc wedge — A* or plan
+    // logic overrunning an agent) clobbers one of these and we catch it at
+    // source. Engine-level (one instance), NOT per-Agent — so no repeat of
+    // the C3 struct-growth boot crash from the old in-struct canary.
+    uint32_t       array_canary_pre_  = 0xDEADBEEFu;
     Agent          agents_[MAX_AGENTS];
+    uint32_t       array_canary_post_ = 0xDEADBEEFu;
     uint16_t       agent_count_ = 0;
     uint32_t       tick_count_ = 0;
+    // Wedge auto-detect + auto-report. Set when tick()'s validity guard
+    // catches a corrupt agent (pc/remaining_ticks/beh_idx out of range), a
+    // bracket canary is clobbered, or the freeze detector trips (agent
+    // state bit-identical for many ticks while board work remains). The
+    // platform polls wedgePending(), emits wedgeReason() to the err channel,
+    // fires an auto-dump, then clearWedge(). This is the only realistic
+    // capture: wedges happen at random times (days apart) and the ring holds
+    // only seconds, so the firmware must self-report the instant it notices.
+    bool           wedge_pending_ = false;
+    char           wedge_reason_[96] = {0};
+    // Freeze detector scratch. We fold every live agent's (pos, pc,
+    // remaining_ticks, state, glitched) into a 64-bit signature each tick.
+    // If it is bit-identical to the prior tick for STALE_WEDGE_TICKS while
+    // missing+extra > 0, the engine is genuinely frozen (the "frozen engine,
+    // live heartbeat" wedge) and we flag it. Keyed on a *state freeze*, NOT
+    // on board-progress or seek counts: brick-starvation chronically leaves
+    // work>0 but the agents still jitter/re-seek every minute roll (signature
+    // changes), so this stays silent on starvation and fires only on a true
+    // gated freeze — the rare days-apart VM wedge we're hunting.
+    uint64_t       stale_last_sig_ = 0;
+    uint32_t       stale_ticks_    = 0;
     // UTC seconds passed to the most recent syncTimeAt() call. Surfaced via
     // lastSyncedUnix() for the `esync_lag=` heartbeat field.
     time_t         last_synced_unix_ = 0;

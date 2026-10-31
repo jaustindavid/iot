@@ -80,6 +80,7 @@ vars:
       - {value: "thyme", label: "thyme"}
       - {value: "tortoise", label: "tortoise"}
       - {value: "doozer", label: "doozer"}
+      - {value: "doozer-jake", label: "doozer-jake"}
       - {value: "boober", label: "boober"}
     scope: [device]
     help: |

@@ -33,7 +33,7 @@ GRID_WIDTH  = $(shell grep GRID_WIDTH  $(DEVICE_HEADER) | awk '{print $$3}')
 GRID_HEIGHT = $(shell grep GRID_HEIGHT $(DEVICE_HEADER) | awk '{print $$3}')
 
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
-            -I $(HAL_ROOT) -I $(BUILD_DIR) -I src
+            -I $(HAL_ROOT) -I $(BUILD_DIR) -I src $(EXTRA_CXXFLAGS)
 
 ENGINE_SRCS := $(HAL_ROOT)/CritterEngine.cpp $(HAL_ROOT)/ErrLog.cpp $(HAL_ROOT)/ir/IrRuntime.cpp $(HAL_ROOT)/SnapshotBuffer.cpp $(HAL_ROOT)/Dst.cpp src/main.cpp
 

@@ -81,7 +81,11 @@ SYSTEM_THREAD(ENABLED);
 // (rico_raccoon.h) defines NO_SNAPSHOT_BUFFER instead, eliding the
 // feature at compile time entirely.
 #ifndef SNAPSHOT_BUFFER_FRAMES_DEFAULT
-#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 0
+// Default to a live ring so dump_now (and the auto-dump on wedge detection)
+// always have frames to flush. The old 0 default meant a freshly-flashed
+// device silently captured nothing until someone set snapshot_buffer_frames
+// over KV — the foot-gun that made timmy/rachel dumps come back empty.
+#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 32
 #endif
 
 #ifndef SNAPSHOT_PUBLISH_BUF_BYTES
@@ -1428,6 +1432,22 @@ static void telemetry_worker() {
             } else {
                 s_last_trace_pub_ms = 0;
             }
+        }
+
+        // Engine self-reported wedge → auto-dump. The engine latches a flag
+        // (corrupt agent, clobbered bracket canary, or staleness) the instant
+        // it notices; we surface the reason on the err channel and force a
+        // dump so the frozen state is captured at discovery. clearWedge()
+        // re-baselines the staleness counter, so a persistently wedged engine
+        // reports once per episode, not every heartbeat.
+        if (g_engine.wedgePending()) {
+            const char* wr = g_engine.wedgeReason();
+            critterchron::g_errlog.record(
+                critterchron::ErrCat::Engine, "wedge:%s", wr);
+            critterchron::snapshot::force_dump(
+                critterchron::snapshot::trigger_name::WEDGE, wr);
+            Log.warn("WEDGE detected: %s — forcing dump", wr);
+            g_engine.clearWedge();
         }
 
         if (critterchron::snapshot::dump_pending()) {

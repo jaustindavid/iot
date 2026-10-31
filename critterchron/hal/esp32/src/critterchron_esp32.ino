@@ -143,11 +143,13 @@
 #endif
 
 // Per-device default for the runtime ring depth. 0 = feature dormant
-// even if compiled in (no append() cost). Staging fleet device headers
-// override to 32 (4 seconds at the default 8Hz physics tick); prod
-// devices stay at 0 until explicitly opted in via stra2us KV.
+// even if compiled in (no append() cost). Defaults to 32 (4 seconds at the
+// default 8Hz physics tick) so dump_now and the auto-dump-on-wedge path
+// always have frames to flush — the old 0 default silently captured nothing
+// until someone set snapshot_buffer_frames over KV, which is why the
+// timmy/rachel dumps came back empty.
 #ifndef SNAPSHOT_BUFFER_FRAMES_DEFAULT
-#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 0
+#define SNAPSHOT_BUFFER_FRAMES_DEFAULT 32
 #endif
 
 // Max bytes a single snapshot publish can carry. Sized for the v1
@@ -1663,6 +1665,23 @@ static void telemetry_task(void*) {
             } else {
                 s_last_trace_pub_ms = 0;  // reset cadence on disable
             }
+        }
+
+        // Engine self-reported wedge → auto-dump. The engine latches a flag
+        // (corrupt agent pc/remaining_ticks, clobbered bracket canary, or the
+        // staleness detector) the instant it notices; we surface the reason
+        // on the err channel and force a dump so the frozen state is captured
+        // at discovery — no human can fire dump_now at the random moment of a
+        // wedge. clearWedge() re-baselines staleness so a persistently wedged
+        // engine reports once per episode, not every heartbeat.
+        if (g_engine.wedgePending()) {
+            const char* wr = g_engine.wedgeReason();
+            critterchron::g_errlog.record(
+                critterchron::ErrCat::Engine, "wedge:%s", wr);
+            critterchron::snapshot::force_dump(
+                critterchron::snapshot::trigger_name::WEDGE, wr);
+            Serial.printf("[WEDGE] %s — forcing dump\n", wr);
+            g_engine.clearWedge();
         }
 
         if (critterchron::snapshot::dump_pending()) {

@@ -482,6 +482,16 @@ bool CritterEngine::reinit() {
         g_agent_canaries[agent_count_ - 1] = 0xDEADBEEFu;
 #endif
     }
+
+    // (Re)arm the bracket canaries and clear any latched wedge / staleness
+    // baseline. In-class initializers set these at construction, but reinit()
+    // also runs after an OTA table swap, so re-stamp defensively.
+    array_canary_pre_  = 0xDEADBEEFu;
+    array_canary_post_ = 0xDEADBEEFu;
+    wedge_pending_     = false;
+    wedge_reason_[0]   = '\0';
+    stale_last_sig_    = 0;     // first tick recomputes + baselines
+    stale_ticks_       = 0;
     return true;
 }
 
@@ -653,6 +663,19 @@ void CritterEngine::tick() {
             // fall through and process this tick
         }
 
+        // Entry validity guard. Catch the corrupt-pc=92 / runaway
+        // remaining_ticks wedge at source: validate beh_idx, pc, and
+        // remaining_ticks before the gate below (a corrupt huge
+        // remaining_ticks would otherwise bench the agent forever and
+        // processAgent would never run to be caught). On corruption we
+        // record the offending values, latch a wedge for auto-dump, and
+        // self-heal the agent (restart at pc=0). The sibling-array canary
+        // does NOT cover the Agent struct, so this is our only in-band
+        // detector for an A*/plan write that overruns into pc/remaining.
+        if (!checkAgentValid(a, i)) {
+            // self-healed in checkAgentValid(); run it clean this tick
+        }
+
         if (a.remaining_ticks > 0) {
             --a.remaining_ticks;
             if (a.remaining_ticks == 0) a.prev_pos = a.pos;
@@ -719,7 +742,129 @@ void CritterEngine::tick() {
     dbg_miss_post_  = countTiles("missing");
     dbg_extra_post_ = countTiles("extra");
 
+    // Bracket-canary check. A write past either end of agents_[] (the
+    // leading suspect for the corrupt-pc wedge) clobbers one of these.
+    // Engine-level, so unlike the old per-Agent canary it can't regrow the
+    // struct and crashloop the C3. Re-arm after flagging so we report once
+    // per episode rather than every tick.
+    if (array_canary_pre_ != 0xDEADBEEFu || array_canary_post_ != 0xDEADBEEFu) {
+        char r[96];
+        snprintf(r, sizeof(r), "canary:pre=%08x,post=%08x,n=%u",
+                 (unsigned)array_canary_pre_, (unsigned)array_canary_post_,
+                 (unsigned)agent_count_);
+        flagWedge(r);
+        array_canary_pre_  = 0xDEADBEEFu;
+        array_canary_post_ = 0xDEADBEEFu;
+    }
+
+    // Freeze detector. The wedge signature is: telemetry alive (tick_count_
+    // climbing), board has work (missing+extra > 0), but the engine's agent
+    // state is utterly static — same positions, same pc, same remaining_ticks
+    // tick after tick. Threshold/MAD detectors miss this; the device looks
+    // healthy. We fold every live agent's state into a 64-bit signature and
+    // watch for it to stay bit-identical for STALE_WEDGE_TICKS while work
+    // remains, then latch a wedge so the engine self-reports the instant it
+    // notices (no human can fire dump_now at the random, days-apart moment of
+    // a wedge). clearWedge() resets the counter, so a persistently frozen
+    // engine reports once per window, not every heartbeat.
+    //
+    // Why a state freeze and NOT board-progress or seek counts: brick
+    // starvation chronically leaves work>0, but its agents keep moving and
+    // re-seeking every minute roll (signature changes, counter resets) — so
+    // a board-progress detector would false-alarm on starvation every
+    // evening and bury the rare event, while a seek-count detector is fooled
+    // the other way (a stuck seek pumps total_seeks every tick). A bit-
+    // identical-state freeze is the one signal that's true for the genuine
+    // gated wedge and false for starvation.
+    // Signature folds POSITION ONLY (plus the live-agent set, implicitly, by
+    // iterating live agents). We deliberately EXCLUDE pc / remaining_ticks /
+    // state: the tick gate decrements remaining_ticks every tick, and an
+    // idle agent cycles pc through its idle block — so including them would
+    // make a benignly-parked OR a genuinely-wedged agent look "active" every
+    // tick and defeat the detector. (remaining_ticks is int16_t anyway: max
+    // ~3.6h at 400ms, so the 18h freeze can't be one long countdown.)
+    // Physical position is the one thing that's truly static in a frozen
+    // engine and that still advances under starvation (agents relocate to new
+    // missing tiles every minute roll), so position-freeze cleanly separates
+    // "wedged" from "starved but alive."
+    uint64_t sig = 1469598103934665603ull;          // FNV-1a offset basis
+    auto mix = [&sig](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+    for (uint16_t i = 0; i < agent_count_; ++i) {
+        const Agent& a = agents_[i];
+        if (!a.alive) continue;
+        mix((uint64_t)(uint8_t)a.pos.x);
+        mix((uint64_t)(uint8_t)a.pos.y);
+        mix((uint64_t)a.id);   // set-membership: spawn/despawn counts as motion
+    }
+    if (sig != stale_last_sig_) {
+        stale_last_sig_ = sig;
+        stale_ticks_ = 0;
+    } else if ((dbg_miss_post_ + dbg_extra_post_) > 0) {
+        if (++stale_ticks_ == STALE_WEDGE_TICKS) {
+            char r[96];
+            snprintf(r, sizeof(r), "frozen:ticks=%lu,miss=%u,extra=%u,seeks=%lu",
+                     (unsigned long)stale_ticks_,
+                     (unsigned)dbg_miss_post_, (unsigned)dbg_extra_post_,
+                     (unsigned long)metrics_.total_seeks);
+            flagWedge(r);
+        }
+    } else {
+        // Board converged (no work) — a static idle pose is legitimate.
+        stale_ticks_ = 0;
+    }
+
     computeConvergence();
+}
+
+// ----- wedge auto-detect helpers --------------------------------------
+
+void CritterEngine::flagWedge(const char* reason) {
+    if (wedge_pending_) return;          // first detection wins
+    wedge_pending_ = true;
+    std::strncpy(wedge_reason_, reason, sizeof(wedge_reason_) - 1);
+    wedge_reason_[sizeof(wedge_reason_) - 1] = '\0';
+}
+
+bool CritterEngine::checkAgentValid(Agent& a, uint16_t idx) {
+    bool bad = false;
+    char why[40] = {0};
+
+    // beh_idx must index a loaded behavior.
+    if (a.beh_idx >= critter_ir::BEHAVIOR_COUNT) {
+        snprintf(why, sizeof(why), "beh=%u/%u", (unsigned)a.beh_idx,
+                 (unsigned)critter_ir::BEHAVIOR_COUNT);
+        bad = true;
+    } else {
+        const int n = (int)critter_ir::BEHAVIORS[a.beh_idx].insn_count;
+        // pc must be in [0, n]. n itself is the legitimate "ran off the end /
+        // done" sentinel the interpreter produces; only pc>n or pc<0 is the
+        // corruption signature (the wedge dumps showed apc=92 with n=92).
+        if (a.pc < 0 || a.pc > n) {
+            snprintf(why, sizeof(why), "pc=%d/%d", (int)a.pc, n);
+            bad = true;
+        } else if (a.remaining_ticks < 0 || a.remaining_ticks > AGENT_REMAINING_MAX) {
+            snprintf(why, sizeof(why), "rem=%d", (int)a.remaining_ticks);
+            bad = true;
+        }
+    }
+
+    if (!bad) return true;
+
+    // Record the full agent fingerprint, latch the wedge, then self-heal so
+    // the clock keeps running rather than staying frozen until reboot.
+    char r[96];
+    snprintf(r, sizeof(r), "corrupt:i=%u,%s,st=%d,pl=%d/%d",
+             (unsigned)idx, why, (int)a.state_str_id,
+             (int)a.plan_cursor, (int)a.plan_len);
+    flagWedge(r);
+
+    a.pc            = 0;
+    a.remaining_ticks = 1;
+    a.plan_len      = 0;
+    a.plan_cursor   = 0;
+    a.seek_ticks    = 0;
+    a.glitched      = false;
+    return false;
 }
 
 void CritterEngine::computeConvergence() {
@@ -2499,7 +2644,7 @@ std::string CritterEngine::dumpStateJsonl() const {
     }
 #endif
 
-    char bigbuf[512];
+    char bigbuf[768];
     std::snprintf(bigbuf, sizeof(bigbuf),
                   ",\"metrics\":{\"convergences\":%u,\"glitches\":%u,"
                   "\"step_contests\":%u,\"failed_seeks\":%u,"
@@ -2510,7 +2655,16 @@ std::string CritterEngine::dumpStateJsonl() const {
                   // miss_post/extra_post = after post-agent mutation.
                   "\"dbg\":{\"miss_pre\":%u,\"extra_pre\":%u,"
                   "\"miss_post\":%u,\"extra_post\":%u,"
-                  "\"cells_now_miss\":%u,\"cells_now_extra\":%u}}\n",
+                  "\"cells_now_miss\":%u,\"cells_now_extra\":%u},"
+                  // Wedge auto-detect state. `wedge`=1 means the engine
+                  // latched a self-detected wedge (this is almost certainly
+                  // the dump that the auto-dump path fired); `wreason` carries
+                  // the corrupt:/canary:/stale: detail. Canary words let an
+                  // offline reader confirm the brackets are intact even when
+                  // wedge=0. All values are JSON-safe (no quotes/backslashes).
+                  "\"wedge\":{\"pending\":%d,\"reason\":\"%s\","
+                  "\"canary_pre\":\"%08x\",\"canary_post\":\"%08x\","
+                  "\"stale_ticks\":%lu}}\n",
                   metrics_.convergences, metrics_.glitches,
                   metrics_.step_contests, metrics_.failed_seeks,
                   metrics_.total_seeks, metrics_.glitch_recoveries,
@@ -2519,7 +2673,10 @@ std::string CritterEngine::dumpStateJsonl() const {
                   (unsigned)dbg_miss_post_, (unsigned)dbg_extra_post_,
                   // Fresh count at dump time (tel/caller thread) — compare
                   // to miss_pre/post to spot cross-thread grid divergence.
-                  (unsigned)countTiles("missing"), (unsigned)countTiles("extra"));
+                  (unsigned)countTiles("missing"), (unsigned)countTiles("extra"),
+                  wedge_pending_ ? 1 : 0, wedge_reason_,
+                  (unsigned)array_canary_pre_, (unsigned)array_canary_post_,
+                  (unsigned long)stale_ticks_);
     out += bigbuf;
     return out;
 }

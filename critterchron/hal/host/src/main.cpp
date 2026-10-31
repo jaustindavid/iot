@@ -62,6 +62,9 @@ int main(int argc, char** argv) {
     uint32_t tick_ms = 0;        // 0 → use critter_ir::RUNTIME_TICK_MS
     const char* start_time_str = nullptr;
     long stuck_window = 900;     // ticks of no-progress-with-work → livelock
+    bool freeze_clock = false;   // --freeze-clock: pin the minute (model a
+                                 // stalled clock); used to verify the engine's
+                                 // position-freeze wedge detector fires.
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--ticks") && i+1 < argc) {
@@ -85,6 +88,8 @@ int main(int argc, char** argv) {
             start_time_str = argv[++i];
         } else if (!std::strcmp(argv[i], "--stuck-ticks") && i+1 < argc) {
             stuck_window = std::strtol(argv[++i], nullptr, 10);
+        } else if (!std::strcmp(argv[i], "--freeze-clock")) {
+            freeze_clock = true;
         } else {
             usage(argv[0]);
             return 2;
@@ -165,8 +170,17 @@ int main(int argc, char** argv) {
         };
 
         for (long i = 0; i < soak_ticks; ++i) {
-            clock.advance_ms(step_ms);
+            if (!freeze_clock) clock.advance_ms(step_ms);
             engine.syncTime();
+#ifdef CRIT_TEST_HOOKS
+            // Fault-injection: at tick 1000, scribble the corrupt-pc=92 /
+            // runaway-remaining signature into agent 0 and confirm the next
+            // tick()'s validity guard latches a wedge and self-heals it.
+            if (i == 1000) {
+                std::printf("[inject] corrupting agent[0] pc=92 rem=30000\n");
+                engine.dbgCorruptAgent(0, 92, 30000);
+            }
+#endif
             engine.tick();
 
             uint32_t seeks    = engine.metrics().total_seeks;
@@ -177,6 +191,15 @@ int main(int argc, char** argv) {
             if (glitches != last_glitches) {
                 report("GLITCH (agent benched)", i);
                 return 3;
+            }
+            // Engine's own self-detector (validity guard / bracket canary /
+            // staleness). On a healthy script this must never latch; if it
+            // does, the report shows whether it caught a real wedge or
+            // false-tripped.
+            if (engine.wedgePending()) {
+                std::printf("ENGINE WEDGE FLAG: %s\n", engine.wedgeReason());
+                report("ENGINE-DETECTED WEDGE", i);
+                return 5;
             }
             if (work > (uint16_t)max_work) max_work = work;
             if (work > 0 && seeks == last_seeks) ++ticks_work_no_seek;

@@ -33,6 +33,7 @@ const char* err_cat_tag(ErrCat cat) {
         case ErrCat::Boot:     return "boot";
         case ErrCat::Sensor:   return "sensor";
         case ErrCat::Net:      return "net";
+        case ErrCat::Engine:   return "engine";
         case ErrCat::Other:    return "other";
     }
     return "other";

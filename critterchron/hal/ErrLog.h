@@ -50,6 +50,7 @@ enum class ErrCat : uint8_t {
     Boot      = 3,   // engine.begin() failed, rescue-hold trigger
     Sensor    = 4,   // future — light sensor calibration drift, etc.
     Net       = 5,   // WiFi/cloud reconnect kicks, transient connectivity events
+    Engine    = 6,   // engine self-reported wedge (corrupt agent / canary / stale)
 };
 
 // Single-token snake_case names for the heartbeat wire format. Server
